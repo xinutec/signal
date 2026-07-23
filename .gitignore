@@ -1,0 +1,10 @@
+# Rust build output
+/target
+
+# Local presage store (Signal linked-device keys — NEVER commit)
+/store
+*.sled
+
+# Local env / secrets
+.env
+secret.env

@@ -1,0 +1,48 @@
+---
+name: build
+
+# signal-archiver (Rust) — gate on fmt + clippy + cargo test (the frame-parser
+# tests in tests/parse.rs are pure units, no MariaDB needed), then build + push
+# xinutec/signal-archiver:latest to Docker Hub. The k8s manifests + deploy live
+# in the home monorepo (xinutec/pippijn code/kubes/signal/k8s); the image tag is
+# the only contract between this repo and the deploy.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**/flake.lock"
+  workflow_dispatch: {}
+
+jobs:
+  verify:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    container: rust:1-bookworm
+    steps:
+      - uses: actions/checkout@v6
+      - run: rustup component add clippy rustfmt
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  image:
+    needs: [verify]
+    # Docker Hub auth comes from repo secrets; the GITHUB_TOKEN only reads.
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PASSWORD }}
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: xinutec/signal-archiver:latest
+          cache-from: type=registry,ref=xinutec/signal-archiver:cache
+          cache-to: type=registry,ref=xinutec/signal-archiver:cache

@@ -1,0 +1,19 @@
+[package]
+name = "signal-archiver"
+version = "0.1.0"
+edition = "2024"
+description = "Ingests Signal messages from signal-cli-rest-api's receive websocket into MariaDB"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+# Plaintext ws:// to the in-cluster signal-cli-rest-api — no TLS feature needed.
+tokio-tungstenite = "0.29"
+serde_json = "1"
+# Plaintext HTTP to signal-cli-rest-api (attachment bytes + group names); no TLS.
+reqwest = { version = "0.13", default-features = false }
+# Runtime SQL only; in-cluster MariaDB is plaintext, so no TLS backend feature.
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "mysql"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
