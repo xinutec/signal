@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
-# Single health gate. A commit must be healthy: this runs the full verify
-# (scripts/verify.sh) — backend + frontend + shared dev-lint rules, plus any
-# generated-type drift folded into verify. There is NO separate pre-push step.
-# Slow by design; we optimise for healthy commits, not commit speed.
-# Quiet on success: the full verify output is printed only when it FAILS, so a
+# Single health gate. A commit must be healthy: this runs the full gate — the
+# rows live in gate.dhall, rendered to the committed gate.json, and are run by
+# dev-lint's shared runner rather than by a script in this repository. There is
+# NO separate pre-push step. Slow by design; we optimise for healthy commits,
+# not commit speed.
+#
+# Quiet on success: the gate's output is printed only when it FAILS, so a
 # healthy commit isn't buried under build/test noise (DL-GIT-PRECOMMIT-GATE).
 # Bypass a genuine work-in-progress commit with:  git commit --no-verify
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
-if ! out=$(scripts/verify.sh 2>&1); then
+if ! out=$(nix run ../dev-lint#gate -- . gate.json 2>&1); then
   printf '%s\n' "$out" >&2
   exit 1
 fi

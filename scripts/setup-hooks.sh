@@ -3,4 +3,4 @@
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 git config core.hooksPath scripts/githooks
-echo "git hooks installed: core.hooksPath = scripts/githooks (pre-commit runs scripts/verify.sh)"
+echo "git hooks installed: core.hooksPath = scripts/githooks (pre-commit runs the gate.dhall table)"

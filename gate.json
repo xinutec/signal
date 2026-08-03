@@ -1,0 +1,80 @@
+{
+  "checks": [
+    {
+      "argv": [
+        "nix",
+        "develop",
+        "--command",
+        "cargo",
+        "fmt",
+        "--all",
+        "--check"
+      ],
+      "cwd": ".",
+      "env": {},
+      "name": "formatting",
+      "timeout_s": 120
+    },
+    {
+      "argv": [
+        "nix",
+        "develop",
+        "--command",
+        "cargo",
+        "clippy",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "cwd": ".",
+      "env": {
+        "CARGO_TARGET_DIR": "/Users/pippijn/.cache/cargo/clippy-target"
+      },
+      "name": "clippy",
+      "timeout_s": 900
+    },
+    {
+      "argv": [
+        "nix",
+        "develop",
+        "--command",
+        "cargo",
+        "test"
+      ],
+      "cwd": ".",
+      "env": {},
+      "name": "tests",
+      "timeout_s": 900
+    },
+    {
+      "argv": [
+        "nix",
+        "run",
+        "../dev-lint#gate",
+        "--",
+        "--check-table",
+        "gate.dhall",
+        "gate.json"
+      ],
+      "cwd": ".",
+      "env": {},
+      "name": "the table matches its Dhall",
+      "timeout_s": 120
+    },
+    {
+      "argv": [
+        "nix",
+        "run",
+        "../dev-lint",
+        "--",
+        "."
+      ],
+      "cwd": ".",
+      "env": {},
+      "name": "dev-lint",
+      "timeout_s": 600
+    }
+  ],
+  "name": "signal-archiver"
+}
