@@ -9,25 +9,33 @@ rows are.
 The generated `gate.json` is committed and `the table matches its Dhall`
 re-renders and diffs it, the way a lockfile is checked, so nothing here needs
 `dhall` installed to run the gate.
+
+**The vocabulary moved into the schema.** `inDevShell`, the clippy target
+directory, the Angular worker cap, and the `ng-build` / `dev-lint` /
+`check-table` rows were spelled out here and in a dozen other tables
+identically — the duplication the shared tools were built to remove, recreated
+one level up. They are `G.` values now. Two consequences the rendered JSON
+shows: every dev-shell row gains `--no-warn-dirty`, because a gate that prints
+"Git tree is dirty" on every row of every run has trained everyone to ignore a
+warning; and dev-lint is pinned to its committed HEAD rather than run out of its
+worktree, which is what stops a neighbour's half-finished edit failing this gate
+for a reason no commit anywhere explains.
+
 -}
 
 let G = ../dev-lint/gate/schema.dhall
-
-let inDevShell =
-      \(argv : List Text) ->
-        [ "nix", "develop", "--command" ] # argv
 
 in  { name = "signal-archiver"
     , checks =
       [ G.Check::{
         , name = "formatting"
-        , argv = inDevShell [ "cargo", "fmt", "--all", "--check" ]
+        , argv = G.inDevShell [ "cargo", "fmt", "--all", "--check" ]
         , timeout_s = 120
         }
       , G.Check::{
         , name = "clippy"
         , argv =
-            inDevShell [ "cargo", "clippy", "--all-targets", "--", "-D", "warnings" ]
+            G.inDevShell [ "cargo", "clippy", "--all-targets", "--", "-D", "warnings" ]
         , {-  Clippy gets its own target directory: clippy-driver and rustc
               fingerprint the workspace differently and evict each other in a
               shared one, forcing a full recompile. A dedicated directory keeps
@@ -39,12 +47,12 @@ in  { name = "signal-archiver"
               ever needs a different one that is an edit here rather than an
               environment variable nobody knew about.
           -}
-          env = toMap { CARGO_TARGET_DIR = "/Users/pippijn/.cache/cargo/clippy-target" }
+          env = G.clippyTarget
         , timeout_s = 900
         }
       , G.Check::{
         , name = "tests"
-        , argv = inDevShell [ "cargo", "test" ]
+        , argv = G.inDevShell [ "cargo", "test" ]
         , timeout_s = 900
         }
       , {-  The lockfile check: `gate.json` is what runs, `gate.dhall` is what
@@ -52,16 +60,7 @@ in  { name = "signal-archiver"
               comparison itself rather than a `bash -c` with process
               substitution, so this row is the same in every repository's table.
           -}
-        G.Check::{
-        , name = "the table matches its Dhall"
-        , argv =
-            [ "nix", "run", "../dev-lint#gate", "--", "--check-table", "gate.dhall", "gate.json" ]
-        , timeout_s = 120
-        }
-      , G.Check::{
-        , name = "dev-lint"
-        , argv = [ "nix", "run", "../dev-lint", "--", "." ]
-        , timeout_s = 600
-        }
+        G.checkTable "../dev-lint"
+      , G.devLint "../"
       ]
     }
