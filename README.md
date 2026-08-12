@@ -103,7 +103,8 @@ curl -s localhost:8080/v1/groups/$NUM > groups.json
 ```
 Copy `main.jsonl` (and `groups.json`) off the device/cluster and run on the Mac:
 ```
-DB_HOST=… DB_PORT=… DB_USER=… DB_PASSWORD=… DB_NAME=signal SELF_UUID=<your ACI> \
+DB_HOST=… DB_PORT=… DB_USER=… DB_PASSWORD=… DB_NAME=signal \
+  SELF_UUID=<your ACI> SELF_PHONE=<your E.164 number> \
   ./tools/import_jsonl.py main.jsonl --groups-json=groups.json [--dry-run] [--limit=N]
 ```
 It resolves the export's internal recipient/chat ids and writes messages,

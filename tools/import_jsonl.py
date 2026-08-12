@@ -19,7 +19,7 @@ to key groups by groupId (matched by name) so history lands in the live thread;
 otherwise groups fall back to masterKey and `tools/reconcile_groups.py` must run
 afterwards to unify them.
 
-Usage (env: DB_HOST DB_PORT DB_USER DB_PASSWORD DB_NAME, SELF_UUID):
+Usage (env: DB_HOST DB_PORT DB_USER DB_PASSWORD DB_NAME, SELF_UUID SELF_PHONE):
     ./import_jsonl.py main.jsonl [--groups-json=groups.json] [--dry-run] [--limit=N]
 """
 import base64
@@ -65,6 +65,12 @@ def main():
     dry = "--dry-run" in opts
     limit = next((int(o.split("=")[1]) for o in opts if o.startswith("--limit=")), None)
     self_uuid = os.environ["SELF_UUID"]
+    # Own number: caller-supplied, never a literal here — this repo is public.
+    # Empty is not "absent": a blank self phone would silently NULL out the one
+    # recipient row that identifies Pippijn, so refuse it rather than degrade.
+    self_phone = norm_phone(os.environ["SELF_PHONE"].strip())
+    if not self_phone:
+        sys.exit("SELF_PHONE is empty; set it to your own number in E.164 form (+…)")
 
     # The export keys a group by its `masterKey`, but the live ingester keys it by
     # signal-cli's derived `groupId` (the groups-API `internal_id`) — different
@@ -94,7 +100,7 @@ def main():
                 r = frame["recipient"]
                 rid = r["id"]
                 if "self" in r:
-                    recipients[rid] = {"uuid": self_uuid, "phone": "+447880472093",
+                    recipients[rid] = {"uuid": self_uuid, "phone": self_phone,
                                        "name": "Me", "is_group": False, "is_self": True}
                 elif "contact" in r:
                     c = r["contact"]
