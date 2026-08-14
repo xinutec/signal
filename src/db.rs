@@ -122,6 +122,34 @@ const MIGRATIONS: &[&str] = &[
         UNIQUE KEY uniq_irc_line (conversation_id, source_tag, file_date, line_no),
         INDEX idx_irc_conv_ts (conversation_id, sent_at)
     )",
+    // v9: the index the viewer's conversation list needs, once the archive
+    // stopped being one network.
+    //
+    // ⚠ MEASURED, and the first two guesses were both wrong. Opening ingestion
+    // to the five networks Pippijn has tabs open on took the archive from
+    // 860,380 rows to 3,683,670, and the list query — `COUNT(*)` and
+    // `MAX(sent_at)` per conversation, restricted to `kind IN
+    // ('message','action')` — went to **27 seconds**. That is the app's landing
+    // screen.
+    //
+    // `idx_irc_conv_ts` cannot serve it: `kind` is not in it, so every candidate
+    // row has to be read to be filtered. With `kind` between the conversation
+    // and the timestamp the whole aggregate is answerable from the index alone.
+    //
+    // ⚠ ADDING IT IS NOT ENOUGH, which is the part worth writing down. The
+    // optimizer went on choosing `uniq_irc_line` — same leading column, and a
+    // row estimate 15x lower than the truth — and the query got no faster.
+    // `FORCE INDEX` proved the ceiling at 3.3s, but the fix is the query's
+    // shape: aggregating `irc_messages` alone in a derived table and joining
+    // that to the conversations picks this index unprompted, and runs in 1.6s.
+    // See `messages`' `archive.rs`, which must keep that shape for this index to
+    // earn its keep.
+    //
+    // `IF NOT EXISTS` because this index existed on the live database before it
+    // existed here: it was created by hand to measure whether it helped, which
+    // is the only way that question could be answered.
+    "ALTER TABLE irc_messages
+        ADD INDEX IF NOT EXISTS idx_irc_conv_kind_ts (conversation_id, kind, sent_at)",
 ];
 
 #[derive(Clone)]
