@@ -26,12 +26,14 @@
 //!
 //! ```text
 //! irc_tail --host 10.100.0.1 --port 2230 --key /ssh/id_ed25519 \
-//!     --known-hosts /ssh/known_hosts --self-nick mynick --map mynet2=mynet \
+//!     --known-hosts /ssh/known_hosts --map mynet2=mynet \
 //!     --heartbeat /run/irc-tail/alive
 //! ```
 //!
 //! Config via env, as the ingester: `DB_HOST`, `DB_PORT` (3306), `DB_NAME`,
-//! `DB_USER`, `DB_PASSWORD`.
+//! `DB_USER`, `DB_PASSWORD` — and `IRC_SELF_NICK` (+ `IRC_SELF_NICK_ALT`),
+//! which decide whose lines are Pippijn's own and are REQUIRED for the reason
+//! `parse_args` gives.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -119,7 +121,6 @@ fn parse_args() -> Result<Args> {
             "--port" => args.port = value()?.parse().context("--port")?,
             "--key" => args.key = PathBuf::from(value()?),
             "--known-hosts" => args.known_hosts = PathBuf::from(value()?),
-            "--self-nick" => args.self_nicks.push(value()?),
             "--heartbeat" => args.heartbeat = Some(PathBuf::from(value()?)),
             "--map" => {
                 let pair = value()?;
@@ -133,6 +134,35 @@ fn parse_args() -> Result<Args> {
     }
     if args.host.is_empty() {
         bail!("--host is required");
+    }
+
+    // ⚠ FROM THE ENVIRONMENT, AND REQUIRED, and both halves of that are
+    // corrections to how this shipped.
+    //
+    // From the environment because the alternative is a `/bin/sh -c` wrapper in
+    // the pod spec purely to expand a variable — the importer needs a shell
+    // anyway (rsync then import), this does not, and adding one to pass an
+    // argument is machinery for its own sake.
+    //
+    // REQUIRED because without it every line is attributed to somebody else,
+    // and that is what happened: the first message pushed after this went live
+    // was Pippijn's own and the app drew it as another person's, because the
+    // Deployment passed no nicks at all. The importer only PRINTS a warning in
+    // that case, which is defensible for a command somebody is watching and
+    // useless for a daemon nobody is. Refusing to start turns a silent
+    // mislabelling into a CrashLoopBackOff, which is the loudest thing a pod
+    // can do.
+    args.self_nicks = std::env::var("IRC_SELF_NICK")
+        .ok()
+        .into_iter()
+        .chain(std::env::var("IRC_SELF_NICK_ALT").ok())
+        .filter(|n| !n.is_empty())
+        .collect();
+    if args.self_nicks.is_empty() {
+        bail!(
+            "IRC_SELF_NICK is not set: every line would be filed as somebody \
+             else's, including Pippijn's own"
+        );
     }
     Ok(args)
 }
