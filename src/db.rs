@@ -177,6 +177,105 @@ const MIGRATIONS: &[&str] = &[
         size_bytes BIGINT NOT NULL,
         imported_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
     )",
+    // v11: the viewer's landing screen, answered without reading the messages.
+    //
+    // ⚠ MEASURED, and the obvious rewrite was measured WRONG. The list needs
+    // `COUNT(*)` and `MAX(sent_at)` per conversation over `kind IN
+    // ('message','action')`. Without that filter MariaDB answers it with a loose
+    // index scan — `Using index for group-by`, **431 rows, 1.4ms**. With it, the
+    // filter sits on the middle column of `idx_irc_conv_kind_ts` and the plan
+    // becomes a full index scan: **3,614,079 rows, 1.29s**.
+    //
+    // Rewriting `IN ('message','action')` as a UNION of two `kind = …` groups is
+    // what the loose-index-scan documentation suggests, and it is slower, not
+    // faster: 2.15s for the MAX and 1.75s for the COUNT, because it buys two
+    // scans instead of one. There is no query shape that recovers the loose scan
+    // while the filter stands, and 0.75s is the floor for counting by scanning.
+    // So the read stops scanning: one row per conversation, maintained on write.
+    //
+    // `cnt`/`last_sent_at` rather than a materialised view because MariaDB has
+    // none, and rather than a periodic refresh because a count that lags is the
+    // bug this app already had once — the UI showed a total three behind the
+    // database and it was noticed.
+    r"CREATE TABLE IF NOT EXISTS irc_conversation_stats (
+        conversation_id INT NOT NULL PRIMARY KEY,
+        cnt BIGINT NOT NULL DEFAULT 0,
+        last_sent_at DATETIME NULL,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    )",
+    // v12: maintain it on insert.
+    //
+    // ⚠ A TRIGGER RATHER THAN APPLICATION CODE, and that is the point. THREE
+    // writers insert these rows — the importer and `irc_tail` here, and the send
+    // echo in the `messages` repo — so maintaining the count in Rust would mean
+    // the same logic in two repositories, and a fourth writer would silently not
+    // maintain it. The trigger is attached to the table, so every writer that
+    // exists or ever will is covered by construction.
+    //
+    // ⚠ **An `INSERT IGNORE` that ignores fires no trigger** — verified, not
+    // assumed. That is what keeps replay free: `irc_tail` re-offers the plugin's
+    // whole ring after every restart and the importer re-reads a file whenever
+    // its mtime moves, and neither can inflate a count.
+    //
+    // `GREATEST(COALESCE(last_sent_at, NEW.sent_at), NEW.sent_at)` because lines
+    // do NOT arrive in timestamp order: the importer walks files by path, so
+    // yesterday's log can land after today's, and a plain assignment would move
+    // the conversation's last-message time backwards.
+    //
+    // ⚠ A FRESH DATABASE NEEDS NO BACKFILL — the triggers maintain from row
+    // zero. Only a database that already held rows when this landed does, and
+    // that is a one-shot with the writers paused:
+    //     DELETE FROM irc_conversation_stats;
+    //     INSERT INTO irc_conversation_stats (conversation_id, cnt, last_sent_at)
+    //     SELECT conversation_id, COUNT(*), MAX(sent_at) FROM irc_messages
+    //      WHERE kind IN ('message','action') GROUP BY conversation_id;
+    // Paused because otherwise a row inserted between the aggregate's snapshot
+    // and its write is counted by the trigger and by the aggregate, or by
+    // neither, depending on which side of the statement it lands.
+    r"CREATE OR REPLACE TRIGGER trg_irc_stats_ai AFTER INSERT ON irc_messages FOR EACH ROW
+    BEGIN
+        IF NEW.kind IN ('message', 'action') THEN
+            INSERT INTO irc_conversation_stats (conversation_id, cnt, last_sent_at)
+                 VALUES (NEW.conversation_id, 1, NEW.sent_at)
+            ON DUPLICATE KEY UPDATE
+                 cnt = cnt + 1,
+                 last_sent_at = GREATEST(COALESCE(last_sent_at, NEW.sent_at), NEW.sent_at);
+        END IF;
+    END",
+    // v13: refuse the delete rather than drift.
+    //
+    // A count kept incrementally can be maintained through an insert and cannot
+    // be maintained through a delete: recovering `MAX(sent_at)` after removing
+    // the newest line means re-reading the conversation, and MariaDB forbids a
+    // trigger from reading the table it is defined on. The archive is append-only
+    // by design — nothing in either repo issues a DELETE — so the honest move is
+    // to make the unmaintainable case impossible to express rather than to let it
+    // silently produce a wrong number.
+    //
+    // To genuinely delete: drop this trigger, delete, rebuild the affected rows
+    // with the backfill statement in v12, and recreate it.
+    r"CREATE OR REPLACE TRIGGER trg_irc_stats_bd BEFORE DELETE ON irc_messages FOR EACH ROW
+    BEGIN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT =
+            'irc_messages is append-only: a DELETE would drift irc_conversation_stats';
+    END",
+    // v14: refuse only the updates that would drift it.
+    //
+    // ⚠ Deliberately NOT a blanket refusal. `is_self` has already needed
+    // correcting in production — one row filed as somebody else's before
+    // `irc_tail` learned the self-nicks — and `text`/`nick` are equally
+    // repairable. None of those three change a count or a last-message time.
+    // Only `conversation_id`, `kind` and `sent_at` do, and those are the three
+    // this refuses.
+    r"CREATE OR REPLACE TRIGGER trg_irc_stats_bu BEFORE UPDATE ON irc_messages FOR EACH ROW
+    BEGIN
+        IF NEW.conversation_id <> OLD.conversation_id
+           OR NEW.kind <> OLD.kind
+           OR NEW.sent_at <> OLD.sent_at THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT =
+                'changing conversation_id, kind or sent_at would drift irc_conversation_stats';
+        END IF;
+    END",
 ];
 
 #[derive(Clone)]

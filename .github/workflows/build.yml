@@ -1,11 +1,15 @@
 ---
 name: build
 
-# signal-archiver (Rust) — gate on fmt + clippy + cargo test (the frame-parser
-# tests in tests/parse.rs are pure units, no MariaDB needed), then build + push
+# signal-archiver (Rust) — gate on fmt + clippy + cargo test, then build + push
 # xinutec/signal-archiver:latest to Docker Hub. The k8s manifests + deploy live
 # in the home monorepo (xinutec/pippijn code/kubes/signal/k8s); the image tag is
 # the only contract between this repo and the deploy.
+#
+# tests/parse.rs and tests/irclog.rs are pure units, but tests/irc_stats.rs is
+# not: `irc_conversation_stats` is maintained by DATABASE TRIGGERS, so the only
+# thing that can test it is a database. Without the service below that test
+# skips itself silently and the triggers ship unverified.
 on:
   push:
     branches: [main]
@@ -19,6 +23,17 @@ jobs:
       contents: read
     runs-on: ubuntu-latest
     container: rust:1-bookworm
+    services:
+      mariadb:
+        image: mariadb:11.8
+        env:
+          MARIADB_ROOT_PASSWORD: root
+          MARIADB_DATABASE: signal_test
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=5s --health-timeout=5s --health-retries=10
+    env:
+      SIGNAL_TEST_DATABASE_URL: mysql://root:root@mariadb:3306/signal_test
     steps:
       - uses: actions/checkout@v6
       - run: rustup component add clippy rustfmt
