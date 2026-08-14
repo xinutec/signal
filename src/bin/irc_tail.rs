@@ -377,20 +377,37 @@ async fn main() -> Result<()> {
                     );
                 }
                 let mut wrote = 0;
+                let mut lost = 0;
                 for ev in &reply.events {
                     match store(&db, &args, &mut conversations, ev).await {
                         Ok(true) => wrote += 1,
                         Ok(false) => {}
                         // One bad event must not end the loop: the reconciler
                         // will place that line, and the next one may be fine.
-                        Err(e) => eprintln!("irc_tail: could not store a line: {e:#}"),
+                        Err(e) => {
+                            lost += 1;
+                            eprintln!("irc_tail: could not store a line: {e:#}");
+                        }
                     }
                 }
                 if !reply.events.is_empty() {
+                    // ⚠ Three outcomes, and only the third is a fault. Saying
+                    // just "N offered, W written" reports the healthy race as a
+                    // shortfall: sending from the app archives the echo first,
+                    // so the tail is SUPPOSED to lose and write nothing. An
+                    // alert that fires on correct behaviour is one you learn to
+                    // ignore, which is how the real case below gets missed.
+                    let held = reply.events.len() - wrote - lost;
+                    let alarm = if lost > 0 {
+                        format!(", {lost} LOST to errors above")
+                    } else {
+                        String::new()
+                    };
                     println!(
-                        "irc_tail: {} line(s) offered, {wrote} written, seq now {}",
-                        reply.events.len(),
-                        reply.seq
+                        "irc_tail: {offered} line(s) offered, {wrote} new, \
+                         {held} already archived{alarm}, seq now {seq}",
+                        offered = reply.events.len(),
+                        seq = reply.seq,
                     );
                 }
                 after = reply.seq;
