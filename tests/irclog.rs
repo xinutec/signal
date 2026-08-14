@@ -180,6 +180,17 @@ fn a_user_notice_keeps_the_nick_and_drops_the_hostmask() {
     assert_eq!(e.text, "ping");
 }
 
+/// An older irssi theme wrote a person's notice as `[notice(nick)] text`. Three
+/// lines in the measured tree, all from 2013, and they are the entire remainder
+/// — with this the corpus classifies completely.
+#[test]
+fn the_older_bracketed_notice_form_is_also_a_notice() {
+    let e = only("21:05 [notice(alice)] ping");
+    assert_eq!(e.kind, Kind::Notice);
+    assert_eq!(e.nick.as_deref(), Some("alice"));
+    assert_eq!(e.text, "ping");
+}
+
 /// The OTR plugin logs its status into the conversation it protects: 288 lines,
 /// all in private logs. Grey lines about the conversation rather than in it, so
 /// they are events — the same thing a join is, from the reader's side.

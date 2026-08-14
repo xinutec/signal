@@ -284,6 +284,12 @@ fn parse_entry(date: Date, line_no: u32, line: &str) -> Option<Entry> {
         let nick = who.split_once('(').map_or(who, |(nick, _host)| nick);
         return entry(Kind::Notice, Some(nick), text);
     }
+    // `[notice(nick)] text` — the same thing an older irssi theme wrote before
+    // the dashed form. 3 measured, all from 2013.
+    if let Some(rest) = rest.strip_prefix("[notice(") {
+        let (nick, text) = rest.split_once(")] ")?;
+        return entry(Kind::Notice, Some(nick), text);
+    }
     // The OTR plugin logs its status into the conversation it protects (288
     // measured, all private). ⚠ Matched literally rather than as `word:`: a
     // general rule would swallow the next plugin's output as a known class

@@ -76,6 +76,52 @@ const MIGRATIONS: &[&str] = &[
         ADD COLUMN edited TINYINT(1) NOT NULL DEFAULT 0,
         ADD COLUMN edit_of_ts BIGINT NULL,
         ADD INDEX idx_edit_of (edit_of_ts)",
+    // v7: IRC conversations — one per (network, target), where the target is a
+    // channel (`#name`) or a nick, straight out of irssi's `autolog_path`.
+    //
+    // `is_status` marks the pseudo-conversation irssi files server notices
+    // into: it is named after your *own* nick, so it looks exactly like a DM
+    // with yourself and is nothing of the kind — 385,012 of one network's
+    // 966,039 logged lines land there. The reader needs to be able to leave it
+    // out without knowing whose nick it was.
+    r"CREATE TABLE IF NOT EXISTS irc_conversations (
+        id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        network VARCHAR(64) NOT NULL,
+        target VARCHAR(255) NOT NULL,
+        is_channel TINYINT(1) NOT NULL DEFAULT 0,
+        is_status TINYINT(1) NOT NULL DEFAULT 0,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        UNIQUE KEY uniq_irc_conv (network, target)
+    )",
+    // v8: IRC lines, one row per logged line.
+    //
+    // ⚠ **`source_tag` is in the dedupe key, and that is what makes merging two
+    // irssi tags into one conversation safe.** irssi invents a second tag
+    // (`net2`) for a second simultaneous connection, and both write
+    // `<tag>/<Y>/<M>/<D>/<target>.log` — so the same conversation on the same
+    // day exists as two files, 18 such pairs in the measured tree. Keyed on
+    // `(conversation, date, line)` alone the second file's lines would collide
+    // with the first's and be dropped by the INSERT IGNORE, silently and
+    // exactly where two connections overlapped.
+    //
+    // Seconds are always zero: irssi's default `timestamp_format` is `%H:%M`
+    // and the date comes from the path, so `sent_at` is as precise as the
+    // source. Lines within a minute keep file order, which `id` preserves.
+    r"CREATE TABLE IF NOT EXISTS irc_messages (
+        id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        conversation_id INT NOT NULL,
+        source_tag VARCHAR(64) NOT NULL,
+        file_date DATE NOT NULL,
+        line_no INT NOT NULL,
+        sent_at DATETIME NOT NULL,
+        nick VARCHAR(255) NULL,
+        is_self TINYINT(1) NOT NULL DEFAULT 0,
+        kind ENUM('message','action','event','notice') NOT NULL,
+        text TEXT NULL,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE KEY uniq_irc_line (conversation_id, source_tag, file_date, line_no),
+        INDEX idx_irc_conv_ts (conversation_id, sent_at)
+    )",
 ];
 
 #[derive(Clone)]
@@ -306,5 +352,66 @@ impl Db {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Ensure the conversation exists and return its id.
+    ///
+    /// `LAST_INSERT_ID(id)` on the duplicate branch is what makes this one round
+    /// trip: MariaDB hands back the *existing* row's id rather than zero, so the
+    /// caller never has to decide between an insert and a select.
+    pub async fn upsert_irc_conversation(
+        &self,
+        network: &str,
+        target: &str,
+        is_channel: bool,
+        is_status: bool,
+    ) -> Result<u64> {
+        let res = sqlx::query(
+            "INSERT INTO irc_conversations (network, target, is_channel, is_status)
+             VALUES (?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE id = LAST_INSERT_ID(id), is_status = ?",
+        )
+        .bind(network)
+        .bind(target)
+        .bind(is_channel)
+        .bind(is_status)
+        .bind(is_status)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.last_insert_id())
+    }
+
+    /// Insert one logged line. `false` means `INSERT IGNORE` dropped a duplicate,
+    /// which is the normal result of re-running an import over logs already read.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_irc_line(
+        &self,
+        conversation_id: u64,
+        source_tag: &str,
+        file_date: &str,
+        line_no: u32,
+        sent_at: &str,
+        nick: Option<&str>,
+        is_self: bool,
+        kind: &str,
+        text: &str,
+    ) -> Result<bool> {
+        let res = sqlx::query(
+            "INSERT IGNORE INTO irc_messages
+                (conversation_id, source_tag, file_date, line_no, sent_at, nick, is_self, kind, text)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(conversation_id)
+        .bind(source_tag)
+        .bind(file_date)
+        .bind(line_no)
+        .bind(sent_at)
+        .bind(nick)
+        .bind(is_self)
+        .bind(kind)
+        .bind(text)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() != 0)
     }
 }
