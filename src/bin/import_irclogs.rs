@@ -185,6 +185,8 @@ async fn main() -> Result<()> {
         (Some(db), false) => db.irc_import_state().await?,
         _ => HashMap::new(),
     };
+    // Files read but not yet recorded as read, awaiting the next flush.
+    let mut pending_state: Vec<(String, i64, i64)> = vec![];
 
     for rel in &logs {
         let Some(path) = parse_path(rel) else {
@@ -294,14 +296,29 @@ async fn main() -> Result<()> {
         // means re-reading it on every run forever — which is the cost this
         // exists to remove. A file that failed above never reaches here, so the
         // next run picks it up again.
-        db.record_irc_import(rel, state.0, state.1).await?;
+        //
+        // Queued rather than written: see `record_irc_imports`. Flushed on the
+        // same boundary the progress line prints on, so what the run says it has
+        // done and what it has recorded having done move together.
+        pending_state.push((rel.clone(), state.0, state.1));
 
         if report.files.is_multiple_of(500) {
+            db.record_irc_imports(&pending_state).await?;
+            pending_state.clear();
             println!(
                 "  {} files, {} rows written…",
                 report.files, report.inserted
             );
         }
+    }
+
+    // ⚠ The tail. Without this every run loses up to 499 files' worth of
+    // progress — they would be read again next time, forever, which reads as
+    // "the skip does not work" rather than as a missing flush.
+    if let Some(db) = &db
+        && !pending_state.is_empty()
+    {
+        db.record_irc_imports(&pending_state).await?;
     }
 
     print_report(&args, &report);
