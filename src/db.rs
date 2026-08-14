@@ -381,37 +381,62 @@ impl Db {
         Ok(res.last_insert_id())
     }
 
-    /// Insert one logged line. `false` means `INSERT IGNORE` dropped a duplicate,
-    /// which is the normal result of re-running an import over logs already read.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn insert_irc_line(
+    /// Insert a log file's lines, returning how many were new — the rest were
+    /// duplicates `INSERT IGNORE` dropped, which is the normal result of
+    /// re-running an import over logs already read.
+    ///
+    /// ⚠ **Batched because the unit of this import is 860,359 lines.** One
+    /// statement per line is one network round trip per line: tolerable
+    /// in-cluster, hours over a port-forward from a laptop, which is where a
+    /// history import is actually run. A log file averages ~72 lines, so a
+    /// statement per file is a ~72× cut in round trips at no cost in
+    /// idempotence — the dedupe key does that work, not the batching.
+    ///
+    /// Chunked at [`INSERT_CHUNK`] rows regardless, because MySQL's protocol
+    /// caps a statement at 65,535 placeholders and a busy channel's day can run
+    /// to thousands of lines.
+    pub async fn insert_irc_lines(
         &self,
         conversation_id: u64,
         source_tag: &str,
         file_date: &str,
-        line_no: u32,
-        sent_at: &str,
-        nick: Option<&str>,
-        is_self: bool,
-        kind: &str,
-        text: &str,
-    ) -> Result<bool> {
-        let res = sqlx::query(
-            "INSERT IGNORE INTO irc_messages
-                (conversation_id, source_tag, file_date, line_no, sent_at, nick, is_self, kind, text)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(conversation_id)
-        .bind(source_tag)
-        .bind(file_date)
-        .bind(line_no)
-        .bind(sent_at)
-        .bind(nick)
-        .bind(is_self)
-        .bind(kind)
-        .bind(text)
-        .execute(&self.pool)
-        .await?;
-        Ok(res.rows_affected() != 0)
+        lines: &[IrcLine],
+    ) -> Result<u64> {
+        let mut written = 0;
+        for chunk in lines.chunks(INSERT_CHUNK) {
+            let mut qb = sqlx::QueryBuilder::new(
+                "INSERT IGNORE INTO irc_messages
+                    (conversation_id, source_tag, file_date, line_no, sent_at, nick, is_self, kind, text) ",
+            );
+            qb.push_values(chunk, |mut row, line| {
+                row.push_bind(conversation_id)
+                    .push_bind(source_tag)
+                    .push_bind(file_date)
+                    .push_bind(line.line_no)
+                    .push_bind(&line.sent_at)
+                    .push_bind(&line.nick)
+                    .push_bind(line.is_self)
+                    .push_bind(line.kind)
+                    .push_bind(&line.text);
+            });
+            written += qb.build().execute(&self.pool).await?.rows_affected();
+        }
+        Ok(written)
     }
+}
+
+/// Rows per statement. 9 columns × 1,000 is well inside MySQL's 65,535
+/// placeholder cap, with room for the column list to grow.
+const INSERT_CHUNK: usize = 1_000;
+
+/// One logged line, ready to write. Owned rather than borrowed: it is built per
+/// file and handed straight to the batch, and threading a lifetime through that
+/// buys nothing at 72 rows.
+pub struct IrcLine {
+    pub line_no: u32,
+    pub sent_at: String,
+    pub nick: Option<String>,
+    pub is_self: bool,
+    pub kind: &'static str,
+    pub text: String,
 }

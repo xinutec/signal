@@ -30,7 +30,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use signal_archiver::db::Db;
+use signal_archiver::db::{Db, IrcLine};
 use signal_archiver::irclog::{Kind, parse_log, parse_path};
 
 struct Args {
@@ -176,47 +176,60 @@ async fn main() -> Result<()> {
 
         for entry in &parsed.entries {
             *report.by_kind.entry(entry.kind.as_str()).or_default() += 1;
-            let Some(db) = &db else { continue };
+        }
 
-            let key = (stored_network.to_string(), path.target.clone());
-            let conversation_id = match conversations.get(&key) {
-                Some(id) => *id,
-                None => {
-                    let id = db
-                        .upsert_irc_conversation(
-                            stored_network,
-                            &path.target,
-                            path.is_channel(),
-                            is_status,
-                        )
-                        .await?;
-                    conversations.insert(key, id);
-                    id
-                }
-            };
+        let Some(db) = &db else { continue };
+        if parsed.entries.is_empty() {
+            continue;
+        }
 
-            let is_self = entry
-                .nick
-                .as_ref()
-                .is_some_and(|n| args.self_nicks.contains(n));
-            let written = db
-                .insert_irc_line(
-                    conversation_id,
-                    &path.network,
-                    &file_date,
-                    entry.line_no,
-                    &entry.at.to_string(),
-                    entry.nick.as_deref(),
-                    is_self,
-                    entry.kind.as_str(),
-                    &entry.text,
-                )
-                .await?;
-            if written {
-                report.inserted += 1;
-            } else {
-                report.duplicates += 1;
+        let key = (stored_network.to_string(), path.target.clone());
+        let conversation_id = match conversations.get(&key) {
+            Some(id) => *id,
+            None => {
+                let id = db
+                    .upsert_irc_conversation(
+                        stored_network,
+                        &path.target,
+                        path.is_channel(),
+                        is_status,
+                    )
+                    .await?;
+                conversations.insert(key, id);
+                id
             }
+        };
+
+        let lines: Vec<IrcLine> = parsed
+            .entries
+            .iter()
+            .map(|entry| IrcLine {
+                line_no: entry.line_no,
+                sent_at: entry.at.to_string(),
+                nick: entry.nick.clone(),
+                is_self: entry
+                    .nick
+                    .as_ref()
+                    .is_some_and(|n| args.self_nicks.contains(n)),
+                kind: entry.kind.as_str(),
+                text: entry.text.clone(),
+            })
+            .collect();
+
+        // The source tag, not the stored network: two connections to one server
+        // write the same path under different tags, and this is what keeps their
+        // lines from colliding once --map has merged the conversations.
+        let written = db
+            .insert_irc_lines(conversation_id, &path.network, &file_date, &lines)
+            .await?;
+        report.inserted += written;
+        report.duplicates += lines.len() as u64 - written;
+
+        if report.files.is_multiple_of(500) {
+            println!(
+                "  {} files, {} rows written…",
+                report.files, report.inserted
+            );
         }
     }
 

@@ -90,6 +90,12 @@ fn a_message_carries_its_nick_and_text() {
 /// Channel ops are logged `<@nick>`, voice `<+nick>`. The prefix is a mode on
 /// the channel, not part of anybody's name — keeping it would file the same
 /// person under two names the day they are opped.
+///
+/// ⚠ **A space is one of those modes: it is the column with no mode in it.**
+/// 323,570 of the 425,748 measured messages are `< nick>` — every ordinary
+/// person speaking in a channel — against 102,178 unpadded. Treating the space
+/// as part of the name split every unopped participant into two people, and put
+/// 13,465 of the archive's owner's own messages under somebody else.
 #[test]
 fn a_mode_prefix_is_not_part_of_the_nick() {
     for (line, nick) in [
@@ -98,10 +104,20 @@ fn a_mode_prefix_is_not_part_of_the_nick() {
         ("21:05 <%carol> hi", "carol"),
         ("21:05 <~dave> hi", "dave"),
         ("21:05 <&erin> hi", "erin"),
+        ("21:05 < frank> hi", "frank"),
     ] {
         let e = only(line);
         assert_eq!(e.nick.as_deref(), Some(nick), "for {line}");
     }
+}
+
+/// The same person, opped and not, is one person.
+#[test]
+fn the_padded_and_opped_forms_of_one_nick_agree() {
+    assert_eq!(
+        only("21:05 < alice> hi").nick,
+        only("21:05 <@alice> hi").nick
+    );
 }
 
 /// The text is taken whole after the first `> `, so a message *about* IRC
