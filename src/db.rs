@@ -3,7 +3,10 @@
 //! `schema_version`. To evolve the schema, APPEND a new entry — never edit an
 //! existing one.
 
+use std::collections::HashMap;
+
 use anyhow::Result;
+use sqlx::Row;
 use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
 
 use crate::parse::ThreadId;
@@ -150,6 +153,30 @@ const MIGRATIONS: &[&str] = &[
     // is the only way that question could be answered.
     "ALTER TABLE irc_messages
         ADD INDEX IF NOT EXISTS idx_irc_conv_kind_ts (conversation_id, kind, sent_at)",
+    // v10: what the importer has already read, so a run costs what is NEW.
+    //
+    // ⚠ MEASURED: an import took 5–7 minutes to write 3 rows. The work was never
+    // proportional to what arrived — every run re-read all 36,201 staged files
+    // and re-issued `INSERT IGNORE` for all 3.68M lines, letting the unique key
+    // throw away 99.9999% of them. Hourly was a consequence of that cost, not a
+    // decision about latency.
+    //
+    // `(mtime, size)` rather than a content hash: irssi's logs are append-only,
+    // so a change always moves both, and hashing would mean reading every file —
+    // which is the cost being removed. It is also exactly the pair `rsync`'s own
+    // quick-check uses, so a file rsync did not transfer is a file this skips,
+    // and the two cannot disagree about what changed.
+    //
+    // ⚠ The row is written AFTER the lines land, so a file that fails mid-import
+    // is simply not marked and the next run does it again. And the importer only
+    // writes here under `--apply`: a dry run that recorded progress would make
+    // the next real run skip work it never did.
+    r"CREATE TABLE IF NOT EXISTS irc_import_state (
+        rel_path VARCHAR(512) NOT NULL PRIMARY KEY,
+        mtime_ns BIGINT NOT NULL,
+        size_bytes BIGINT NOT NULL,
+        imported_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    )",
 ];
 
 #[derive(Clone)]
@@ -450,6 +477,44 @@ impl Db {
             written += qb.build().execute(&self.pool).await?.rows_affected();
         }
         Ok(written)
+    }
+
+    /// Every file the importer has already read, as `rel_path → (mtime_ns, size)`.
+    ///
+    /// Read whole, once, rather than a `SELECT` per file: it is one row per log
+    /// file — 36,201 today, a few MB — and the alternative is 36,201 round trips
+    /// to decide whether to do nothing.
+    pub async fn irc_import_state(&self) -> Result<HashMap<String, (i64, i64)>> {
+        let rows = sqlx::query("SELECT rel_path, mtime_ns, size_bytes FROM irc_import_state")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(|r| {
+                Ok((
+                    r.try_get("rel_path")?,
+                    (r.try_get("mtime_ns")?, r.try_get("size_bytes")?),
+                ))
+            })
+            .collect()
+    }
+
+    /// Mark one file as imported at the state it was read in.
+    ///
+    /// ⚠ Call this only AFTER the lines are in, and only under `--apply`. It is
+    /// the record of work done; writing it before, or during a dry run, converts
+    /// the next run's skip into data loss that nothing reports.
+    pub async fn record_irc_import(&self, rel_path: &str, mtime_ns: i64, size: i64) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO irc_import_state (rel_path, mtime_ns, size_bytes)
+             VALUES (?, ?, ?)
+             ON DUPLICATE KEY UPDATE mtime_ns = VALUES(mtime_ns), size_bytes = VALUES(size_bytes)",
+        )
+        .bind(rel_path)
+        .bind(mtime_ns)
+        .bind(size)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 }
 

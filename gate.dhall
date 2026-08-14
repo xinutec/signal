@@ -50,10 +50,39 @@ in  { name = "signal-archiver"
           env = G.clippyTarget
         , timeout_s = 900
         }
-      , G.Check::{
-        , name = "tests"
-        , argv = G.inDevShell [ "cargo", "test" ]
-        , timeout_s = 900
+      , {-  ⚠ THROUGH A REAL MARIADB, and the row exists because `cargo test`
+              alone would have SKIPPED the tests that matter most here. The
+              importer's incremental behaviour — which files it decides not to
+              read — is only testable against a database, so `tests/import_irclogs.rs`
+              is written to skip when `SIGNAL_TEST_DATABASE_URL` is unset. Run
+              without this, those four tests print "skipping" and the gate stays
+              green while the one failure mode that produces no error, no warning
+              and no row goes unchecked.
+
+              Port 3320: fleetwatch's ephemeral server takes 3317, messages 3318
+              and coach 3319, so the fleet gate can run them all at once.
+
+              No `--grant-all`: this suite uses the one database it is given.
+          -}
+        G.Check::{
+        , name = "tests (against a real MariaDB)"
+        , argv =
+              G.inDevShell [ "nix", "run", "../dev-lint#with-test-db", "--" ]
+            # [ "--database"
+              , "signal_test"
+              , "--user"
+              , "signal"
+              , "--password"
+              , "signal"
+              , "--port"
+              , "3320"
+              , "--url-env"
+              , "SIGNAL_TEST_DATABASE_URL"
+              , "--"
+              , "cargo"
+              , "test"
+              ]
+        , timeout_s = 1800
         }
       , {-  The lockfile check: `gate.json` is what runs, `gate.dhall` is what
               typechecks, and this is what stops them drifting. `gate` does the

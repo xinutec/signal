@@ -42,13 +42,28 @@
         "develop",
         "--no-warn-dirty",
         "--command",
+        "nix",
+        "run",
+        "../dev-lint#with-test-db",
+        "--",
+        "--database",
+        "signal_test",
+        "--user",
+        "signal",
+        "--password",
+        "signal",
+        "--port",
+        "3320",
+        "--url-env",
+        "SIGNAL_TEST_DATABASE_URL",
+        "--",
         "cargo",
         "test"
       ],
       "cwd": ".",
       "env": {},
-      "name": "tests",
-      "timeout_s": 900
+      "name": "tests (against a real MariaDB)",
+      "timeout_s": 1800
     },
     {
       "argv": [
