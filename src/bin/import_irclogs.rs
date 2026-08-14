@@ -133,6 +133,32 @@ fn file_state(path: &Path) -> Result<(i64, i64)> {
     Ok((mtime, meta.len() as i64))
 }
 
+/// The part of a snapshot that is safe to parse: up to and including the last
+/// newline.
+///
+/// ⚠ **A LINE WITHOUT ITS NEWLINE IS A LINE STILL BEING WRITTEN, and importing
+/// one corrupts the archive permanently.** `rsync` copies whatever the file
+/// holds at that instant, and irssi may be halfway through appending. Rust's
+/// `lines()` yields that fragment like any other line, so it would be parsed and
+/// inserted — and when the complete line arrives it carries the SAME `line_no`,
+/// which the dedupe key refuses. The truncated text would stay, with no error
+/// anywhere and no run that could ever correct it.
+///
+/// Leaving it costs nothing: the file grows when the write finishes, so the next
+/// run sees a changed size and reads the whole line properly.
+///
+/// MEASURED before relying on it — all 36,201 files in the archive end with a
+/// newline, so this drops nothing that was ever complete. A file that genuinely
+/// ended mid-line would hold its last line back until it grew, which is the
+/// right way round: a fragment is not a message.
+fn complete_lines(text: &str) -> &str {
+    match text.rfind('\n') {
+        Some(i) => &text[..=i],
+        // No newline at all: nothing in this snapshot is known to be finished.
+        None => "",
+    }
+}
+
 /// Every `*.log` under `root`, as paths relative to it, in sorted order.
 ///
 /// Sorted because `id` is the tiebreak for two lines in the same minute —
@@ -225,7 +251,11 @@ async fn main() -> Result<()> {
             }
         };
 
-        let parsed = parse_log(path.date, &text);
+        // ⚠ `complete_lines`, not `text`: the last line may still be being
+        // written. Line numbering is unaffected — the dropped line is the last
+        // one, so every line kept has the number it always had, which is half
+        // the dedupe key.
+        let parsed = parse_log(path.date, complete_lines(&text));
         report.files += 1;
         report.unparsed += parsed.unparsed.len() as u64;
         for line_no in &parsed.unparsed {

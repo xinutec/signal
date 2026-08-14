@@ -159,6 +159,68 @@ fn all_re_reads_files_that_have_not_changed() {
     );
 }
 
+/// The text of every line stored for one conversation, oldest first.
+async fn stored_text(tag: &str) -> Vec<String> {
+    let url = std::env::var("SIGNAL_TEST_DATABASE_URL").unwrap();
+    let pool = sqlx::MySqlPool::connect(&url).await.unwrap();
+    // ⚠ The `query_as` TUPLE form, not `query_scalar`. `irc_messages.text` is
+    // NULLable (an event line — a join, a mode change — has no text), and
+    // dev-lint's DL-SQLX-ROW-TYPES peels one `Option` off a `query_scalar`
+    // target assuming it is the collection wrapper, so
+    // `query_scalar::<_, Option<String>>` reads to it as a bare `String` and no
+    // turbofish can satisfy it. The tuple form is judged correctly.
+    let rows: Vec<(Option<String>,)> = sqlx::query_as(
+        "SELECT m.text FROM irc_messages m
+           JOIN irc_conversations c ON c.id = m.conversation_id
+          WHERE c.network = ? ORDER BY m.file_date, m.line_no",
+    )
+    .bind(tag)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    rows.into_iter().map(|(t,)| t.unwrap_or_default()).collect()
+}
+
+/// ⚠ **THE CORRUPTION THIS PREVENTS IS PERMANENT.** `rsync` copies a log file
+/// whatever irssi is doing to it, so a snapshot can end halfway through a line.
+/// Imported, that fragment takes the `line_no` the finished line will have — and
+/// the dedupe key then refuses the real one forever. No error, no warning, and
+/// no run that could ever correct it; the archive would simply hold half a
+/// sentence.
+///
+/// It is also why the cadence matters: at 24 runs a day this is rare, and the
+/// whole point of #880 is to run it far more often.
+#[tokio::test]
+async fn a_half_written_last_line_is_left_until_it_is_finished() {
+    if db_env().is_none() {
+        eprintln!("skipping: SIGNAL_TEST_DATABASE_URL not set");
+        return;
+    }
+    let tag = "tnetpartial";
+    // No trailing newline: irssi is still writing this line.
+    let root = tree(tag, "10:00 < alice> first\n10:01 < alice> half of a");
+    let first = import(&root, &["--apply"]);
+    assert!(
+        first.contains("wrote 1 rows"),
+        "only the finished line: {first}"
+    );
+    assert_eq!(stored_text(tag).await, ["first"]);
+
+    // irssi finishes the line.
+    fs::write(
+        log_path(&root, tag),
+        "10:00 < alice> first\n10:01 < alice> half of a sentence\n",
+    )
+    .unwrap();
+    let second = import(&root, &["--apply"]);
+    assert!(second.contains("wrote 1 rows"), "{second}");
+    assert_eq!(
+        stored_text(tag).await,
+        ["first", "half of a sentence"],
+        "the whole line, not the fragment that was there when rsync looked"
+    );
+}
+
 #[test]
 fn a_dry_run_records_nothing_so_the_next_real_run_still_reads_the_file() {
     if db_env().is_none() {
