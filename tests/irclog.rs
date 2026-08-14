@@ -365,3 +365,59 @@ fn a_timestamp_renders_as_a_mariadb_datetime() {
     let e = only("09:05 <alice> hi");
     assert_eq!(e.at.to_string(), "2026-08-14 09:05:00");
 }
+
+// ------------------------------------------------- one line, two readers
+
+/// A line read on its own means exactly what it means read in its file.
+///
+/// ⚠ **THIS IS THE CONTRACT BETWEEN THE TWO TIERS.** `import_irclogs` parses
+/// whole files; `irc_tail` is handed one line at a time by the irssi plugin and
+/// parses it alone, then writes the row on the archive's dedupe key. If the two
+/// readings differed by so much as a nick, the live row and the row the next
+/// import would write would be different rows about the same line — and the
+/// dedupe key would keep whichever landed first, silently.
+///
+/// Everything but `line_no` must match: the single-line parse cannot know where
+/// in the file the line sat, which is why the plugin reports that separately and
+/// `irc_tail` overrides it.
+#[test]
+fn a_line_parsed_alone_matches_the_same_line_parsed_in_its_file() {
+    // The shapes that actually differ between readings if anything is wrong: the
+    // channel-mode space in `< nick>`, an op's `<@nick>`, an action, a server
+    // notice, and an event with no speaker.
+    let file = "--- Log opened Fri Aug 14 00:00:00 2026\n\
+                10:00 < alice> a plain line\n\
+                10:01 <@bob> an op speaks\n\
+                10:02  * alice waves\n\
+                10:03 !server [*** ] a server notice\n\
+                10:04 -!- carol [carol@host] has joined #chan\n";
+
+    let whole = parse_log(DAY, file);
+    assert!(
+        whole.unparsed.is_empty(),
+        "fixture must parse: {:?}",
+        whole.unparsed
+    );
+    assert_eq!(whole.entries.len(), 5, "five entries in the fixture");
+
+    let lines: Vec<&str> = file.lines().collect();
+    for entry in &whole.entries {
+        let raw = lines[entry.line_no as usize - 1];
+        let alone = parse_log(DAY, &format!("{raw}\n"));
+        assert_eq!(
+            alone.entries.len(),
+            1,
+            "line {} parsed alone yielded {} entries: {raw:?}",
+            entry.line_no,
+            alone.entries.len()
+        );
+        let solo = &alone.entries[0];
+        assert_eq!(solo.at, entry.at, "timestamp differs for {raw:?}");
+        assert_eq!(solo.kind, entry.kind, "kind differs for {raw:?}");
+        assert_eq!(solo.nick, entry.nick, "nick differs for {raw:?}");
+        assert_eq!(solo.text, entry.text, "text differs for {raw:?}");
+        // The one field a single line cannot know, and the reason the plugin
+        // reports it: alone, every line is line 1.
+        assert_eq!(solo.line_no, 1, "a line read alone is always line 1");
+    }
+}

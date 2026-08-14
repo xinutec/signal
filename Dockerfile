@@ -7,7 +7,8 @@ COPY Cargo.toml Cargo.lock* ./
 COPY src ./src
 RUN cargo build --release \
     && cp target/release/signal-archiver /signal-archiver \
-    && cp target/release/import_irclogs /import_irclogs
+    && cp target/release/import_irclogs /import_irclogs \
+    && cp target/release/irc_tail /irc_tail
 
 # --- runtime -------------------------------------------------------------
 FROM debian:bookworm-slim
@@ -23,7 +24,12 @@ RUN groupadd --gid 65532 archiver \
     && useradd --uid 65532 --gid archiver --no-create-home --shell /usr/sbin/nologin archiver
 COPY --from=build /signal-archiver /usr/local/bin/signal-archiver
 COPY --from=build /import_irclogs /usr/local/bin/import_irclogs
+COPY --from=build /irc_tail /usr/local/bin/irc_tail
 USER archiver
-# The ingester is what this image runs by default; the IRC importer is a CronJob
-# that overrides the command, because it is a periodic pull rather than a daemon.
+# Three programs, one image, because they share the schema and the parser: the
+# ingester (default), the IRC importer that a CronJob runs periodically, and
+# `irc_tail`, the Deployment that holds a long poll open to irssi so a line
+# reaches the archive in under a second. The importer is the reconciler for what
+# `irc_tail` misses; they write the same rows on the same dedupe key, which is
+# only true because they share `irclog.rs`.
 ENTRYPOINT ["signal-archiver"]
