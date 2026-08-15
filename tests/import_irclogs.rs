@@ -13,13 +13,17 @@
 //! not in the archive, and nothing ever looks at that file again.
 //!
 //! They run when `SIGNAL_TEST_DATABASE_URL` points at a *throwaway* database and
-//! are skipped otherwise. Each test uses its own network tag, so the rows and
-//! the `irc_import_state` keys of one cannot collide with another's and they are
-//! safe to run in parallel. NEVER point this at the real signal database.
+//! are skipped otherwise. Each test uses a network tag of its own, unique to the
+//! test AND to the run (see [`tag`]), so the rows and the `irc_import_state` keys
+//! of one collide with neither another test's nor an earlier run's. They are safe
+//! to run in parallel and safe to run twice. NEVER point this at the real signal
+//! database.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// `mysql://user:pass@host:port/name` split into the five variables the binary
 /// reads from the environment. None when the variable is unset, which is what
@@ -38,6 +42,38 @@ fn db_env() -> Option<Vec<(&'static str, String)>> {
         ("DB_USER", user.to_string()),
         ("DB_PASSWORD", pass.to_string()),
     ])
+}
+
+/// A network tag unique to `base` *and* to this run.
+///
+/// ⚠ **UNIQUE PER TEST IS NOT ENOUGH — IT HAS TO BE UNIQUE PER RUN.** The tags
+/// used to be constants, which kept the five tests out of each other's way and
+/// did nothing about the run before. A second `cargo test` against the same
+/// database then failed four of five: the rows are still there, so the dedupe key
+/// refuses them, and `irc_import_state` still holds the `rel_path` — which embeds
+/// the tag — so the importer reports `0 log files read` where the test wants 2
+/// rows written. Green on a fresh database and red on a used one is worse than
+/// either, because it reads as a bug in whatever was being changed at the time.
+///
+/// Dropping the rows instead is not on offer: `trg_irc_stats_bd` refuses a DELETE
+/// on `irc_messages` by design, so nothing here can clean up after itself and
+/// every run has to land somewhere new.
+///
+/// One nonce for the whole process, so every row a single run wrote shares a
+/// suffix and can be read back as one batch by hand.
+fn tag(base: &str) -> String {
+    static NONCE: OnceLock<String> = OnceLock::new();
+    let nonce = NONCE.get_or_init(|| {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before the epoch")
+            .as_nanos();
+        // The pid alone repeats across boots and the clock alone can repeat under
+        // a coarse timer; together they are unique in practice. `network` is
+        // VARCHAR(64) and this is well under it.
+        format!("{}-{nanos}", std::process::id())
+    });
+    format!("{base}-{nonce}")
 }
 
 /// A log tree holding one day of one conversation, under a tag of its own.
@@ -87,7 +123,7 @@ fn a_second_run_reads_nothing_and_writes_nothing() {
         eprintln!("skipping: SIGNAL_TEST_DATABASE_URL not set");
         return;
     }
-    let tag = "tnetsecond";
+    let tag = &tag("tnetsecond");
     let root = tree(tag, DAY_ONE);
 
     let first = import(&root, &["--apply"]);
@@ -109,7 +145,7 @@ fn an_appended_line_is_imported_and_only_that_file_is_read() {
     if db_env().is_none() {
         return;
     }
-    let tag = "tnetappend";
+    let tag = &tag("tnetappend");
     let root = tree(tag, DAY_ONE);
     import(&root, &["--apply"]);
 
@@ -142,7 +178,7 @@ fn all_re_reads_files_that_have_not_changed() {
     if db_env().is_none() {
         return;
     }
-    let tag = "tnetall";
+    let tag = &tag("tnetall");
     let root = tree(tag, DAY_ONE);
     import(&root, &["--apply"]);
 
@@ -196,7 +232,7 @@ async fn a_half_written_last_line_is_left_until_it_is_finished() {
         eprintln!("skipping: SIGNAL_TEST_DATABASE_URL not set");
         return;
     }
-    let tag = "tnetpartial";
+    let tag = &tag("tnetpartial");
     // No trailing newline: irssi is still writing this line.
     let root = tree(tag, "10:00 < alice> first\n10:01 < alice> half of a");
     let first = import(&root, &["--apply"]);
@@ -226,7 +262,7 @@ fn a_dry_run_records_nothing_so_the_next_real_run_still_reads_the_file() {
     if db_env().is_none() {
         return;
     }
-    let tag = "tnetdry";
+    let tag = &tag("tnetdry");
     let root = tree(tag, DAY_ONE);
 
     let dry = import(&root, &[]);
