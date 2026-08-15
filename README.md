@@ -45,14 +45,21 @@ ingester (no libsignal/sqlcipher — fast, small build).
   `gchat_*` tables in the same DB (see *Other origins* below).
 
 ## Tests
-The bug-prone part — mapping signal-cli's JSON to archive actions — is unit-tested
-in `tests/parse.rs` (incoming/outgoing, groups, reactions, deletes, stickers,
-attachments, jsonrpc-wrapping, skips). Run locally:
-```
-nix-shell -p cargo rustc --run "cargo test"
-```
-(`db.rs` SQL is not unit-tested — it needs a live MariaDB; CI gates the image on
-`cargo test` via the `signal-verify` job.)
+`tests/parse.rs` unit-tests the bug-prone part — mapping signal-cli's JSON to
+archive actions (incoming/outgoing, groups, reactions, deletes, stickers,
+attachments, jsonrpc-wrapping, skips). No I/O, always runs.
+
+Two suites need a real MariaDB and **skip silently without one**, so a bare
+`cargo test` proves less than it looks like it does:
+- `tests/irc_stats.rs` — the `irc_conversation_stats` triggers (v11–v14): what
+  counts, that replay is free, and that DELETE and edits to
+  `conversation_id`/`kind`/`sent_at` are refused.
+- `tests/import_irclogs.rs` — the importer's incremental behaviour, the one
+  failure mode that produces no error and no row.
+
+Both key off `SIGNAL_TEST_DATABASE_URL`. CI supplies a `mariadb:11.8` service;
+locally use `dev-lint#with-test-db`. Each test tags its rows uniquely per run as
+well as per test, so running the suite twice against one database is safe.
 - `Dockerfile` — pure-Rust build (no C toolchain).
 - `k8s/` — `00-namespace`, `01-pvc` (DB + signal-cli data), `02-db` (MariaDB),
   `03-signal-cli` (the rest-api engine), `04-ingester` (the Rust binary),
