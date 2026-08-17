@@ -3,6 +3,7 @@
 //! (`db`). The binary (`main.rs`) wires these to the receive websocket.
 //! Split into a lib so the parsing is unit-testable (see `tests/`).
 
+pub mod attach;
 pub mod db;
 pub mod irclog;
 pub mod parse;

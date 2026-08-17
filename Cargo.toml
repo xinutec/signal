@@ -15,7 +15,10 @@ serde_json = "1"
 # error rather than a silently absent line.
 serde = { version = "1", features = ["derive"] }
 # Plaintext HTTP to signal-cli-rest-api (attachment bytes + group names); no TLS.
-reqwest = { version = "0.13", default-features = false }
+# `stream` is for `bytes_stream()`: attachment blobs are written chunk by chunk,
+# so the pod's peak memory is one chunk rather than the largest file anyone
+# sends it — which is what lets the container carry a memory limit at all.
+reqwest = { version = "0.13", default-features = false, features = ["stream"] }
 # Runtime SQL only; in-cluster MariaDB is plaintext, so no TLS backend feature.
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "mysql"] }
 anyhow = "1"

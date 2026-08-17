@@ -11,6 +11,7 @@
 //! SIGNAL_NUMBER (E.164), SIGNAL_API_WS (ws://signal-cli-rest-api:8080),
 //! SIGNAL_API_HTTP (http://signal-cli-rest-api:8080), ATTACHMENTS_DIR (/attachments).
 
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -27,6 +28,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 const READ_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_IDLE_PROBES: u32 = 3;
 
+use signal_archiver::attach;
 use signal_archiver::db::Db;
 use signal_archiver::parse::{Action, parse_frame};
 
@@ -236,6 +238,10 @@ async fn dispatch(ctx: &Ctx, frame: &Value) -> Result<()> {
 }
 
 /// Best-effort: fetch the attachment blob from the rest-api and store it.
+///
+/// ⚠ The body is STREAMED, not buffered — see `attach::write_stream` for why
+/// that is the difference between a memory limit that is a ceiling and one that
+/// is a bet on how big somebody else's video is.
 async fn download_attachment(ctx: &Ctx, id: &str) -> Option<String> {
     let url = format!("{}/v1/attachments/{}", ctx.http_base, id);
     let resp = ctx
@@ -249,16 +255,15 @@ async fn download_attachment(ctx: &Ctx, id: &str) -> Option<String> {
         tracing::warn!("attachment {id} fetch returned {}", resp.status());
         return None;
     }
-    let bytes = resp.bytes().await.ok()?;
     let safe: String = id
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
     let path = format!("{}/{}", ctx.attach_dir, safe);
-    match tokio::fs::write(&path, &bytes).await {
+    match attach::write_stream(Path::new(&path), resp.bytes_stream()).await {
         Ok(()) => Some(path),
         Err(e) => {
-            tracing::warn!("writing attachment {id} failed: {e}");
+            tracing::warn!("storing attachment {id} failed: {e:#}");
             None
         }
     }
