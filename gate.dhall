@@ -59,8 +59,14 @@ in  { name = "signal-archiver"
               green while the one failure mode that produces no error, no warning
               and no row goes unchecked.
 
-              Port 3320: fleetwatch's ephemeral server takes 3317, messages 3318
-              and coach 3319, so the fleet gate can run them all at once.
+              Port 3322, and it must be one NOTHING ELSE CLAIMS, so concurrent
+              gates do not fight over a socket. ⚠ This said 3320 and justified it
+              by naming the three repos below it — fleetwatch 3317, messages 3318,
+              coach 3319 — which was true and stopped being true: `life` already
+              held 3320 and `tasks` later took 3321, so this suite and life's
+              collided for weeks. Fixed 2026-09-02. Do not re-derive a free port
+              by listing neighbours; grep `"--port"` across the fleet's gate.dhall
+              files, because the list is what went stale, not the reasoning.
 
               No `--grant-all`: this suite uses the one database it is given.
           -}
@@ -75,7 +81,7 @@ in  { name = "signal-archiver"
               , "--password"
               , "signal"
               , "--port"
-              , "3320"
+              , "3322"
               , "--url-env"
               , "SIGNAL_TEST_DATABASE_URL"
               , "--"
