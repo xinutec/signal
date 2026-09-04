@@ -42,6 +42,24 @@
         "develop",
         "--no-warn-dirty",
         "--command",
+        "cargo",
+        "doc",
+        "--no-deps",
+        "--workspace"
+      ],
+      "cwd": ".",
+      "env": {
+        "RUSTDOCFLAGS": "-D rustdoc::broken_intra_doc_links"
+      },
+      "name": "rustdoc resolves every intra-doc link",
+      "timeout_s": 900
+    },
+    {
+      "argv": [
+        "nix",
+        "develop",
+        "--no-warn-dirty",
+        "--command",
         "nix",
         "run",
         "../dev-lint#with-test-db",

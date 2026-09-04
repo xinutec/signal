@@ -50,6 +50,7 @@ in  { name = "signal-archiver"
           env = G.clippyTarget
         , timeout_s = 900
         }
+      , G.cargoDoc
       , {-  ⚠ THROUGH A REAL MARIADB, and the row exists because `cargo test`
               alone would have SKIPPED the tests that matter most here. The
               importer's incremental behaviour — which files it decides not to
