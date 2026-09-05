@@ -31,7 +31,7 @@
       ],
       "cwd": ".",
       "env": {
-        "CARGO_TARGET_DIR": "/Users/pippijn/.cache/cargo/clippy-target"
+        "CARGO_TARGET_DIR": "target/clippy"
       },
       "name": "clippy",
       "timeout_s": 900
