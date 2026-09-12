@@ -11,6 +11,7 @@
         "--all",
         "--check"
       ],
+      "artifacts": [],
       "cwd": ".",
       "env": {},
       "name": "formatting",
@@ -29,6 +30,7 @@
         "-D",
         "warnings"
       ],
+      "artifacts": [],
       "cwd": ".",
       "env": {
         "CARGO_TARGET_DIR": "target/clippy"
@@ -47,6 +49,7 @@
         "--no-deps",
         "--workspace"
       ],
+      "artifacts": [],
       "cwd": ".",
       "env": {
         "RUSTDOCFLAGS": "-D rustdoc::broken_intra_doc_links"
@@ -78,6 +81,7 @@
         "cargo",
         "test"
       ],
+      "artifacts": [],
       "cwd": ".",
       "env": {},
       "name": "tests (against a real MariaDB)",
@@ -93,6 +97,7 @@
         "gate.dhall",
         "gate.json"
       ],
+      "artifacts": [],
       "cwd": ".",
       "env": {},
       "name": "the table matches its Dhall",
@@ -106,6 +111,7 @@
         "--",
         "."
       ],
+      "artifacts": [],
       "cwd": ".",
       "env": {},
       "name": "dev-lint",
