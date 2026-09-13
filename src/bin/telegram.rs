@@ -50,6 +50,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use grammers_client::Client;
 use grammers_client::client::UpdatesConfiguration;
+use grammers_client::session::types::PeerRef;
 use grammers_client::session::updates::UpdatesLike;
 use grammers_client::update::Update;
 use grammers_mtsender::SenderPool;
@@ -247,8 +248,12 @@ async fn archive(
     // can only close a gap in the update sequence for peers already in the session
     // cache, so a sweep of the dialog list is what makes catch-up work at all.
     // `auto_cache_peers` does the caching as a side effect of this call.
-    let conversations = sweep_dialogs(client, db).await?;
-    tracing::info!("{conversations} conversations known");
+    // ⚠ BEFORE the update stream, not merely early. `stream_updates` can only
+    // close a gap in the sequence for peers already in the session cache, and this
+    // is what puts them there. The backfill sweeps again on its own; two listings
+    // at startup is the price of that ordering being explicit.
+    let pending = sweep(client, db).await?;
+    tracing::info!("{} conversation(s) with history to walk", pending.len());
 
     // Live updates run CONCURRENTLY with the backfill. A decade of history takes
     // hours; a message that arrives during it must not wait for them.
@@ -271,16 +276,33 @@ async fn archive(
     }
 }
 
-/// Record every conversation the account has, and seed the peer cache.
-async fn sweep_dialogs(client: &Client, db: &Db) -> Result<usize> {
+/// List every conversation the account has, record what each one IS, and return
+/// the ones whose history is not finished.
+///
+/// ⚠ **ONE `messages.getDialogs` PER CALL, and that is the whole point of the
+/// shape.** The first version listed the dialogs inside the per-conversation loop
+/// and took ONE page of 100 messages per pass — so a conversation with five
+/// thousand messages needed fifty passes and fifty full dialog listings. Telegram
+/// answered with `FLOOD_WAIT` on `getDialogs`, sleeping 17-18 seconds at a time:
+/// self-healing, nothing lost, and the backfill crawling for a reason that was
+/// entirely ours.
+///
+/// It also seeds the session's peer cache, which is what `stream_updates` needs
+/// before it can close a gap — so this runs once at startup for that reason alone,
+/// and then once per sweep for this one.
+///
+/// The conversation upsert happens HERE rather than in the walk because this is
+/// where the peer is in hand: `ConvKind::from_peer` can tell a supergroup from a
+/// broadcast, which an id cannot.
+async fn sweep(client: &Client, db: &Db) -> Result<Vec<(i64, PeerRef)>> {
     let mut dialogs = client.iter_dialogs();
-    let mut seen = 0;
+    let mut pending = Vec::new();
     while let Some(dialog) = dialogs.next().await.context("listing dialogs")? {
         let peer = dialog.peer();
-        let id = peer
-            .id()
-            .bot_api_dialog_id()
-            .context("a dialog whose peer is the self-user sentinel")?;
+        let Some(id) = peer.id().bot_api_dialog_id() else {
+            // The self-user sentinel, which is not a conversation.
+            continue;
+        };
         db.upsert_telegram_conversation(
             id,
             ConvKind::from_peer(peer),
@@ -288,9 +310,26 @@ async fn sweep_dialogs(client: &Client, db: &Db) -> Result<usize> {
             peer.username(),
         )
         .await?;
-        seen += 1;
+        if db
+            .telegram_backfill_state(id)
+            .await?
+            .is_some_and(|state| state.complete)
+        {
+            continue;
+        }
+        match peer
+            .to_ref()
+            .await
+            .map_err(|e| anyhow::anyhow!("resolving {id}: {e}"))?
+        {
+            Some(peer_ref) => pending.push((id, peer_ref)),
+            // Without a reference nothing can be requested for it. Reported rather
+            // than skipped silently, because a conversation that never gets one
+            // would otherwise be permanently and invisibly unarchived.
+            None => tracing::warn!("no reference for conversation {id}; skipping this sweep"),
+        }
     }
-    Ok(seen)
+    Ok(pending)
 }
 
 /// Hold the update stream, storing what arrives.
@@ -416,84 +455,99 @@ fn kind_from_space(row: &Row) -> ConvKind {
 /// Walk every conversation's history backwards, resuming where it left off.
 async fn backfill(client: &Client, db: &Db, self_id: i64) -> Result<()> {
     loop {
-        let mut worked = false;
-        let mut dialogs = client.iter_dialogs();
-        while let Some(dialog) = dialogs.next().await.context("listing dialogs")? {
-            let peer = dialog.peer();
-            let Some(id) = peer.id().bot_api_dialog_id() else {
-                continue;
-            };
-            let state = db.telegram_backfill_state(id).await?;
-            if state.is_some_and(|s| s.complete) {
-                continue;
-            }
-            worked = true;
-            let Some(peer_ref) = peer
-                .to_ref()
-                .await
-                .map_err(|e| anyhow::anyhow!("resolving {id}: {e}"))?
-            else {
-                tracing::warn!("no reference for conversation {id}; skipping this sweep");
-                continue;
-            };
-
-            let offset = state.and_then(|s| s.oldest_seen).unwrap_or(0);
-            let mut iter = client.iter_messages(peer_ref).limit(PAGE);
-            // `offset_id(0)` means "from the newest"; anything else means "older
-            // than this", which is what resuming is.
-            if offset != 0 {
-                iter = iter.offset_id(offset);
-            }
-
-            // ⚠ `walked` and `stored` are different numbers and the column is named
-            // for the second. Counting every message the walk SAW would inflate
-            // `messages_stored` on every re-walk — and a re-walk is exactly what an
-            // enrichment pass is, so the counter would drift each time a column was
-            // added. `enriched` is reported but not counted: it is the same message,
-            // better described.
-            let mut walked = 0i64;
-            let mut stored = 0i64;
-            let mut enriched = 0i64;
-            let mut oldest = None;
-            while let Some(message) = iter.next().await.context("reading a history page")? {
-                let sender = message.sender().and_then(peer_name);
-                match store(db, self_id, &message.raw, sender).await? {
-                    TelegramStored::Inserted | TelegramStored::Edited => stored += 1,
-                    TelegramStored::Enriched => enriched += 1,
-                    TelegramStored::Unchanged => {}
-                }
-                oldest = Some(match oldest {
-                    None => message.id(),
-                    Some(prev) => i32::min(prev, message.id()),
-                });
-                walked += 1;
-                if (walked as usize).is_multiple_of(PAGE) {
-                    tokio::time::sleep(PAGE_PAUSE).await;
-                }
-            }
-
-            // ⚠ `complete` only when the page was EMPTY — which is what the WALK
-            // returned, not what was stored. Keying it on `stored` would declare a
-            // conversation finished the moment a page held nothing new, which on a
-            // re-walk is the first page.
-            let complete = walked == 0;
-            db.record_telegram_backfill(id, oldest, complete, stored)
-                .await?;
-            if complete {
-                tracing::info!("conversation {id} is fully archived");
-            } else {
-                tracing::info!(
-                    "conversation {id}: walked {walked}, stored {stored}, enriched {enriched}"
-                );
-            }
-            tokio::time::sleep(PAGE_PAUSE).await;
-        }
-        if !worked {
-            // Nothing left to walk. Sweeping again on a long timer rather than
-            // exiting, because a conversation can gain history that is older than
-            // anything seen: joining a group hands over everything said before.
+        let pending = sweep(client, db).await?;
+        if pending.is_empty() {
+            // Sweeping again on a long timer rather than exiting, because a
+            // conversation can gain history OLDER than anything seen: joining a
+            // group hands over everything said before you arrived.
             tracing::info!("every conversation is archived; sweeping again later");
             tokio::time::sleep(IDLE_SWEEP).await;
+            continue;
+        }
+        for (id, peer_ref) in pending {
+            let from = db
+                .telegram_backfill_state(id)
+                .await?
+                .and_then(|state| state.oldest_seen);
+            walk(client, db, self_id, id, peer_ref, from).await?;
         }
     }
+}
+
+/// Walk one conversation to the end of its history.
+///
+/// ⚠ **ONE ITERATOR FOR THE WHOLE CONVERSATION.** `MessageIter` pages internally —
+/// it advances its own offset and knows when it has had the last chunk — so
+/// letting it run is one `getHistory` per hundred messages and NO dialog listing
+/// in between. Setting `.limit(PAGE)` instead, as this did first, turned the outer
+/// loop into the pager and made every page cost a full dialog sweep.
+///
+/// ⚠ **Progress is checkpointed every `PAGE` messages, which is what keeps it
+/// resumable.** The iterator's own position lives in memory; a pod that dies
+/// mid-walk resumes from the last checkpoint rather than from the top. Recording
+/// only at the end would mean a conversation of ten thousand messages either
+/// finished or started over.
+async fn walk(
+    client: &Client,
+    db: &Db,
+    self_id: i64,
+    id: i64,
+    peer_ref: PeerRef,
+    from: Option<i32>,
+) -> Result<()> {
+    let mut iter = client.iter_messages(peer_ref);
+    // `offset_id` unset means "from the newest"; set means "older than this", which
+    // is what resuming is.
+    if let Some(offset) = from {
+        iter = iter.offset_id(offset);
+    }
+
+    // ⚠ `walked` and `stored` are different numbers and the column is named for the
+    // second. Counting every message the walk SAW would inflate `messages_stored`
+    // on every re-walk — and a re-walk is exactly what an enrichment pass is, so the
+    // counter would drift each time a column was added. `enriched` is reported but
+    // not counted: it is the same message, better described.
+    let mut walked = 0i64;
+    let mut stored = 0i64;
+    let mut enriched = 0i64;
+    let mut total_walked = 0i64;
+    let mut oldest = None;
+    while let Some(message) = iter.next().await.context("reading a history page")? {
+        let sender = message.sender().and_then(peer_name);
+        match store(db, self_id, &message.raw, sender).await? {
+            TelegramStored::Inserted | TelegramStored::Edited => stored += 1,
+            TelegramStored::Enriched => enriched += 1,
+            TelegramStored::Unchanged => {}
+        }
+        oldest = Some(match oldest {
+            None => message.id(),
+            Some(prev) => i32::min(prev, message.id()),
+        });
+        walked += 1;
+        total_walked += 1;
+        if (walked as usize).is_multiple_of(PAGE) {
+            // A checkpoint, and the delta since the last one — never a running
+            // total, or the stored count would be added again at every checkpoint.
+            db.record_telegram_backfill(id, oldest, false, stored)
+                .await?;
+            tracing::info!(
+                "conversation {id}: {total_walked} walked so far, {stored} stored, \
+                 {enriched} enriched in this page"
+            );
+            walked = 0;
+            stored = 0;
+            enriched = 0;
+            tokio::time::sleep(PAGE_PAUSE).await;
+        }
+    }
+
+    // ⚠ The iterator running out IS the end of the history — the only signal
+    // Telegram gives — so `complete` is set here and nowhere else. An interrupted
+    // walk never reaches this line, which is exactly what makes it resume rather
+    // than declare itself finished.
+    db.record_telegram_backfill(id, oldest, true, stored)
+        .await?;
+    tracing::info!("conversation {id} is fully archived ({total_walked} walked)");
+    tokio::time::sleep(PAGE_PAUSE).await;
+    Ok(())
 }
