@@ -344,7 +344,7 @@ fn beat(args: &Args) {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = parse_args()?;
-    let db = Db::connect(&db_url()?).await?;
+    let db = Db::connect(&signal_archiver::db::url_from_env()?).await?;
 
     // See `poll`: the mounted secret is not readable by this process's user.
     let key = PathBuf::from("/tmp/irc-tail-key");
@@ -422,13 +422,4 @@ async fn main() -> Result<()> {
             }
         }
     }
-}
-
-fn db_url() -> Result<String> {
-    let host = std::env::var("DB_HOST").context("DB_HOST not set")?;
-    let port = std::env::var("DB_PORT").unwrap_or_else(|_| "3306".to_string());
-    let name = std::env::var("DB_NAME").context("DB_NAME not set")?;
-    let user = std::env::var("DB_USER").context("DB_USER not set")?;
-    let pass = std::env::var("DB_PASSWORD").context("DB_PASSWORD not set")?;
-    Ok(format!("mysql://{user}:{pass}@{host}:{port}/{name}"))
 }

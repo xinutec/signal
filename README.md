@@ -43,6 +43,10 @@ ingester (no libsignal/sqlcipher — fast, small build).
   threads to the live group ids (for history imported before `--groups-json`).
 - `tools/import_gchat.py` — imports the Google Chat archive into SEPARATE
   `gchat_*` tables in the same DB (see *Other origins* below).
+- `src/telegram/` + `src/bin/telegram.rs` — the Telegram feed. `map.rs` is the
+  pure wire-type→row mapping (the `parse.rs` of that origin, unit-tested with no
+  account); `session.rs` keeps the MTProto session in MariaDB; the binary does
+  login, backfill and the live update stream. See *Other origins* below.
 
 ## Tests
 `tests/parse.rs` unit-tests the bug-prone part — mapping signal-cli's JSON to
@@ -57,7 +61,25 @@ Two suites need a real MariaDB and **skip silently without one**, so a bare
 - `tests/import_irclogs.rs` — the importer's incremental behaviour, the one
   failure mode that produces no error and no row.
 
-Both key off `SIGNAL_TEST_DATABASE_URL`. CI supplies a `mariadb:11.8` service;
+`tests/telegram_store.rs` is a third, and what it pins is everything only the
+DATABASE can decide: that an edit keeps the text it replaces and a replayed edit
+appends nothing, that a peer-less deletion does not reach a channel sharing the
+number, that a withdrawn reaction stops being counted, that the backfill frontier
+never moves backwards, and that a session round-trips WITH its auth key. Two real
+defects were found by running it and by nothing else — a primary key over nullable
+columns, which MariaDB silently makes `NOT NULL` and which rejected every unicode
+reaction; and a gap-lock deadlock between the backfill and the live stream, which
+only appears when two writers are in flight. Both are written up where they were
+fixed (`db.rs` v17, and `store_telegram_message`).
+
+Telegram's mapping is unit-tested in `src/telegram/map/` and needs no account and
+no database: `tl::types::Message` is generated from Telegram's own schema, so a
+fixture is a struct literal the compiler checks against the real contract rather
+than a captured blob that can drift from it. The DM-attribution rule was ablated
+both ways (arms swapped, and the inference let out of DMs) and each fails exactly
+one test.
+
+All key off `SIGNAL_TEST_DATABASE_URL`. CI supplies a `mariadb:11.8` service;
 locally use `dev-lint#with-test-db`. Each test tags its rows uniquely per run as
 well as per test, so running the suite twice against one database is safe.
 - `Dockerfile` — pure-Rust build (no C toolchain).
@@ -154,6 +176,68 @@ DB_HOST=… DB_PORT=… DB_USER=… DB_PASSWORD=… DB_NAME=signal \
 The importer creates the `gchat_*` tables itself (`CREATE TABLE IF NOT EXISTS`);
 they are independent of the Rust ingester's `MIGRATIONS` (which owns only the
 Signal tables).
+
+## Other origins — Telegram (separate tables, one login)
+`telegram_conversations`, `telegram_messages`, `telegram_reactions`,
+`telegram_message_edits`, `telegram_backfill_state`, `telegram_session` — created by
+the Rust `MIGRATIONS` (v15–v20), unlike the `gchat_*` tables.
+
+**The only origin whose past and present come from one feed.** Telegram keeps
+history server-side, so a single authorised session pages backwards through
+everything AND holds the update stream. No export, no second import path, and the
+two halves cannot disagree because they write the same rows on the same key:
+`(conversation_id, msg_id)` is the message's own server-assigned identity, which is
+a stronger dedupe key than either of the other origins has.
+
+```
+# once per account lifetime, interactively (a code arrives on the phone):
+DB_HOST=… DB_PORT=… DB_USER=… DB_PASSWORD=… DB_NAME=signal \
+  TELEGRAM_API_ID=… TELEGRAM_API_HASH=… \
+  cargo run --bin telegram -- login '+31…' 
+# then, as a Deployment: no arguments.
+```
+
+⚠ **`telegram login` cannot be run with `kubectl exec` into the Deployment.** That
+pod refuses to start until a session exists — deliberately, because a feed which is
+quietly not logged in looks exactly like a quiet week — so there is no running
+container to exec into. In-cluster it is a throwaway pod with the same environment;
+`kubes/signal/k8s/secret.sh` prints the command. Locally it is the form above, with
+`signal-db` port-forwarded.
+
+`TELEGRAM_API_ID` / `TELEGRAM_API_HASH` come from <https://my.telegram.org>, are
+Pippijn's own, and live in `signal-secret`.
+
+⚠ **A BOT CANNOT DO THIS.** A Telegram bot is a separate account and cannot read
+the chats of the person who owns it, so this is a USER client speaking MTProto.
+That is also why `telegram_session` holds a credential rather than a cache: the row
+is a logged-in session, and re-logging-in is rate-limited by Telegram in hours.
+Losing it is not free.
+
+⚠ **`grammers` owns the protocol, for the reason `signal-cli` owns Signal's.** The
+DH handshake, AES-IGE, the message containers and the TL schema are the parts that
+rot silently when the other side bumps a layer. What is ours is the mapping and the
+rows. Unlike signal-cli it is a crate rather than a sidecar, so there is no REST
+hop and no third-party container holding the keys.
+
+⚠ **`Cargo.lock` pins `glass_pumpkin` to `2.0.0-rc0` and a `cargo update` undoes
+it**, breaking the build inside `grammers-crypto`. The note in `Cargo.toml` has the
+one-line fix.
+
+⚠ **Secret chats are not here and cannot be**: device-local by construction, so no
+login reaches them.
+
+What Telegram does that the others do not, and where each is handled:
+
+| | how Telegram does it | where |
+| --- | --- | --- |
+| a DM names no sender | `from_id` omitted; `out` says which end | `map.rs`, inferred and tested both ways |
+| an edit MUTATES the message | same `msg_id`, new text, new `edit_date` | the prior text is filed in `telegram_message_edits` before the update, in one transaction |
+| a deletion names no peer | private chats and basic groups share ONE id sequence; channels have their own | `Db::mark_telegram_deleted` takes a SCOPE, and a peer-less deletion never reaches a channel |
+| a supergroup looks like a channel | same id space, told apart by a flag on the peer | the id gives `PeerSpace`, the peer gives `ConvKind`; the dialog sweep is what corrects it |
+| reactions are counts | aggregated per emoji, not per author | stored as given; a custom emoji keeps its document id |
+
+Media is NOT downloaded: `media_kind` records that there was a photo. Attachment
+bytes are Signal-only in this archive.
 
 ## Security
 The signal-cli data PVC holds linked-device keys — secret-class; keep its odin

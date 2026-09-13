@@ -5,11 +5,32 @@
 
 use std::collections::HashMap;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use sqlx::Row;
 use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
 
 use crate::parse::ThreadId;
+
+/// The MariaDB DSN, from the `DB_*` environment the whole namespace shares.
+///
+/// ⚠ Here rather than in a binary because there were THREE identical copies of
+/// it — `main.rs`, `irc_tail` and `import_irclogs` — and a fourth was about to be
+/// written for Telegram. They agreed, which is the only reason nothing had gone
+/// wrong yet; the next edit to one of them is where that would have ended.
+///
+/// The password is interpolated unescaped, exactly as all three copies did. That
+/// is a real limit rather than an oversight: a password containing `@` or `/`
+/// would produce a DSN that parses wrongly, and the fleet's does not. Changing it
+/// means re-testing against the live secret, so it is recorded here instead of
+/// quietly "fixed".
+pub fn url_from_env() -> Result<String> {
+    let host = std::env::var("DB_HOST").context("DB_HOST not set")?;
+    let port = std::env::var("DB_PORT").unwrap_or_else(|_| "3306".to_string());
+    let name = std::env::var("DB_NAME").context("DB_NAME not set")?;
+    let user = std::env::var("DB_USER").context("DB_USER not set")?;
+    let pass = std::env::var("DB_PASSWORD").context("DB_PASSWORD not set")?;
+    Ok(format!("mysql://{user}:{pass}@{host}:{port}/{name}"))
+}
 
 const MIGRATIONS: &[&str] = &[
     // v0: contacts (people). Keyed by Signal ACI UUID (or E.164 if no UUID).
@@ -276,6 +297,220 @@ const MIGRATIONS: &[&str] = &[
                 'changing conversation_id, kind or sent_at would drift irc_conversation_stats';
         END IF;
     END",
+    // v15: Telegram conversations — the fourth origin, and the first whose
+    // history and live feed come from ONE login.
+    //
+    // ⚠ **`id` is the Bot-API normalisation, not the raw MTProto id, and that is
+    // deliberate.** MTProto names a peer by a `user_id`, a `chat_id` or a
+    // `channel_id`, each from its own space, so the raw number identifies a
+    // conversation only when you also carry which of the three it was. Every
+    // Telegram tool folds them into one signed space instead, and this does too:
+    //
+    //     user    →  user_id
+    //     chat    → -chat_id                       (a basic group)
+    //     channel → -1_000_000_000_000 - channel_id
+    //
+    // so a conversation is one BIGINT the viewer can put in a URL, and no user
+    // can collide with a group. `kind` is still stored, because recovering it by
+    // looking at the sign of an id is exactly the kind of cleverness that reads
+    // as a bug three years later. `src/telegram/map.rs::normalise_peer` is the
+    // one implementation and is unit-tested against all three.
+    //
+    // `kind` has a value the other origins do not: a `channel` is a broadcast
+    // with an audience rather than a conversation, so the viewer may well want
+    // to leave it out of a list of people. Stored, not filtered, here.
+    r"CREATE TABLE IF NOT EXISTS telegram_conversations (
+        id BIGINT NOT NULL PRIMARY KEY,
+        kind ENUM('dm','group','channel') NOT NULL,
+        name VARCHAR(255) NULL,
+        username VARCHAR(255) NULL,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    )",
+    // v16: Telegram messages.
+    //
+    // **The dedupe key is honest here in a way the other origins' are not.** A
+    // Telegram message id is assigned by the server and is stable for the life
+    // of the message, so `(conversation_id, msg_id)` IS the message's identity —
+    // no guessing that a timestamp is unique per sender (Signal) and no
+    // synthesising a key out of a file path and a line number (IRC). Backfill
+    // and the live stream therefore overlap for free under `INSERT IGNORE`, and
+    // a re-run of either costs nothing.
+    //
+    // `sent_at` is unix SECONDS, UTC — Telegram's own unit, stored unconverted
+    // for the reason `gchat_messages.ts_us` keeps microseconds: the viewer
+    // normalises units at the edge (`archive.rs`), and a conversion on the way
+    // IN is a conversion that cannot be checked against the source afterwards.
+    // Seconds is also all Telegram gives: there is no sub-second field in the
+    // message constructor.
+    //
+    // `sender_name` is denormalised, as `gchat_messages` does it and for the same
+    // reason: the conversation list's index lesson (v9/v11) was that a read which
+    // has to join to name a row is a read that scans. What it records is the name
+    // the archive SAW when the row landed, which is not the same as the name the
+    // person has now — that is a property of an archive, not a defect.
+    //
+    // `media_kind` is a label, not a file. Bytes are Signal-only in this archive
+    // (the `attachments` PVC and the viewer's `/attachments` route), so a
+    // Telegram photo is recorded as having been a photo and is not downloaded.
+    // The column is what a later pass would fill; nothing fills it today.
+    //
+    // `kind` separates a message from a service event ("X joined", a pinned
+    // notice) the way `irc_messages.kind` separates a line from a join — same
+    // problem, same answer, so the viewer can restrict to what was SAID.
+    r"CREATE TABLE IF NOT EXISTS telegram_messages (
+        id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        conversation_id BIGINT NOT NULL,
+        msg_id INT NOT NULL,
+        sent_at BIGINT NOT NULL,
+        sender_id BIGINT NULL,
+        sender_name VARCHAR(255) NULL,
+        is_outgoing TINYINT(1) NOT NULL DEFAULT 0,
+        kind ENUM('message','service') NOT NULL DEFAULT 'message',
+        text TEXT NULL,
+        media_kind VARCHAR(32) NULL,
+        edited_at BIGINT NULL,
+        reply_to_msg_id INT NULL,
+        fwd_from_name VARCHAR(255) NULL,
+        deleted TINYINT(1) NOT NULL DEFAULT 0,
+        deleted_at TIMESTAMP NULL,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE KEY uniq_tg_msg (conversation_id, msg_id),
+        INDEX idx_tg_conv_kind_ts (conversation_id, kind, sent_at)
+    )",
+    // v17: reactions, aggregated per emoji.
+    //
+    // Closer to `gchat_reactions` than to Signal's: Telegram hands over a count
+    // per reaction rather than a stream of add/remove events, so this stores what
+    // it is given. The consequence is the one the viewer already documents for
+    // Google Chat — you can see that four people laughed, not which four.
+    //
+    // `emoji` holds a unicode emoticon; a custom emoji is a document id with no
+    // characters to show, so it is recorded as its id under `custom_emoji_id` and
+    // `emoji` stays NULL. A reader that cannot draw one at least knows it is
+    // there rather than silently counting nothing.
+    //
+    // ⚠ **`reaction_key` IS GENERATED, AND THE OBVIOUS KEY DOES NOT WORK.** The
+    // identity of a reaction is "the emoji, or the custom emoji's id" — a sum, one
+    // side of which is always NULL. A primary key over `(…, emoji,
+    // custom_emoji_id)` is what this entry said while it was being written, and
+    // MariaDB silently makes every primary-key column NOT NULL: the result
+    // rejected every unicode reaction, with `Column 'custom_emoji_id' cannot be
+    // null`. It would have failed on the first reaction in production and been
+    // caught by nothing, because no mapping test touches SQL.
+    //
+    // (Corrected in place rather than by appending a repair, because v15–v20 had
+    // never been applied anywhere but a throwaway test database. The append-only
+    // rule at the top of this file is about migrations that have RUN.)
+    //
+    // So the database derives one non-null identity from the pair. Generated
+    // rather than composed by the writer for the reason the IRC stats are a
+    // trigger: a second writer cannot forget to do it.
+    //
+    // ⚠ And it is a UNIQUE KEY over a surrogate primary key, not the primary key
+    // itself: MariaDB answers `PRIMARY KEY (…, reaction_key)` with "Primary key
+    // cannot be defined upon a generated column" — and because a failed migration
+    // stops the whole list, that mistake took every test in this repository down,
+    // not just the Telegram ones. The `COALESCE(…, '')` tail is what keeps the
+    // unique key honest: a NULL never compares equal to another NULL, so without
+    // a non-null fallback the index would happily hold duplicates.
+    //
+    // ⚠ `GENERATED ALWAYS AS (…) STORED` and not MariaDB's own `AS (…) PERSISTENT`,
+    // which means the identical thing and which MariaDB documents first. The
+    // spelling matters because dev-lint parses this DDL to know which columns
+    // exist, and it could not read the MariaDB-only form — so it printed
+    // "unparseable DDL disables absence checks" and went quietly green over this
+    // table while still passing the gate. A check that has silently stopped
+    // checking is worse than one that fails, so the schema uses the spelling both
+    // engines and the linter understand.
+    r"CREATE TABLE IF NOT EXISTS telegram_reactions (
+        id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        conversation_id BIGINT NOT NULL,
+        msg_id INT NOT NULL,
+        emoji VARCHAR(32) NULL,
+        custom_emoji_id BIGINT NULL,
+        reaction_key VARCHAR(64) GENERATED ALWAYS AS
+            (COALESCE(emoji, CONCAT('custom:', custom_emoji_id), '')) STORED,
+        cnt INT NOT NULL DEFAULT 0,
+        chosen TINYINT(1) NOT NULL DEFAULT 0,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        UNIQUE KEY uniq_tg_reaction (conversation_id, msg_id, reaction_key)
+    )",
+    // v18: the text a message used to have.
+    //
+    // ⚠ **Telegram's edit is a MUTATION, which is why this table exists.** Signal
+    // sends an edit as a new message pointing at the original (v6 above), so its
+    // history is the archive's natural shape — append a row and nothing is lost.
+    // Telegram sends the SAME `msg_id` with different text, so an archive that
+    // only upserts `telegram_messages` would overwrite the words it exists to
+    // keep, silently, with no trace that there had been others.
+    //
+    // So the row in `telegram_messages` is the CURRENT text, and the text it is
+    // replacing is appended here first. `was_edited_at` is the `edit_date` the
+    // superseded version carried, NULL for the original — which is what orders
+    // the chain, since Telegram gives no revision number.
+    //
+    // ⚠ An edit seen twice must not append twice. The unique key is
+    // `(conversation_id, msg_id, was_edited_at)`, so a replayed update — the
+    // whole point of `catch_up` — is idempotent. NULL does not compare equal to
+    // NULL in a unique index, so the ORIGINAL text is instead guarded by only
+    // being written when the row's stored `edited_at` was NULL: the first edit is
+    // the only moment the pre-edit text is knowable at all.
+    r"CREATE TABLE IF NOT EXISTS telegram_message_edits (
+        id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        conversation_id BIGINT NOT NULL,
+        msg_id INT NOT NULL,
+        was_edited_at BIGINT NULL,
+        text TEXT NULL,
+        recorded_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE KEY uniq_tg_edit (conversation_id, msg_id, was_edited_at),
+        INDEX idx_tg_edit_msg (conversation_id, msg_id)
+    )",
+    // v19: how far back each conversation has been walked, so a backfill is
+    // resumable and a restart costs what is LEFT rather than what is done.
+    //
+    // The lesson `irc_import_state` (v10) records, applied before it can be
+    // learned the expensive way: an import whose cost is the size of the archive
+    // rather than the size of what is new gets run rarely, and a feed that is run
+    // rarely is a feed that is behind.
+    //
+    // `oldest_seen` is the lowest `msg_id` this walk has stored; the next page
+    // asks Telegram for what is older than it. `complete` is set when a page
+    // comes back empty, which is the only signal Telegram gives that a
+    // conversation has no more history — and it is recorded ONLY then, so an
+    // interrupted walk resumes rather than declaring itself finished.
+    r"CREATE TABLE IF NOT EXISTS telegram_backfill_state (
+        conversation_id BIGINT NOT NULL PRIMARY KEY,
+        oldest_seen INT NULL,
+        complete TINYINT(1) NOT NULL DEFAULT 0,
+        messages_stored BIGINT NOT NULL DEFAULT 0,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    )",
+    // v20: the MTProto session — the authorisation key, the datacentre list, the
+    // peer cache and the update state — as one row.
+    //
+    // ⚠ **IN THE DATABASE RATHER THAN ON A VOLUME, and it is a credential.** A
+    // row here is a logged-in Telegram session: whoever reads it reads the
+    // account. It lives with the messages because it is exactly as sensitive as
+    // they are, it is covered by their backup, and the alternative was a PVC that
+    // one pod writes — which is how `messages` spent 26 hours answering 502 over
+    // a 0400 file in an emptyDir it could no longer write (see that repo's
+    // `IrcSender::prepare`).
+    //
+    // ⚠ **Losing this row is NOT free.** Logging in again is rate-limited by
+    // Telegram with flood waits measured in hours, so this is not a cache to be
+    // dropped when convenient. `single_row` is a CHECKed constant so a second
+    // session cannot be inserted by accident: two pods with two keys is two
+    // update streams, each acknowledging state the other needs.
+    //
+    // LONGTEXT rather than JSON: MariaDB's JSON is an alias for LONGTEXT with a
+    // validity constraint, and nothing here queries inside the document — it is
+    // read whole at boot and written whole when it changes.
+    r"CREATE TABLE IF NOT EXISTS telegram_session (
+        single_row TINYINT(1) NOT NULL PRIMARY KEY DEFAULT 1
+            CHECK (single_row = 1),
+        data LONGTEXT NOT NULL,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    )",
 ];
 
 #[derive(Clone)]
@@ -628,6 +863,319 @@ impl Db {
         }
         Ok(())
     }
+
+    /// The pool, for the Telegram session store — which implements a `grammers`
+    /// trait and so cannot be a method on `Db`.
+    pub fn pool(&self) -> &MySqlPool {
+        &self.pool
+    }
+
+    pub async fn upsert_telegram_conversation(
+        &self,
+        id: i64,
+        kind: crate::telegram::ConvKind,
+        name: Option<&str>,
+        username: Option<&str>,
+    ) -> Result<()> {
+        // ⚠ `COALESCE(VALUES(name), name)` rather than `VALUES(name)`: a response
+        // that carries a peer without its title must not blank a name the archive
+        // already has. Telegram sends minimal peers routinely (the `min` flag),
+        // and the visible symptom of getting this wrong is a conversation list
+        // that loses its names as you use it.
+        sqlx::query(
+            "INSERT INTO telegram_conversations (id, kind, name, username)
+             VALUES (?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE
+                 kind = VALUES(kind),
+                 name = COALESCE(VALUES(name), name),
+                 username = COALESCE(VALUES(username), username)",
+        )
+        .bind(id)
+        .bind(kind.as_str())
+        .bind(name)
+        .bind(username)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Store a mapped message, keeping any text it is replacing.
+    ///
+    /// ⚠ **This is the one write in the archive that can destroy something, and
+    /// the transaction is what stops it.** Telegram's edit is a mutation of a
+    /// message that keeps its id, so the row has to be updated in place — and the
+    /// words being replaced exist nowhere else the moment that update lands. So
+    /// the old text is appended to `telegram_message_edits` and the row is updated
+    /// in the same transaction: either both happen or neither does, and a crash
+    /// between them cannot leave the archive holding only the new version.
+    ///
+    /// Replay is free. An unchanged message is recognised by its `edit_date`
+    /// matching what is stored and costs one insert that does nothing, which is
+    /// what makes it safe for the backfill and the live stream to cover the same
+    /// ground.
+    ///
+    /// ⚠ **THERE IS NO `SELECT … FOR UPDATE` HERE, AND THAT IS THE FIX FOR A
+    /// DEADLOCK, not a weakening.** The first version opened with a locking read
+    /// of a row that usually does not exist yet, which in InnoDB takes a GAP lock
+    /// — and two transactions inserting different messages into the same gap
+    /// deadlock each other. This archive has exactly the two concurrent writers
+    /// that provokes: the backfill walking history while the update stream stores
+    /// what is arriving. It surfaced as `1213 Deadlock found` under parallel
+    /// tests, which is the only reason it was seen before production.
+    ///
+    /// What replaces it is a compare-and-swap. `INSERT IGNORE` needs no gap lock;
+    /// the edit path then reads without locking and updates under
+    /// `edited_at <=> <the value it read>`, so if another writer edited the same
+    /// message in between, this update matches nothing and reports that rather
+    /// than overwriting a version whose text it never filed. `<=>` and not `=`
+    /// because the value being compared is NULL for a message not yet edited, and
+    /// `NULL = NULL` is not true.
+    pub async fn store_telegram_message(
+        &self,
+        row: &crate::telegram::map::Row,
+        sender_name: Option<&str>,
+    ) -> Result<TelegramStored> {
+        let inserted = sqlx::query(
+            "INSERT IGNORE INTO telegram_messages
+                (conversation_id, msg_id, sent_at, sender_id, sender_name,
+                 is_outgoing, kind, text, media_kind, edited_at,
+                 reply_to_msg_id, fwd_from_name)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(row.conversation_id)
+        .bind(row.msg_id)
+        .bind(row.sent_at)
+        .bind(row.sender_id)
+        .bind(sender_name)
+        .bind(row.is_outgoing)
+        .bind(row.kind.as_str())
+        .bind(row.text.as_deref())
+        .bind(row.media_kind.map(|m| m.as_str()))
+        .bind(row.edited_at)
+        .bind(row.reply_to_msg_id)
+        .bind(row.fwd_from_name.as_deref())
+        .execute(&self.pool)
+        .await?;
+        if inserted.rows_affected() != 0 {
+            return Ok(TelegramStored::Inserted);
+        }
+
+        let existing: Option<(Option<String>, Option<i64>)> = sqlx::query_as(
+            "SELECT text, edited_at FROM telegram_messages
+              WHERE conversation_id = ? AND msg_id = ?",
+        )
+        .bind(row.conversation_id)
+        .bind(row.msg_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let mut tx = self.pool.begin().await?;
+        let outcome = match existing {
+            // Gone between the insert and the read. Nothing to preserve and
+            // nothing to update; the next delivery will insert it.
+            None => TelegramStored::Unchanged,
+            Some((_, stored_edit)) if stored_edit == row.edited_at => TelegramStored::Unchanged,
+            Some((stored_text, stored_edit)) => {
+                // The superseded version, filed under the `edit_date` it carried.
+                // `INSERT IGNORE` because an update seen twice must not append
+                // twice — and for the ORIGINAL text `was_edited_at` is NULL, which
+                // no unique index can deduplicate, so that case is guarded by
+                // only ever being reachable while the row's stored `edited_at` is
+                // still NULL: the first edit is the only moment the pre-edit text
+                // is knowable.
+                sqlx::query(
+                    "INSERT IGNORE INTO telegram_message_edits
+                        (conversation_id, msg_id, was_edited_at, text)
+                     VALUES (?, ?, ?, ?)",
+                )
+                .bind(row.conversation_id)
+                .bind(row.msg_id)
+                .bind(stored_edit)
+                .bind(stored_text.as_deref())
+                .execute(&mut *tx)
+                .await?;
+                let updated = sqlx::query(
+                    "UPDATE telegram_messages
+                        SET text = ?, media_kind = ?, edited_at = ?
+                      WHERE conversation_id = ? AND msg_id = ? AND edited_at <=> ?",
+                )
+                .bind(row.text.as_deref())
+                .bind(row.media_kind.map(|m| m.as_str()))
+                .bind(row.edited_at)
+                .bind(row.conversation_id)
+                .bind(row.msg_id)
+                .bind(stored_edit)
+                .execute(&mut *tx)
+                .await?;
+                if updated.rows_affected() == 0 {
+                    // Another writer edited the same message between the read and
+                    // here. Its history row is already filed; ours would describe a
+                    // version that is no longer current, so this reports having
+                    // changed nothing rather than racing.
+                    TelegramStored::Unchanged
+                } else {
+                    TelegramStored::Edited
+                }
+            }
+        };
+        tx.commit().await?;
+        Ok(outcome)
+    }
+
+    /// Replace a message's reaction counts with what Telegram last reported.
+    ///
+    /// ⚠ DELETE-then-insert rather than upsert, because a reaction that has been
+    /// taken away is absent from the new list rather than present with a count of
+    /// zero. An upsert alone would leave every reaction a message has ever had
+    /// visible forever, at its high-water mark.
+    ///
+    /// Skipped entirely when there is nothing to say: Telegram omits the field for
+    /// a message with no reactions, and an empty list would then delete real rows
+    /// every time a message was re-read. Removing the LAST reaction is therefore
+    /// invisible to this archive — recorded here as the known limit it is.
+    pub async fn replace_telegram_reactions(
+        &self,
+        conversation_id: i64,
+        msg_id: i32,
+        reactions: &[crate::telegram::map::Reaction],
+    ) -> Result<()> {
+        if reactions.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM telegram_reactions WHERE conversation_id = ? AND msg_id = ?")
+            .bind(conversation_id)
+            .bind(msg_id)
+            .execute(&mut *tx)
+            .await?;
+        for r in reactions {
+            sqlx::query(
+                "INSERT INTO telegram_reactions
+                    (conversation_id, msg_id, emoji, custom_emoji_id, cnt, chosen)
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(conversation_id)
+            .bind(msg_id)
+            .bind(r.emoji.as_deref())
+            .bind(r.custom_emoji_id)
+            .bind(r.cnt)
+            .bind(r.chosen)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// How far back a conversation has been walked, or `None` if it never has.
+    pub async fn telegram_backfill_state(
+        &self,
+        conversation_id: i64,
+    ) -> Result<Option<TelegramBackfill>> {
+        let row: Option<(Option<i32>, i8, i64)> = sqlx::query_as(
+            "SELECT oldest_seen, complete, messages_stored
+               FROM telegram_backfill_state WHERE conversation_id = ?",
+        )
+        .bind(conversation_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(
+            |(oldest_seen, complete, messages_stored)| TelegramBackfill {
+                oldest_seen,
+                complete: complete != 0,
+                messages_stored,
+            },
+        ))
+    }
+
+    /// Record progress through a conversation's history.
+    ///
+    /// ⚠ `LEAST` on `oldest_seen`, so a resumed walk cannot move the frontier
+    /// backwards: the live stream stores NEW messages with high ids through the
+    /// same path, and a plain assignment would let one of those reset the backfill
+    /// to the top and walk the whole conversation again.
+    pub async fn record_telegram_backfill(
+        &self,
+        conversation_id: i64,
+        oldest_seen: Option<i32>,
+        complete: bool,
+        stored_delta: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO telegram_backfill_state
+                (conversation_id, oldest_seen, complete, messages_stored)
+             VALUES (?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE
+                 oldest_seen = LEAST(COALESCE(VALUES(oldest_seen), oldest_seen),
+                                     COALESCE(oldest_seen, VALUES(oldest_seen))),
+                 complete = GREATEST(complete, VALUES(complete)),
+                 messages_stored = messages_stored + VALUES(messages_stored)",
+        )
+        .bind(conversation_id)
+        .bind(oldest_seen)
+        .bind(complete)
+        .bind(stored_delta)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Flag messages a `updateDeleteMessages` named, and report how many rows it
+    /// reached.
+    ///
+    /// ⚠ **`updateDeleteMessages` CARRIES NO PEER, and that is why this takes a
+    /// kind rather than a conversation.** Telegram can leave the peer out because
+    /// private chats and basic groups share ONE message-id sequence per account —
+    /// an id is enough to identify the message among them. Channels each have
+    /// their own sequence and get `updateDeleteChannelMessages`, which does name
+    /// the channel. So a peer-less deletion is applied to non-channel
+    /// conversations only; applying it everywhere would retract an unrelated
+    /// channel post that happens to share the number.
+    ///
+    /// The text is kept. `deleted` is a flag, as it is for Signal, and the viewer
+    /// decides what to put on screen.
+    pub async fn mark_telegram_deleted(
+        &self,
+        msg_ids: &[i32],
+        scope: TelegramDeleteScope,
+    ) -> Result<u64> {
+        if msg_ids.is_empty() {
+            return Ok(0);
+        }
+        // One statement per id rather than one `IN (...)`: the shared-sequence
+        // case has to join to the conversations to exclude channels, and a
+        // deletion names a handful of ids, so there is no scan to save here.
+        let mut affected = 0;
+        for id in msg_ids {
+            let res = match scope {
+                TelegramDeleteScope::Channel(conversation_id) => {
+                    sqlx::query(
+                        "UPDATE telegram_messages
+                        SET deleted = 1, deleted_at = COALESCE(deleted_at, CURRENT_TIMESTAMP)
+                      WHERE conversation_id = ? AND msg_id = ?",
+                    )
+                    .bind(conversation_id)
+                    .bind(id)
+                    .execute(&self.pool)
+                    .await?
+                }
+                TelegramDeleteScope::SharedSequence => {
+                    sqlx::query(
+                        "UPDATE telegram_messages m
+                       JOIN telegram_conversations c ON c.id = m.conversation_id
+                        SET m.deleted = 1,
+                            m.deleted_at = COALESCE(m.deleted_at, CURRENT_TIMESTAMP)
+                      WHERE m.msg_id = ? AND c.kind <> 'channel'",
+                    )
+                    .bind(id)
+                    .execute(&self.pool)
+                    .await?
+                }
+            };
+            affected += res.rows_affected();
+        }
+        Ok(affected)
+    }
 }
 
 /// Rows per statement. 9 columns × 1,000 is well inside MySQL's 65,535
@@ -637,6 +1185,39 @@ const INSERT_CHUNK: usize = 1_000;
 /// One logged line, ready to write. Owned rather than borrowed: it is built per
 /// file and handed straight to the batch, and threading a lifetime through that
 /// buys nothing at 72 rows.
+/// What [`Db::store_telegram_message`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelegramStored {
+    /// A message the archive had never seen.
+    Inserted,
+    /// A message whose text was replaced, with the old version kept.
+    Edited,
+    /// Already stored, at the same `edit_date`. The common case on replay.
+    Unchanged,
+}
+
+/// How far back through a conversation the walk has got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TelegramBackfill {
+    /// The lowest `msg_id` stored so far, or `None` before the first page.
+    pub oldest_seen: Option<i32>,
+    /// Set once a page came back empty, which is Telegram's only signal that a
+    /// conversation has no more history.
+    pub complete: bool,
+    pub messages_stored: i64,
+}
+
+/// Which conversations a deletion applies to — see [`Db::mark_telegram_deleted`]
+/// for why this is not simply a conversation id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelegramDeleteScope {
+    /// `updateDeleteChannelMessages`, which names its channel.
+    Channel(i64),
+    /// `updateDeleteMessages`, which does not — the ids belong to the one
+    /// sequence that private chats and basic groups share.
+    SharedSequence,
+}
+
 pub struct IrcLine {
     pub line_no: u32,
     pub sent_at: String,

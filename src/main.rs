@@ -63,7 +63,7 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("creating attachments dir {attach_dir}"))?;
 
-    let db = Db::connect(&database_url()?)
+    let db = Db::connect(&signal_archiver::db::url_from_env()?)
         .await
         .context("connecting to MariaDB")?;
     let ctx = Ctx {
@@ -305,13 +305,4 @@ async fn refresh_group_names(ctx: Ctx) {
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
-}
-
-fn database_url() -> Result<String> {
-    let host = std::env::var("DB_HOST").context("DB_HOST not set")?;
-    let port = env_or("DB_PORT", "3306");
-    let name = std::env::var("DB_NAME").context("DB_NAME not set")?;
-    let user = std::env::var("DB_USER").context("DB_USER not set")?;
-    let pass = std::env::var("DB_PASSWORD").context("DB_PASSWORD not set")?;
-    Ok(format!("mysql://{user}:{pass}@{host}:{port}/{name}"))
 }

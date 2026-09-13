@@ -193,7 +193,7 @@ fn collect_logs(root: &Path) -> Result<Vec<String>> {
 async fn main() -> Result<()> {
     let args = parse_args()?;
     let db = if args.apply {
-        Some(Db::connect(&db_url()?).await?)
+        Some(Db::connect(&signal_archiver::db::url_from_env()?).await?)
     } else {
         None
     };
@@ -413,15 +413,6 @@ fn print_report(args: &Args, report: &Report) {
              and no conversation is marked as the status log."
         );
     }
-}
-
-fn db_url() -> Result<String> {
-    let host = std::env::var("DB_HOST").context("DB_HOST not set")?;
-    let port = std::env::var("DB_PORT").unwrap_or_else(|_| "3306".to_string());
-    let name = std::env::var("DB_NAME").context("DB_NAME not set")?;
-    let user = std::env::var("DB_USER").context("DB_USER not set")?;
-    let pass = std::env::var("DB_PASSWORD").context("DB_PASSWORD not set")?;
-    Ok(format!("mysql://{user}:{pass}@{host}:{port}/{name}"))
 }
 
 /// Kept honest by the compiler: every kind the parser can produce has a column

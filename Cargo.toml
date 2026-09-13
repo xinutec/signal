@@ -24,3 +24,43 @@ sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio",
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Telegram, as a user client rather than a bot: a bot cannot read the chats of
+# the account it belongs to, so an archive of Pippijn's own conversations has to
+# speak MTProto with his own api_id. `grammers` owns that protocol — the DH
+# handshake, AES-IGE, the message containers and the TL schema — for the same
+# reason `signal-cli` owns Signal's: it is the part that rots silently when the
+# other side bumps a layer, and the part whose bugs are unobservable from here.
+# What is OURS is the binary that turns its types into archive rows.
+grammers-client = "0.10.0"
+# ⚠ `default-features = false` is load-bearing, and the default is what this
+# repository is built to avoid. `grammers-session`'s default feature is
+# `sqlite-storage`, which is `libsql` → `libsql-ffi` → `bindgen` → `clang-sys`:
+# a C toolchain and libclang in the build image, for a local SQLite file this
+# archive does not want. The session lives in MariaDB beside the messages it
+# authorises (`telegram_session`, src/telegram/session.rs), so the storage that
+# dependency would provide has nothing to store.
+#
+# `serde` is what replaces it: the four pieces of session state each derive
+# Serialize under that feature, so our own `Session` impl can persist them.
+grammers-session = { version = "0.10.0", default-features = false, features = [
+  "serde",
+] }
+# ⚠ **`Cargo.lock` PINS `glass_pumpkin` TO 2.0.0-rc0, AND A `cargo update` WILL
+# BREAK THE BUILD BY UNDOING IT.** `grammers-crypto` asks for `2.0.0-rc0`, and
+# cargo reads a pre-release requirement as "this rc or a later one", so it
+# resolves 2.0.0-rc1 — which changed `safe_prime::check` to return a `Result` and
+# does not compile against grammers 0.10.0. The failure is loud and names
+# `grammers-crypto/src/two_factor_auth.rs`, so this note is here to save the
+# diagnosis rather than the build:
+#     cargo update -p glass_pumpkin --precise 2.0.0-rc0
+# Not pinnable from this file without taking a direct dependency on a crate this
+# code never calls, which would be a worse lie than a lockfile entry.
+#
+# The sender pool: the thing that actually holds the connections. It is a
+# separate crate from the client because the client is a handle to it, and the
+# binary needs both — one to spawn the runner, one to make calls.
+grammers-mtsender = "0.10.0"
+# The raw TL types. `map.rs` maps `tl::enums::Message` — a plain data enum with
+# no client attached — which is what lets the whole mapping be unit-tested with
+# no network and no login, exactly as `parse.rs` is for Signal.
+grammers-tl-types = "0.10.0"
