@@ -146,6 +146,15 @@ pub struct Row {
     /// edited. This is Telegram's `edit_date` and is the only ordering there is
     /// for an edit chain — there is no revision number.
     pub edited_at: Option<i64>,
+    /// ⚠ **Telegram's `edit_hide`: "the message should be shown as NOT MODIFIED to
+    /// the user, even if an edit date is present".**
+    ///
+    /// An `edit_date` alone does not mean a person edited anything — Telegram sets
+    /// one for its own reasons and then asks clients not to surface it, which is
+    /// why its own apps show no "edited" marker on such a message and why this
+    /// archive did. Reading `edit_date` without this flag is reading half the
+    /// contract. The edit is still RECORDED; what the flag governs is display.
+    pub edit_hidden: bool,
     pub reply_to_msg_id: Option<i32>,
     /// Who a forward came from, when the header carried a NAME. A forward from a
     /// peer whose name is only in the peer map is left to the caller.
@@ -222,6 +231,7 @@ pub fn map_message(msg: &tl::enums::Message, self_id: i64) -> Option<Row> {
                 media_size: media.as_ref().and_then(|f| f.size),
                 media_mime: media.as_ref().and_then(|f| f.mime.clone()),
                 edited_at: m.edit_date.map(i64::from),
+                edit_hidden: m.edit_hide,
                 reply_to_msg_id: m.reply_to.as_ref().and_then(reply_target),
                 fwd_from_name: m.fwd_from.as_ref().and_then(fwd_name),
                 reactions: m.reactions.as_ref().map(reactions).unwrap_or_default(),
@@ -253,6 +263,9 @@ pub fn map_message(msg: &tl::enums::Message, self_id: i64) -> Option<Row> {
                 media_size: None,
                 media_mime: None,
                 edited_at: None,
+                // A service message carries neither field: `messageService` has no
+                // `edit_date` and no `edit_hide`.
+                edit_hidden: false,
                 reply_to_msg_id: m.reply_to.as_ref().and_then(reply_target),
                 fwd_from_name: None,
                 reactions: m.reactions.as_ref().map(reactions).unwrap_or_default(),

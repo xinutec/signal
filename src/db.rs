@@ -531,6 +531,25 @@ const MIGRATIONS: &[&str] = &[
     r"ALTER TABLE telegram_messages
         ADD COLUMN media_size BIGINT NULL,
         ADD COLUMN media_mime VARCHAR(128) NULL",
+    // v22: whether Telegram asked for the edit NOT to be shown.
+    //
+    // ⚠ **`edit_date` IS NOT "SOMEBODY EDITED THIS".** Telegram's `message`
+    // constructor carries `edit_hide` beside it, documented as "whether the message
+    // should be shown as not modified to the user, EVEN IF AN EDIT DATE IS
+    // PRESENT". Telegram sets an edit date for its own reasons and then asks
+    // clients not to surface it — so its apps show no marker where this archive
+    // showed "Edited", on a photo in a live conversation, which is how it was
+    // noticed.
+    //
+    // The edit is still RECORDED. This governs display only, which is why it is a
+    // column here rather than a reason to drop `edited_at`.
+    //
+    // ⚠ NULLable, and the default is NOT `0`. `0` would assert "Telegram did not
+    // ask us to hide it", which is a claim about every row stored before this
+    // column existed and cannot be true of them — they were never asked. NULL means
+    // NOT YET KNOWN, which is what lets the enrichment path in
+    // `store_telegram_message` fill it on a re-walk.
+    r"ALTER TABLE telegram_messages ADD COLUMN edit_hidden TINYINT(1) NULL",
 ];
 
 #[derive(Clone)]
@@ -959,8 +978,8 @@ impl Db {
             "INSERT IGNORE INTO telegram_messages
                 (conversation_id, msg_id, sent_at, sender_id, sender_name,
                  is_outgoing, kind, text, media_kind, media_size, media_mime,
-                 edited_at, reply_to_msg_id, fwd_from_name)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 edited_at, edit_hidden, reply_to_msg_id, fwd_from_name)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(row.conversation_id)
         .bind(row.msg_id)
@@ -974,6 +993,7 @@ impl Db {
         .bind(row.media_size)
         .bind(row.media_mime.as_deref())
         .bind(row.edited_at)
+        .bind(row.edit_hidden)
         .bind(row.reply_to_msg_id)
         .bind(row.fwd_from_name.as_deref())
         .execute(&self.pool)
@@ -1003,15 +1023,18 @@ impl Db {
             "UPDATE telegram_messages
                 SET media_kind = COALESCE(media_kind, ?),
                     media_size = COALESCE(media_size, ?),
-                    media_mime = COALESCE(media_mime, ?)
+                    media_mime = COALESCE(media_mime, ?),
+                    edit_hidden = COALESCE(edit_hidden, ?)
               WHERE conversation_id = ? AND msg_id = ?
                 AND ((media_size IS NULL AND ? IS NOT NULL)
                   OR (media_mime IS NULL AND ? IS NOT NULL)
-                  OR (media_kind IS NULL AND ? IS NOT NULL))",
+                  OR (media_kind IS NULL AND ? IS NOT NULL)
+                  OR edit_hidden IS NULL)",
         )
         .bind(row.media_kind.map(|m| m.as_str()))
         .bind(row.media_size)
         .bind(row.media_mime.as_deref())
+        .bind(row.edit_hidden)
         .bind(row.conversation_id)
         .bind(row.msg_id)
         .bind(row.media_size)

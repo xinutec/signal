@@ -470,3 +470,39 @@ fn media_reports_its_size_without_a_download() {
     // disagree with it.
     assert_eq!(row.media_kind, Some(MediaKind::Video));
 }
+
+/// ⚠ **AN `edit_date` IS NOT "SOMEBODY EDITED THIS".** Telegram carries `edit_hide`
+/// beside it — "whether the message should be shown as not modified to the user,
+/// even if an edit date is present" — and sets an edit date for its own reasons.
+/// Reading the date without the flag is reading half the contract, and the visible
+/// consequence was this archive printing "Edited" on a message Telegram itself
+/// shows as untouched.
+///
+/// Both halves are asserted: the date is still RECORDED (an archive keeps what it
+/// saw), and the flag travels with it so the reader can honour it.
+#[test]
+fn an_edit_telegram_asks_us_to_hide_is_recorded_but_marked_hidden() {
+    let ordinary = tl::types::Message {
+        edit_date: Some(1_700_000_500),
+        ..dm()
+    };
+    let row = mapped(ordinary);
+    assert_eq!(row.edited_at, Some(1_700_000_500));
+    assert!(!row.edit_hidden);
+
+    let hidden = tl::types::Message {
+        edit_date: Some(1_700_000_500),
+        edit_hide: true,
+        ..dm()
+    };
+    let row = mapped(hidden);
+    assert_eq!(
+        row.edited_at,
+        Some(1_700_000_500),
+        "the archive keeps the date it was given"
+    );
+    assert!(
+        row.edit_hidden,
+        "and carries the instruction not to show it"
+    );
+}
