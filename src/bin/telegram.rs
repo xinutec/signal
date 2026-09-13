@@ -54,7 +54,7 @@ use grammers_client::session::types::PeerRef;
 use grammers_client::session::updates::UpdatesLike;
 use grammers_client::update::Update;
 use grammers_mtsender::SenderPool;
-use signal_archiver::db::{Db, TelegramDeleteScope, TelegramStored};
+use signal_archiver::db::{Db, TelegramDeleteScope, TelegramMediaState, TelegramStored};
 use signal_archiver::telegram::map::{self, Row};
 use signal_archiver::telegram::session::DbSession;
 use signal_archiver::telegram::{ConvKind, peer_name};
@@ -86,9 +86,24 @@ const PAGE_PAUSE: Duration = Duration::from_millis(400);
 /// A pause between backfill sweeps once every conversation is complete.
 const IDLE_SWEEP: Duration = Duration::from_secs(3600);
 
+/// The largest media this fetches without being asked.
+///
+/// ⚠ **MEASURED BEFORE IT WAS CHOSEN.** The archive records every file's size from
+/// the message itself, at no network cost, so the split is arithmetic rather than
+/// instinct: 4,906 photos come to about 0.9GB and the largest is 0.8MB, while 832
+/// videos come to 3.8GB and ONE of them is 1.5GB. A ceiling here rather than a test
+/// on `media_kind` because the kind is a label and the bytes are the cost — a
+/// 40MB "photo" nobody anticipated should wait to be asked for, and a 200KB video
+/// may as well come along.
+const EAGER_MAX_BYTES: i64 = 4 * 1024 * 1024;
+
+#[derive(Clone)]
 struct Cfg {
     api_id: i32,
     api_hash: String,
+    /// Where fetched media is written. A mount, read-only in the viewer that serves
+    /// it.
+    media_dir: String,
 }
 
 fn cfg() -> Result<Cfg> {
@@ -98,6 +113,8 @@ fn cfg() -> Result<Cfg> {
             .parse()
             .context("TELEGRAM_API_ID is not a number")?,
         api_hash: std::env::var("TELEGRAM_API_HASH").context("TELEGRAM_API_HASH not set")?,
+        media_dir: std::env::var("TELEGRAM_MEDIA_DIR")
+            .unwrap_or_else(|_| "/telegram-media".to_owned()),
     })
 }
 
@@ -147,7 +164,7 @@ async fn main() -> Result<()> {
             tracing::info!("logged in; the session is stored");
             Ok(())
         }
-        None => archive(&client, &db, &session, updates).await,
+        None => archive(&client, &db, &cfg, &session, updates).await,
         Some(other) => bail!("unknown mode {other:?}; expected `login <phone>` or no argument"),
     }
 }
@@ -228,6 +245,7 @@ fn prompt(what: &str) -> Result<String> {
 async fn archive(
     client: &Client,
     db: &Db,
+    cfg: &Cfg,
     session: &Arc<DbSession>,
     updates: tokio::sync::mpsc::UnboundedReceiver<UpdatesLike>,
 ) -> Result<()> {
@@ -257,15 +275,19 @@ async fn archive(
 
     // Live updates run CONCURRENTLY with the backfill. A decade of history takes
     // hours; a message that arrives during it must not wait for them.
+    // ⚠ Both tasks need the media directory, so `Cfg` is cloned into each rather
+    // than borrowed: a spawned task cannot hold a reference to a local.
     let live = {
         let client = client.clone();
         let db = db.clone();
-        tokio::spawn(async move { follow(&client, &db, self_id, updates).await })
+        let cfg = cfg.clone();
+        tokio::spawn(async move { follow(&client, &db, &cfg, self_id, updates).await })
     };
     let history = {
         let client = client.clone();
         let db = db.clone();
-        tokio::spawn(async move { backfill(&client, &db, self_id).await })
+        let cfg = cfg.clone();
+        tokio::spawn(async move { backfill(&client, &db, &cfg, self_id).await })
     };
 
     // Either ending is fatal: a feed with only half of itself running is the
@@ -336,6 +358,7 @@ async fn sweep(client: &Client, db: &Db) -> Result<Vec<(i64, PeerRef)>> {
 async fn follow(
     client: &Client,
     db: &Db,
+    cfg: &Cfg,
     self_id: i64,
     updates: tokio::sync::mpsc::UnboundedReceiver<UpdatesLike>,
 ) -> Result<()> {
@@ -358,7 +381,7 @@ async fn follow(
 
     loop {
         let update = stream.next().await.context("reading an update")?;
-        if let Err(e) = apply(db, self_id, &update).await {
+        if let Err(e) = apply(db, cfg, self_id, &update).await {
             // One bad update must not end the feed. Logged with the update's shape
             // so the next one of its kind can be handled deliberately.
             tracing::error!("could not store an update: {e:#}");
@@ -366,7 +389,7 @@ async fn follow(
     }
 }
 
-async fn apply(db: &Db, self_id: i64, update: &Update) -> Result<()> {
+async fn apply(db: &Db, cfg: &Cfg, self_id: i64, update: &Update) -> Result<()> {
     match update {
         Update::NewMessage(m) | Update::MessageEdited(m) => {
             // ⚠ **`m.raw` IS NOT THE MESSAGE.** `update::Message` has its own
@@ -377,9 +400,11 @@ async fn apply(db: &Db, self_id: i64, update: &Update) -> Result<()> {
             // through the deref target explicitly, once, with its type written
             // down.
             let inner: &grammers_client::message::Message = m;
-            store(db, self_id, &inner.raw, m.sender().and_then(peer_name))
-                .await
-                .map(|_| ())
+            store(db, self_id, &inner.raw, m.sender().and_then(peer_name)).await?;
+            if let Some(row) = map::map_message(&inner.raw, self_id) {
+                fetch_media(db, cfg, inner, row.conversation_id).await?;
+            }
+            Ok(())
         }
         Update::MessageDeleted(d) => {
             // ⚠ Which conversations this reaches depends on whether Telegram named
@@ -439,6 +464,121 @@ async fn store(
     Ok(outcome)
 }
 
+/// Fetch this message's media if it is small enough to take without being asked,
+/// and otherwise record that it is there to be asked for.
+///
+/// ⚠ **NEVER FATAL.** A download that fails must not end the feed or stop the walk:
+/// the archive's job is the messages, and a picture that did not arrive is recorded
+/// as `failed` with its reason so it can be retried deliberately. An error here
+/// returning `Err` would let one unfetchable file stop a decade of history.
+///
+/// ⚠ **The row is written AFTER the file is closed.** `download_media` streams chunk
+/// by chunk, so a path published before the last chunk is a path to a short file,
+/// and nothing downstream can tell a short file from a small one.
+async fn fetch_media(
+    db: &Db,
+    cfg: &Cfg,
+    message: &grammers_client::message::Message,
+    conversation_id: i64,
+) -> Result<()> {
+    let Some(media) = message.media() else {
+        return Ok(());
+    };
+    let msg_id = message.id();
+    // Already accounted for: stored, offered and waiting, or failed with a reason.
+    // Re-offering would be harmless and re-downloading would not, and a re-walk
+    // passes every message again.
+    if db
+        .telegram_media_state(conversation_id, msg_id)
+        .await?
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    let size = media.size().and_then(|s| i64::try_from(s).ok());
+    let Some(size) = size else {
+        // Not a file — a poll, a location, a link preview. Nothing to hold, and no
+        // offer to make either.
+        return Ok(());
+    };
+    if size > EAGER_MAX_BYTES {
+        db.record_telegram_media_state(conversation_id, msg_id, TelegramMediaState::Offered, None)
+            .await?;
+        return Ok(());
+    }
+
+    // ⚠ The name carries the conversation AND the message, because `msg_id` alone
+    // is unique only within a conversation — two files from different chats would
+    // otherwise overwrite each other on the volume, and the loser would be a photo
+    // showing somebody else's picture.
+    let stored_name = format!("{conversation_id}_{msg_id}");
+    let path = std::path::Path::new(&cfg.media_dir).join(&stored_name);
+    // ⚠ `download_media` returns a BOOL, and `false` means "there was nothing to
+    // download" rather than a failure. Treating it as success would record a stored
+    // file that is not there — the reader would then serve a 404 for a message the
+    // archive claims to hold.
+    match message.download_media(&path).await {
+        Ok(true) => {
+            let on_disk = tokio::fs::metadata(&path)
+                .await
+                .map(|m| i64::try_from(m.len()).unwrap_or(size))
+                .unwrap_or(size);
+            db.record_telegram_media_stored(
+                conversation_id,
+                msg_id,
+                &stored_name,
+                on_disk,
+                media_content_type(&media).as_deref(),
+            )
+            .await?;
+        }
+        Ok(false) => {
+            // Nothing fetchable behind it: a thumbnail-only or expired reference.
+            // Recorded as offered rather than failed, because there is no error to
+            // report and a reader asking may yet get it.
+            db.record_telegram_media_state(
+                conversation_id,
+                msg_id,
+                TelegramMediaState::Offered,
+                Some("telegram returned no file for this message"),
+            )
+            .await?;
+        }
+        Err(e) => {
+            // The partial file is removed: a valid-looking file of the wrong length
+            // is worse than none, because nothing later comes back to notice it.
+            let _ = tokio::fs::remove_file(&path).await;
+            let note = format!("{e}");
+            tracing::warn!("media {conversation_id}/{msg_id} could not be fetched: {note}");
+            db.record_telegram_media_state(
+                conversation_id,
+                msg_id,
+                TelegramMediaState::Failed,
+                Some(note.chars().take(200).collect::<String>().as_str()),
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// What to serve the bytes as.
+///
+/// Telegram photos are compressed JPEG — that is what the variant means — and a
+/// document carries its own mime. Anything else gets none, and the reader falls
+/// back to `application/octet-stream` rather than guessing from the extension there
+/// is not.
+fn media_content_type(media: &grammers_client::media::Media) -> Option<String> {
+    use grammers_client::media::Media as M;
+    match media {
+        M::Photo(_) => Some("image/jpeg".to_owned()),
+        M::Sticker(s) => s.document.mime_type().map(str::to_owned),
+        M::Document(d) => d.mime_type().map(str::to_owned),
+        _ => None,
+    }
+}
+
 /// The best kind available without the peer.
 ///
 /// ⚠ A channel id may be a broadcast OR a supergroup and this cannot tell which,
@@ -453,7 +593,7 @@ fn kind_from_space(row: &Row) -> ConvKind {
 }
 
 /// Walk every conversation's history backwards, resuming where it left off.
-async fn backfill(client: &Client, db: &Db, self_id: i64) -> Result<()> {
+async fn backfill(client: &Client, db: &Db, cfg: &Cfg, self_id: i64) -> Result<()> {
     loop {
         let pending = sweep(client, db).await?;
         if pending.is_empty() {
@@ -469,7 +609,7 @@ async fn backfill(client: &Client, db: &Db, self_id: i64) -> Result<()> {
                 .telegram_backfill_state(id)
                 .await?
                 .and_then(|state| state.oldest_seen);
-            walk(client, db, self_id, id, peer_ref, from).await?;
+            walk(client, db, cfg, self_id, id, peer_ref, from).await?;
         }
     }
 }
@@ -490,6 +630,7 @@ async fn backfill(client: &Client, db: &Db, self_id: i64) -> Result<()> {
 async fn walk(
     client: &Client,
     db: &Db,
+    cfg: &Cfg,
     self_id: i64,
     id: i64,
     peer_ref: PeerRef,
@@ -514,11 +655,16 @@ async fn walk(
     let mut oldest = None;
     while let Some(message) = iter.next().await.context("reading a history page")? {
         let sender = message.sender().and_then(peer_name);
+        // ⚠ The MESSAGE first, the bytes second. A picture whose row is missing is
+        // a file nothing references; a row whose picture is missing is a message
+        // that reads correctly and offers to fetch one. Only the second is
+        // recoverable, so the order is not arbitrary.
         match store(db, self_id, &message.raw, sender).await? {
             TelegramStored::Inserted | TelegramStored::Edited => stored += 1,
             TelegramStored::Enriched => enriched += 1,
             TelegramStored::Unchanged => {}
         }
+        fetch_media(db, cfg, &message, id).await?;
         oldest = Some(match oldest {
             None => message.id(),
             Some(prev) => i32::min(prev, message.id()),

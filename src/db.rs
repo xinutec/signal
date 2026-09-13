@@ -571,6 +571,45 @@ const MIGRATIONS: &[&str] = &[
        WHERE media_kind = 'document' AND media_mime LIKE 'video/%'",
     r"UPDATE telegram_messages SET media_kind = 'audio'
        WHERE media_kind = 'document' AND media_mime LIKE 'audio/%'",
+    // v24: the bytes this archive actually HOLDS for a Telegram message.
+    //
+    // Separate from the media columns on `telegram_messages` because they answer
+    // different questions and can disagree honestly: those record what TELEGRAM
+    // said about the file (its size, its type, knowable with no request), and this
+    // records what is on the volume. A row here with no row there would be bytes we
+    // cannot describe; a row there with none here is a file we have not fetched,
+    // which is the normal state for everything large.
+    //
+    // ⚠ **`state` IS THE WHOLE DESIGN, and it mirrors `link_images` in the
+    // `messages` repo deliberately.** Photos are fetched EAGERLY, because a photo in
+    // a conversation is the conversation and the backfill is already at that message
+    // with the connection open. Everything larger is `offered` and fetched only when
+    // a reader asks — 832 videos come to 3.8GB and one of them is 1.5GB, measured
+    // before any of this was built, which is what made the split a decision rather
+    // than a guess.
+    //
+    // `failed` keeps the reason. A fetch that failed silently and left no row would
+    // be retried forever by the eager pass; one that left a row with no reason would
+    // be a mystery nobody could act on.
+    //
+    // `stored_name` is a NAME, not a path: the directory is configuration
+    // (`TELEGRAM_MEDIA_DIR`), and a stored absolute path would survive a remount
+    // pointing at nothing. The reader joins the two and takes only the file name, so
+    // a name cannot escape the mount.
+    r"CREATE TABLE IF NOT EXISTS telegram_media (
+        conversation_id BIGINT NOT NULL,
+        msg_id INT NOT NULL,
+        state ENUM('offered','stored','failed') NOT NULL,
+        stored_name VARCHAR(255) NULL,
+        size_bytes BIGINT NULL,
+        content_type VARCHAR(128) NULL,
+        note VARCHAR(255) NULL,
+        requested_at TIMESTAMP NULL,
+        stored_at TIMESTAMP NULL,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (conversation_id, msg_id),
+        INDEX idx_tg_media_state (state, requested_at)
+    )",
 ];
 
 #[derive(Clone)]
@@ -1179,6 +1218,84 @@ impl Db {
         Ok(())
     }
 
+    /// Whether this message's bytes are already accounted for — stored, offered or
+    /// failed — so the eager pass can skip it without a download attempt.
+    pub async fn telegram_media_state(
+        &self,
+        conversation_id: i64,
+        msg_id: i32,
+    ) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT state FROM telegram_media WHERE conversation_id = ? AND msg_id = ?",
+        )
+        .bind(conversation_id)
+        .bind(msg_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    /// Record bytes written to the volume.
+    ///
+    /// ⚠ Called AFTER the file is closed, never before. The row is what tells the
+    /// reader a file is there; writing it first would publish a path to a
+    /// half-written file, and the reader has no way to tell a short file from a
+    /// small one. Same ordering, and the same reason, as the Signal attachment path.
+    pub async fn record_telegram_media_stored(
+        &self,
+        conversation_id: i64,
+        msg_id: i32,
+        stored_name: &str,
+        size_bytes: i64,
+        content_type: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO telegram_media
+                (conversation_id, msg_id, state, stored_name, size_bytes, content_type,
+                 stored_at)
+             VALUES (?, ?, 'stored', ?, ?, ?, CURRENT_TIMESTAMP)
+             ON DUPLICATE KEY UPDATE
+                 state = 'stored', stored_name = VALUES(stored_name),
+                 size_bytes = VALUES(size_bytes), content_type = VALUES(content_type),
+                 note = NULL, stored_at = CURRENT_TIMESTAMP",
+        )
+        .bind(conversation_id)
+        .bind(msg_id)
+        .bind(stored_name)
+        .bind(size_bytes)
+        .bind(content_type)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Record that this message's bytes are available but not fetched, or that
+    /// fetching them failed and why.
+    ///
+    /// ⚠ `offered` does NOT overwrite `stored`: a re-walk offers everything it sees,
+    /// and without the guard it would retract files already on the volume.
+    pub async fn record_telegram_media_state(
+        &self,
+        conversation_id: i64,
+        msg_id: i32,
+        state: TelegramMediaState,
+        note: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO telegram_media (conversation_id, msg_id, state, note)
+             VALUES (?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE
+                 state = IF(state = 'stored', 'stored', VALUES(state)),
+                 note = IF(state = 'stored', note, VALUES(note))",
+        )
+        .bind(conversation_id)
+        .bind(msg_id)
+        .bind(state.as_str())
+        .bind(note)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// How far back a conversation has been walked, or `None` if it never has.
     pub async fn telegram_backfill_state(
         &self,
@@ -1320,6 +1437,28 @@ pub struct TelegramBackfill {
     /// conversation has no more history.
     pub complete: bool,
     pub messages_stored: i64,
+}
+
+/// What the archive holds, or does not, for one message's media.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelegramMediaState {
+    /// Telegram has the bytes and we have not fetched them. The normal state for
+    /// anything large.
+    Offered,
+    /// On the volume.
+    Stored,
+    /// Tried and could not — `note` says why.
+    Failed,
+}
+
+impl TelegramMediaState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TelegramMediaState::Offered => "offered",
+            TelegramMediaState::Stored => "stored",
+            TelegramMediaState::Failed => "failed",
+        }
+    }
 }
 
 /// Which conversations a deletion applies to — see [`Db::mark_telegram_deleted`]
