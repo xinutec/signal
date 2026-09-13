@@ -231,13 +231,23 @@ What Telegram does that the others do not, and where each is handled:
 | | how Telegram does it | where |
 | --- | --- | --- |
 | a DM names no sender | `from_id` omitted; `out` says which end | `map.rs`, inferred and tested both ways |
-| an edit MUTATES the message | same `msg_id`, new text, new `edit_date` | the prior text is filed in `telegram_message_edits` before the update, in one transaction |
+| an edit MUTATES the message | same `msg_id`, new text, new `edit_date` | the prior text is filed in `telegram_message_edits` before the update, in one transaction — but only when the archive HELD the prior text, so backfilled edits have none and never will (558 such on the first ingest) |
 | a deletion names no peer | private chats and basic groups share ONE id sequence; channels have their own | `Db::mark_telegram_deleted` takes a SCOPE, and a peer-less deletion never reaches a channel |
 | a supergroup looks like a channel | same id space, told apart by a flag on the peer | the id gives `PeerSpace`, the peer gives `ConvKind`; the dialog sweep is what corrects it |
 | reactions are counts | aggregated per emoji, not per author | stored as given; a custom emoji keeps its document id |
 
 Media is NOT downloaded: `media_kind` records that there was a photo. Attachment
 bytes are Signal-only in this archive.
+
+**First ingest, 2026-09-13** — 21 conversations, all of them DMs, so nothing here
+has yet exercised the group, supergroup or channel paths. Of 472 reaction rows,
+**none** were custom emoji, so that branch is unit-tested and unexercised by real
+data. The DM sender inference — the one rule in `map.rs` that guesses — produced
+**zero NULL senders across 5,523 DM messages**, which is the number worth having:
+it is the only thing that says the inference fires at all on real rows. It does
+NOT say the two arms are the right way round; the 2,646/2,879
+incoming/outgoing split would look just as plausible reversed, and only the
+ablated unit tests speak to that.
 
 ## Security
 The signal-cli data PVC holds linked-device keys — secret-class; keep its odin
