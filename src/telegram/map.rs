@@ -55,8 +55,9 @@ impl MsgKind {
 }
 
 /// What KIND of media a message carried. Not the media itself: this archive
-/// stores Telegram bytes nowhere (see the v16 migration), so a photo is recorded
-/// as having been a photo.
+/// stores Telegram bytes nowhere yet (see the v16 migration), so a photo is
+/// recorded as having been a photo — with, since v21, its SIZE and mime beside it,
+/// which is what makes the decision about downloading a measured one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaKind {
     Photo,
@@ -138,6 +139,9 @@ pub struct Row {
     pub kind: MsgKind,
     pub text: Option<String>,
     pub media_kind: Option<MediaKind>,
+    /// What a download would cost, from the message rather than from a request.
+    pub media_size: Option<i64>,
+    pub media_mime: Option<String>,
     /// Unix seconds of the most recent edit, or `None` for a message never
     /// edited. This is Telegram's `edit_date` and is the only ordering there is
     /// for an edit chain — there is no revision number.
@@ -195,6 +199,7 @@ pub fn map_message(msg: &tl::enums::Message, self_id: i64) -> Option<Row> {
         tl::enums::Message::Empty(_) => None,
         tl::enums::Message::Message(m) => {
             let (conversation_id, peer_space) = normalise_peer(&m.peer_id);
+            let media = m.media.as_ref().map(media_of);
             Some(Row {
                 conversation_id,
                 peer_space,
@@ -213,7 +218,9 @@ pub fn map_message(msg: &tl::enums::Message, self_id: i64) -> Option<Row> {
                 // only a photo said nothing, and the viewer already distinguishes
                 // "no body" from "a body that is blank" (its copied-log rule).
                 text: non_empty(&m.message),
-                media_kind: m.media.as_ref().map(media_kind),
+                media_kind: media.as_ref().map(|f| f.kind),
+                media_size: media.as_ref().and_then(|f| f.size),
+                media_mime: media.as_ref().and_then(|f| f.mime.clone()),
                 edited_at: m.edit_date.map(i64::from),
                 reply_to_msg_id: m.reply_to.as_ref().and_then(reply_target),
                 fwd_from_name: m.fwd_from.as_ref().and_then(fwd_name),
@@ -243,6 +250,8 @@ pub fn map_message(msg: &tl::enums::Message, self_id: i64) -> Option<Row> {
                 // it for something a person typed.
                 text: Some(describe_action(&m.action).to_owned()),
                 media_kind: None,
+                media_size: None,
+                media_mime: None,
                 edited_at: None,
                 reply_to_msg_id: m.reply_to.as_ref().and_then(reply_target),
                 fwd_from_name: None,
@@ -309,29 +318,69 @@ fn reactions(r: &tl::enums::MessageReactions) -> Vec<Reaction> {
         .collect()
 }
 
-fn media_kind(media: &tl::enums::MessageMedia) -> MediaKind {
-    use tl::enums::MessageMedia as M;
-    match media {
-        M::Photo(_) => MediaKind::Photo,
-        M::Geo(_) => MediaKind::GeoPoint,
-        M::GeoLive(_) => MediaKind::GeoPoint,
-        M::Contact(_) => MediaKind::Contact,
-        M::Poll(_) => MediaKind::Poll,
-        M::Dice(_) => MediaKind::Dice,
-        M::Game(_) => MediaKind::Game,
-        M::Invoice(_) => MediaKind::Invoice,
-        M::WebPage(_) => MediaKind::WebPage,
-        M::Story(_) => MediaKind::Story,
-        M::Giveaway(_) => MediaKind::Giveaway,
-        M::GiveawayResults(_) => MediaKind::Giveaway,
-        // ⚠ A sticker, a video, a voice note and a PDF are ALL `messageMediaDocument`;
-        // which one it is lives in the document's attributes rather than in the
-        // media variant. Distinguishing them means reading those attributes, so
-        // this reports `document` and the finer label waits for the pass that
-        // would also fetch the bytes.
-        M::Document(_) => MediaKind::Document,
-        _ => MediaKind::Other,
-    }
+/// What a message's media IS, how big it is, and what type it holds.
+///
+/// ⚠ **Through `grammers_client::media::Media` rather than the raw enum, and that
+/// is what makes the finer answers possible.** A sticker, a video, a voice note
+/// and a PDF are all `messageMediaDocument` on the wire; which one it is lives in
+/// the document's ATTRIBUTES. `Media::from_raw` reads them, and it needs no client
+/// — so this layer stays pure and gains `sticker` and a mime type it could not
+/// otherwise see.
+///
+/// ⚠ **`size()` AND `mime` COST NO NETWORK REQUEST.** They come out of the message
+/// itself, which is what lets the archive record what a download would cost before
+/// anything is downloaded.
+fn media_of(media: &tl::enums::MessageMedia) -> MediaFacts {
+    use grammers_client::media::Media as M;
+    let Some(m) = M::from_raw(media.clone()) else {
+        // `messageMediaEmpty` and media this build of grammers does not model. It
+        // was there, and that is all this can say.
+        return MediaFacts {
+            kind: MediaKind::Other,
+            size: None,
+            mime: None,
+        };
+    };
+    let size = m.size().and_then(|s| i64::try_from(s).ok());
+    let (kind, mime) = match &m {
+        // Telegram photos are compressed JPEG — that is what the variant MEANS, so
+        // the mime is knowable without asking.
+        M::Photo(_) => (MediaKind::Photo, Some("image/jpeg".to_owned())),
+        M::Sticker(s) => (
+            MediaKind::Sticker,
+            s.document.mime_type().map(str::to_owned),
+        ),
+        M::Document(d) => (
+            // The mime is the honest finer label: a `video/mp4` and a
+            // `application/pdf` are both documents, and the column that separates
+            // them is the one that says so rather than a taxonomy of ours.
+            match d.mime_type() {
+                Some(t) if t.starts_with("video/") => MediaKind::Video,
+                Some(t) if t.starts_with("audio/") => MediaKind::Audio,
+                _ => MediaKind::Document,
+            },
+            d.mime_type().map(str::to_owned),
+        ),
+        M::Contact(_) => (MediaKind::Contact, None),
+        M::Poll(_) => (MediaKind::Poll, None),
+        M::Geo(_) | M::GeoLive(_) | M::Venue(_) => (MediaKind::GeoPoint, None),
+        M::Dice(_) => (MediaKind::Dice, None),
+        M::WebPage(_) => (MediaKind::WebPage, None),
+        // `Media` is `#[non_exhaustive]`: a variant grammers adds later lands here
+        // rather than stopping the build, and is recorded as having been something.
+        _ => (MediaKind::Other, None),
+    };
+    MediaFacts { kind, size, mime }
+}
+
+/// What [`media_of`] found. A struct because the three travel together and a
+/// tuple of two `Option`s at the call site is the shape nobody reads correctly.
+pub struct MediaFacts {
+    pub kind: MediaKind,
+    /// Bytes a download would take, when Telegram said. `None` for media that is
+    /// not a file at all — a poll has no size.
+    pub size: Option<i64>,
+    pub mime: Option<String>,
 }
 
 /// An English label for a service action.

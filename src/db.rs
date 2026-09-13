@@ -511,6 +511,26 @@ const MIGRATIONS: &[&str] = &[
         data LONGTEXT NOT NULL,
         updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
     )",
+    // v21: what a media download WOULD cost, and what it is.
+    //
+    // ⚠ **RECORDED BEFORE ANYTHING IS DOWNLOADED, which is the point.** `grammers`
+    // reports a file's size and mime from the message itself — no network request —
+    // so the archive can say exactly what fetching the photos would take before
+    // anybody commits a volume to it. The alternative was estimating from a
+    // per-photo guess, and the documents are precisely where a guess goes wrong: a
+    // couple of videos outweigh every photo in the account.
+    //
+    // `media_mime` is here too, one column early, because it comes from the same
+    // call and because serving bytes later needs a content type. A row that knows
+    // it is a 3 MB `video/mp4` is answerable without a download; a row that knows
+    // only "document" is not.
+    //
+    // ⚠ NULL means NOT YET KNOWN, not zero. Everything stored before this migration
+    // has NULL here, and no re-walk fills it by itself — see the enrichment note on
+    // `store_telegram_message`, which is what does.
+    r"ALTER TABLE telegram_messages
+        ADD COLUMN media_size BIGINT NULL,
+        ADD COLUMN media_mime VARCHAR(128) NULL",
 ];
 
 #[derive(Clone)]
@@ -938,9 +958,9 @@ impl Db {
         let inserted = sqlx::query(
             "INSERT IGNORE INTO telegram_messages
                 (conversation_id, msg_id, sent_at, sender_id, sender_name,
-                 is_outgoing, kind, text, media_kind, edited_at,
-                 reply_to_msg_id, fwd_from_name)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 is_outgoing, kind, text, media_kind, media_size, media_mime,
+                 edited_at, reply_to_msg_id, fwd_from_name)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(row.conversation_id)
         .bind(row.msg_id)
@@ -951,6 +971,8 @@ impl Db {
         .bind(row.kind.as_str())
         .bind(row.text.as_deref())
         .bind(row.media_kind.map(|m| m.as_str()))
+        .bind(row.media_size)
+        .bind(row.media_mime.as_deref())
         .bind(row.edited_at)
         .bind(row.reply_to_msg_id)
         .bind(row.fwd_from_name.as_deref())
@@ -959,6 +981,46 @@ impl Db {
         if inserted.rows_affected() != 0 {
             return Ok(TelegramStored::Inserted);
         }
+
+        // ⚠ **WHAT MAKES A NEW COLUMN FILLABLE FOR ROWS ALREADY STORED.** Without
+        // this, adding `media_size` would have left it NULL forever on everything
+        // ingested before it existed: the backfill marks a conversation `complete`
+        // and never returns, and even a forced re-walk stores nothing because the
+        // INSERT above is IGNOREd and the edit path only fires when `edit_date`
+        // moves. The archive would have had a column it could never populate.
+        //
+        // So a message the archive already holds is ENRICHED when this delivery
+        // knows something the stored row does not. Keyed on the stored value being
+        // NULL — "not yet known" — rather than on a version number, so it is
+        // idempotent and costs one statement that matches nothing once the row is
+        // complete.
+        //
+        // ⚠ It does NOT overwrite a known value with a different one. That would be
+        // the wrong instinct here: media facts come from the message and do not
+        // change, so a disagreement means one of the two readings is wrong, and
+        // silently taking the newer one would hide that.
+        let enriched = sqlx::query(
+            "UPDATE telegram_messages
+                SET media_kind = COALESCE(media_kind, ?),
+                    media_size = COALESCE(media_size, ?),
+                    media_mime = COALESCE(media_mime, ?)
+              WHERE conversation_id = ? AND msg_id = ?
+                AND ((media_size IS NULL AND ? IS NOT NULL)
+                  OR (media_mime IS NULL AND ? IS NOT NULL)
+                  OR (media_kind IS NULL AND ? IS NOT NULL))",
+        )
+        .bind(row.media_kind.map(|m| m.as_str()))
+        .bind(row.media_size)
+        .bind(row.media_mime.as_deref())
+        .bind(row.conversation_id)
+        .bind(row.msg_id)
+        .bind(row.media_size)
+        .bind(row.media_mime.as_deref())
+        .bind(row.media_kind.map(|m| m.as_str()))
+        .execute(&self.pool)
+        .await?
+        .rows_affected()
+            != 0;
 
         let existing: Option<(Option<String>, Option<i64>)> = sqlx::query_as(
             "SELECT text, edited_at FROM telegram_messages
@@ -974,7 +1036,13 @@ impl Db {
             // Gone between the insert and the read. Nothing to preserve and
             // nothing to update; the next delivery will insert it.
             None => TelegramStored::Unchanged,
-            Some((_, stored_edit)) if stored_edit == row.edited_at => TelegramStored::Unchanged,
+            Some((_, stored_edit)) if stored_edit == row.edited_at => {
+                if enriched {
+                    TelegramStored::Enriched
+                } else {
+                    TelegramStored::Unchanged
+                }
+            }
             Some((stored_text, stored_edit)) => {
                 // The superseded version, filed under the `edit_date` it carried.
                 // `INSERT IGNORE` because an update seen twice must not append
@@ -1192,7 +1260,10 @@ pub enum TelegramStored {
     Inserted,
     /// A message whose text was replaced, with the old version kept.
     Edited,
-    /// Already stored, at the same `edit_date`. The common case on replay.
+    /// Already stored, and this delivery knew something the stored row did not —
+    /// a media size or mime recorded by a build that came after the row.
+    Enriched,
+    /// Already stored, and nothing new. The common case on replay.
     Unchanged,
 }
 

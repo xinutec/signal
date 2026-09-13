@@ -212,12 +212,16 @@ fn a_message_with_only_media_has_no_text() {
     assert_eq!(row.media_kind, Some(MediaKind::Photo));
 }
 
-/// ⚠ A sticker, a video note and a PDF are all `messageMediaDocument` on the
-/// wire. This pins the honest answer — `document` — rather than a finer label
-/// this build does not earn, so that a later pass which reads the document's
-/// attributes has a test to change deliberately.
+/// ⚠ **A sticker, a video and a PDF are all `messageMediaDocument` on the wire**,
+/// and this test used to pin the coarse answer `document` — "a finer label this
+/// build does not earn" — with a note that a later pass reading the document's
+/// attributes would have a test to change deliberately. This is that change.
+///
+/// The finer label now comes from `Media::from_raw`, which reads the attributes and
+/// needs no client. A document with NO mime is still `document`: the taxonomy is
+/// the mime type's, not ours, so an absent mime leaves nothing to be finer about.
 #[test]
-fn every_document_shaped_media_reports_document() {
+fn a_document_with_no_mime_type_is_still_just_a_document() {
     let doc = tl::types::Message {
         media: Some(tl::enums::MessageMedia::Document(
             tl::types::MessageMediaDocument {
@@ -419,4 +423,50 @@ fn a_story_reply_is_not_a_message_reply() {
         ..dm()
     };
     assert_eq!(mapped(to_a_story).reply_to_msg_id, None);
+}
+
+/// The size and the mime come out of the MESSAGE, with no request — which is the
+/// whole reason the archive can say what a download would cost before deciding to
+/// make one.
+///
+/// ⚠ A poll has no size and that is not a failure: `None` means "not a file",
+/// where 0 would mean "an empty file". The column is NULLable for that reason.
+#[test]
+fn media_reports_its_size_without_a_download() {
+    let doc = tl::types::Document {
+        id: 11,
+        access_hash: 22,
+        file_reference: vec![],
+        date: 1_700_000_000,
+        mime_type: "video/mp4".to_owned(),
+        size: 3_145_728,
+        thumbs: None,
+        video_thumbs: None,
+        dc_id: 2,
+        attributes: vec![],
+    };
+    let with_video = tl::types::Message {
+        media: Some(tl::enums::MessageMedia::Document(
+            tl::types::MessageMediaDocument {
+                nopremium: false,
+                spoiler: false,
+                video: false,
+                round: false,
+                voice: false,
+                document: Some(tl::enums::Document::Document(doc)),
+                alt_documents: None,
+                video_cover: None,
+                video_timestamp: None,
+                ttl_seconds: None,
+            },
+        )),
+        ..dm()
+    };
+    let row = mapped(with_video);
+    assert_eq!(row.media_size, Some(3_145_728));
+    assert_eq!(row.media_mime.as_deref(), Some("video/mp4"));
+    // ⚠ And the mime is what makes it a VIDEO rather than a document — the finer
+    // label is the mime's judgement, not a second taxonomy of ours that could
+    // disagree with it.
+    assert_eq!(row.media_kind, Some(MediaKind::Video));
 }

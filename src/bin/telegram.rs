@@ -338,7 +338,9 @@ async fn apply(db: &Db, self_id: i64, update: &Update) -> Result<()> {
             // through the deref target explicitly, once, with its type written
             // down.
             let inner: &grammers_client::message::Message = m;
-            store(db, self_id, &inner.raw, m.sender().and_then(peer_name)).await
+            store(db, self_id, &inner.raw, m.sender().and_then(peer_name))
+                .await
+                .map(|_| ())
         }
         Update::MessageDeleted(d) => {
             // ⚠ Which conversations this reaches depends on whether Telegram named
@@ -369,9 +371,10 @@ async fn store(
     self_id: i64,
     raw: &grammers_tl_types::enums::Message,
     sender_name: Option<String>,
-) -> Result<()> {
+) -> Result<TelegramStored> {
     let Some(row) = map::map_message(raw, self_id) else {
-        return Ok(());
+        // Nothing to store, and nothing learned.
+        return Ok(TelegramStored::Unchanged);
     };
     // ⚠ The conversation row FIRST, and with the kind the id implies rather than
     // the one the peer would give. A message can arrive from a conversation the
@@ -394,7 +397,7 @@ async fn store(
             row.msg_id
         );
     }
-    Ok(())
+    Ok(outcome)
 }
 
 /// The best kind available without the peer.
@@ -442,31 +445,46 @@ async fn backfill(client: &Client, db: &Db, self_id: i64) -> Result<()> {
                 iter = iter.offset_id(offset);
             }
 
+            // ⚠ `walked` and `stored` are different numbers and the column is named
+            // for the second. Counting every message the walk SAW would inflate
+            // `messages_stored` on every re-walk — and a re-walk is exactly what an
+            // enrichment pass is, so the counter would drift each time a column was
+            // added. `enriched` is reported but not counted: it is the same message,
+            // better described.
+            let mut walked = 0i64;
             let mut stored = 0i64;
+            let mut enriched = 0i64;
             let mut oldest = None;
             while let Some(message) = iter.next().await.context("reading a history page")? {
                 let sender = message.sender().and_then(peer_name);
-                store(db, self_id, &message.raw, sender).await?;
+                match store(db, self_id, &message.raw, sender).await? {
+                    TelegramStored::Inserted | TelegramStored::Edited => stored += 1,
+                    TelegramStored::Enriched => enriched += 1,
+                    TelegramStored::Unchanged => {}
+                }
                 oldest = Some(match oldest {
                     None => message.id(),
                     Some(prev) => i32::min(prev, message.id()),
                 });
-                stored += 1;
-                if (stored as usize).is_multiple_of(PAGE) {
+                walked += 1;
+                if (walked as usize).is_multiple_of(PAGE) {
                     tokio::time::sleep(PAGE_PAUSE).await;
                 }
             }
 
-            // ⚠ `complete` only when the page was EMPTY. An interrupted walk that
-            // recorded itself finished would leave a conversation permanently
-            // half-archived, with nothing anywhere saying so.
-            let complete = stored == 0;
+            // ⚠ `complete` only when the page was EMPTY — which is what the WALK
+            // returned, not what was stored. Keying it on `stored` would declare a
+            // conversation finished the moment a page held nothing new, which on a
+            // re-walk is the first page.
+            let complete = walked == 0;
             db.record_telegram_backfill(id, oldest, complete, stored)
                 .await?;
             if complete {
                 tracing::info!("conversation {id} is fully archived");
             } else {
-                tracing::info!("conversation {id}: {stored} older message(s) stored");
+                tracing::info!(
+                    "conversation {id}: walked {walked}, stored {stored}, enriched {enriched}"
+                );
             }
             tokio::time::sleep(PAGE_PAUSE).await;
         }

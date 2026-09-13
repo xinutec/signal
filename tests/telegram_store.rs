@@ -77,6 +77,8 @@ fn row(conversation: i64, space: PeerSpace, msg_id: i32, text: &str) -> Row {
         kind: MsgKind::Message,
         text: Some(text.to_owned()),
         media_kind: None,
+        media_size: None,
+        media_mime: None,
         edited_at: None,
         reply_to_msg_id: None,
         fwd_from_name: None,
@@ -468,4 +470,99 @@ async fn a_session_survives_a_round_trip_with_its_auth_key() {
         "the sentinel still resolves after a round trip"
     );
     assert_eq!(reloaded.updates_state().await.expect("updates").pts, 4242);
+}
+
+/// ⚠ **A message the archive already holds gains facts a later build can see.**
+/// This is what makes adding a column possible at all: the backfill marks a
+/// conversation `complete` and never returns, and a forced re-walk stores nothing
+/// because the insert is IGNOREd and the edit path only fires when `edit_date`
+/// moves. Without enrichment, `media_size` would have been NULL forever on every
+/// row ingested before it existed — a column the archive could not populate.
+///
+/// Also pinned: enrichment is IDEMPOTENT, and it does NOT overwrite a value it
+/// already has. Media facts come from the message and do not change, so a
+/// disagreement means one of the two readings is wrong; taking the newer one
+/// silently would hide that.
+#[tokio::test]
+async fn a_stored_message_is_enriched_with_facts_it_did_not_have() {
+    let Some((db, pool)) = connect().await else {
+        return;
+    };
+    let id = ids(6);
+    let msg = id.msg_base + 1;
+
+    // As an older build stored it: a photo, with nothing known about its bytes.
+    let bare = Row {
+        media_kind: Some(signal_archiver::telegram::map::MediaKind::Photo),
+        ..row(id.conversation, PeerSpace::User, msg, "look at this")
+    };
+    assert_eq!(
+        db.store_telegram_message(&bare, None)
+            .await
+            .expect("insert"),
+        TelegramStored::Inserted
+    );
+    assert_eq!(media_facts(&pool, id.conversation, msg).await, (None, None));
+
+    // The same message, delivered again by a build that reads sizes.
+    let known = Row {
+        media_size: Some(204_800),
+        media_mime: Some("image/jpeg".to_owned()),
+        ..bare.clone()
+    };
+    assert_eq!(
+        db.store_telegram_message(&known, None)
+            .await
+            .expect("enrich"),
+        TelegramStored::Enriched
+    );
+    assert_eq!(
+        media_facts(&pool, id.conversation, msg).await,
+        (Some(204_800), Some("image/jpeg".to_owned()))
+    );
+
+    // Again, unchanged: nothing left to learn, so nothing is written and the
+    // outcome says so. This is what keeps a re-walk cheap.
+    assert_eq!(
+        db.store_telegram_message(&known, None)
+            .await
+            .expect("replay"),
+        TelegramStored::Unchanged
+    );
+
+    // ⚠ And a DISAGREEING value is refused rather than taken. If two readings of
+    // one message differ about its size, the archive keeps the first and the
+    // difference stays visible instead of being quietly resolved.
+    let disagrees = Row {
+        media_size: Some(999_999),
+        ..known.clone()
+    };
+    assert_eq!(
+        db.store_telegram_message(&disagrees, None)
+            .await
+            .expect("disagreement"),
+        TelegramStored::Unchanged
+    );
+    assert_eq!(
+        media_facts(&pool, id.conversation, msg).await.0,
+        Some(204_800),
+        "the first reading stands"
+    );
+}
+
+async fn media_facts(
+    pool: &MySqlPool,
+    conversation: i64,
+    msg_id: i32,
+) -> (Option<i64>, Option<String>) {
+    let row: (Option<i64>, Option<String>) = sqlx::query_as(
+        "SELECT media_size, media_mime FROM telegram_messages
+          WHERE conversation_id = ? AND msg_id = ?",
+    )
+    .bind(conversation)
+    .bind(msg_id)
+    .fetch_one(pool)
+    .await
+    .expect("read the media facts");
+    row
 }
