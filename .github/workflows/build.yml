@@ -10,6 +10,11 @@ name: build
 # not: `irc_conversation_stats` is maintained by DATABASE TRIGGERS, so the only
 # thing that can test it is a database. Without the service below that test
 # skips itself silently and the triggers ship unverified.
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 on:
   push:
     branches: [main]
