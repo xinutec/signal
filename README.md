@@ -231,6 +231,7 @@ What Telegram does that the others do not, and where each is handled:
 | | how Telegram does it | where |
 | --- | --- | --- |
 | a DM names no sender | `from_id` omitted; `out` says which end | `map.rs`, inferred and tested both ways |
+| an edit date is not an edit to SHOW | `edit_hide` sits beside `edit_date`: "shown as not modified to the user, even if an edit date is present" | recorded in `edit_hidden`, honoured by the viewer — 606 hidden against 51 genuine when the archive re-read itself |
 | an edit MUTATES the message | same `msg_id`, new text, new `edit_date` | the prior text is filed in `telegram_message_edits` before the update, in one transaction — but only when the archive HELD the prior text, so backfilled edits have none and never will (558 such on the first ingest) |
 | a deletion names no peer | private chats and basic groups share ONE id sequence; channels have their own | `Db::mark_telegram_deleted` takes a SCOPE, and a peer-less deletion never reaches a channel |
 | a supergroup looks like a channel | same id space, told apart by a flag on the peer | the id gives `PeerSpace`, the peer gives `ConvKind`; the dialog sweep is what corrects it |
