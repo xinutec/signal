@@ -550,6 +550,27 @@ const MIGRATIONS: &[&str] = &[
     // NOT YET KNOWN, which is what lets the enrichment path in
     // `store_telegram_message` fill it on a re-walk.
     r"ALTER TABLE telegram_messages ADD COLUMN edit_hidden TINYINT(1) NULL",
+    // v23: the relabel that was run by HAND on production, written down so it is
+    // part of the schema rather than part of nobody's memory.
+    //
+    // ⚠ **ENRICHMENT CAN ADD A FACT AND CANNOT CORRECT ONE.** v21 made
+    // `media_kind` finer — a `video/mp4` reports `video` rather than `document` —
+    // but the enrichment path in `store_telegram_message` fills only what is NULL,
+    // deliberately, so it will not rewrite a kind an earlier build already wrote.
+    // The consequence was 731 videos and 58 audio files still filed as
+    // `document`: the column meant two different things depending on WHEN the row
+    // was written, which is the one-concept-two-readers trap in time rather than
+    // in space.
+    //
+    // These two statements are what I ran against the live database at the time.
+    // They are here because a hand-run data fix that exists nowhere in the
+    // repository is invisible to a rebuild: restore this database from the
+    // migrations alone and the correction would silently not happen. Idempotent —
+    // a second run matches nothing.
+    r"UPDATE telegram_messages SET media_kind = 'video'
+       WHERE media_kind = 'document' AND media_mime LIKE 'video/%'",
+    r"UPDATE telegram_messages SET media_kind = 'audio'
+       WHERE media_kind = 'document' AND media_mime LIKE 'audio/%'",
 ];
 
 #[derive(Clone)]
