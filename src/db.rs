@@ -630,6 +630,22 @@ const MIGRATIONS: &[&str] = &[
     // count.** A stat that can read zero is worse than no stat, and the flush that
     // would make one reliable belongs to a file handle this code does not own.
     r"ALTER TABLE telegram_media DROP COLUMN size_bytes",
+    // v26: a reader can ask for what was only offered.
+    //
+    // ⚠ **`wanted` IS A QUEUE, AND THE DATABASE IS DELIBERATELY THE WHOLE OF IT.**
+    // The thing that must do the fetching is the feed, because it is the only
+    // process holding a Telegram session — and the feed listens on no port, which is
+    // a property worth keeping: nothing in the cluster can dial the pod that holds a
+    // logged-in account. So the viewer writes a row and the feed reads it, which
+    // needs no endpoint, no second credential and no service.
+    //
+    // The cost is latency bounded by the poll interval rather than by the network,
+    // which for a 1.5GB video nobody is watching load is not the part that matters.
+    //
+    // `requested_at` was in the table from the first version for this, and the index
+    // on `(state, requested_at)` is what makes the poll a lookup rather than a scan.
+    r"ALTER TABLE telegram_media
+        MODIFY COLUMN state ENUM('offered','wanted','stored','failed') NOT NULL",
 ];
 
 #[derive(Clone)]
@@ -1317,6 +1333,46 @@ impl Db {
         Ok(())
     }
 
+    /// A reader asked for these bytes.
+    ///
+    /// ⚠ Only from `offered` or `failed`, and the `WHERE` is what enforces it. A
+    /// request against something already `stored` would move a file that is on the
+    /// volume back into a queue, and the fetch would then overwrite a good file with
+    /// a fresh download of the same bytes. A request against something already
+    /// `wanted` is a reader tapping twice and must not restart the clock.
+    ///
+    /// Returns whether anything changed, so the caller can tell "queued" from
+    /// "there was nothing to queue" rather than reporting success either way.
+    pub async fn request_telegram_media(&self, row_id: i64) -> Result<bool> {
+        let changed = sqlx::query(
+            "UPDATE telegram_media d
+               JOIN telegram_messages m
+                 ON m.conversation_id = d.conversation_id AND m.msg_id = d.msg_id
+                SET d.state = 'wanted', d.requested_at = CURRENT_TIMESTAMP
+              WHERE m.id = ? AND d.state IN ('offered', 'failed')",
+        )
+        .bind(row_id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(changed != 0)
+    }
+
+    /// What readers have asked for, oldest request first.
+    ///
+    /// Oldest first because a queue that served the newest request would starve
+    /// whoever asked while a large file was downloading — which is precisely the
+    /// case this exists for.
+    pub async fn wanted_telegram_media(&self, limit: i64) -> Result<Vec<(i64, i32)>> {
+        Ok(sqlx::query_as(
+            "SELECT conversation_id, msg_id FROM telegram_media
+              WHERE state = 'wanted' ORDER BY requested_at ASC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     /// How far back a conversation has been walked, or `None` if it never has.
     pub async fn telegram_backfill_state(
         &self,
@@ -1466,6 +1522,8 @@ pub enum TelegramMediaState {
     /// Telegram has the bytes and we have not fetched them. The normal state for
     /// anything large.
     Offered,
+    /// A reader asked for it and the feed has not got to it yet.
+    Wanted,
     /// On the volume.
     Stored,
     /// Tried and could not — `note` says why.
@@ -1476,6 +1534,7 @@ impl TelegramMediaState {
     pub fn as_str(self) -> &'static str {
         match self {
             TelegramMediaState::Offered => "offered",
+            TelegramMediaState::Wanted => "wanted",
             TelegramMediaState::Stored => "stored",
             TelegramMediaState::Failed => "failed",
         }

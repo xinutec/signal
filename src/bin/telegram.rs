@@ -50,6 +50,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use grammers_client::Client;
 use grammers_client::client::UpdatesConfiguration;
+use grammers_client::session::Session;
 use grammers_client::session::types::PeerRef;
 use grammers_client::session::updates::UpdatesLike;
 use grammers_client::update::Update;
@@ -85,6 +86,22 @@ const PAGE_PAUSE: Duration = Duration::from_millis(400);
 
 /// A pause between backfill sweeps once every conversation is complete.
 const IDLE_SWEEP: Duration = Duration::from_secs(3600);
+
+/// How often the feed looks for media a reader has asked for.
+///
+/// ⚠ This is the latency of a tap, so it is short — but it is a POLL against an
+/// indexed lookup on a table of a few thousand rows, not a scan, and an idle archive
+/// costs one such lookup every three seconds. The alternative was giving this pod an
+/// inbound endpoint, and the property that nothing in the cluster can dial the
+/// process holding a logged-in Telegram account is worth more than three seconds.
+const REQUEST_POLL: Duration = Duration::from_secs(3);
+
+/// How many asked-for files to fetch before looking for more.
+///
+/// One at a time, deliberately. The requests that reach here are the LARGE media —
+/// that is what being asked for means — so a batch would mean several multi-hundred-
+/// megabyte downloads sharing the connection the live stream also uses.
+const REQUEST_BATCH: i64 = 1;
 
 /// The largest media this fetches without being asked.
 ///
@@ -273,6 +290,16 @@ async fn archive(
     let pending = sweep(client, db).await?;
     tracing::info!("{} conversation(s) with history to walk", pending.len());
 
+    // A third task: what readers have asked for. Concurrent with both, because a tap
+    // must not wait for a decade of history to finish walking.
+    let requests = {
+        let client = client.clone();
+        let db = db.clone();
+        let cfg = cfg.clone();
+        let session = Arc::clone(session);
+        tokio::spawn(async move { serve_requests(&client, &db, &cfg, &session).await })
+    };
+
     // Live updates run CONCURRENTLY with the backfill. A decade of history takes
     // hours; a message that arrives during it must not wait for them.
     // ⚠ Both tasks need the media directory, so `Cfg` is cloned into each rather
@@ -295,6 +322,7 @@ async fn archive(
     tokio::select! {
         r = live => r.context("the update stream task panicked")?.context("following updates"),
         r = history => r.context("the backfill task panicked")?.context("backfilling history"),
+        r = requests => r.context("the request task panicked")?.context("serving requests"),
     }
 }
 
@@ -590,6 +618,105 @@ fn kind_from_space(row: &Row) -> ConvKind {
         map::PeerSpace::User => ConvKind::Dm,
         map::PeerSpace::Chat => ConvKind::Group,
         map::PeerSpace::Channel => ConvKind::Channel,
+    }
+}
+
+/// Fetch the media readers have asked for.
+///
+/// ⚠ **NO SIZE CEILING HERE, and that is the entire point of the queue.** The eager
+/// pass skips anything over `EAGER_MAX_BYTES` precisely so that a 1.5GB video is not
+/// pulled speculatively; being asked for is the signal that somebody wants this one.
+async fn serve_requests(
+    client: &Client,
+    db: &Db,
+    cfg: &Cfg,
+    session: &Arc<DbSession>,
+) -> Result<()> {
+    loop {
+        let wanted = db.wanted_telegram_media(REQUEST_BATCH).await?;
+        if wanted.is_empty() {
+            tokio::time::sleep(REQUEST_POLL).await;
+            continue;
+        }
+        for (conversation_id, msg_id) in wanted {
+            if let Err(e) = serve_one(client, db, cfg, session, conversation_id, msg_id).await {
+                // ⚠ Recorded as failed rather than left `wanted`, or the queue would
+                // hand this same row back on the next poll forever and nothing behind
+                // it would ever be fetched. A reader can ask again; a stuck queue is
+                // not something anybody can act on.
+                tracing::warn!("requested media {conversation_id}/{msg_id} failed: {e:#}");
+                db.record_telegram_media_state(
+                    conversation_id,
+                    msg_id,
+                    TelegramMediaState::Failed,
+                    Some(
+                        format!("{e:#}")
+                            .chars()
+                            .take(200)
+                            .collect::<String>()
+                            .as_str(),
+                    ),
+                )
+                .await?;
+            }
+        }
+    }
+}
+
+/// Re-fetch one message by id and download whatever it carries.
+async fn serve_one(
+    client: &Client,
+    db: &Db,
+    cfg: &Cfg,
+    session: &Arc<DbSession>,
+    conversation_id: i64,
+    msg_id: i32,
+) -> Result<()> {
+    // ⚠ The folded id goes back to a peer the same way it came from one. `PeerId`
+    // uses the Bot-API dialog format internally, which is the format this archive
+    // stores, so the round trip is exact rather than a re-derivation that could
+    // disagree with `normalise_peer`.
+    let peer_id = grammers_client::session::types::PeerId::from_bot_api_dialog_id(conversation_id)
+        .with_context(|| format!("{conversation_id} is not a dialog id"))?;
+    let peer_ref = session
+        .peer_ref(peer_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("resolving {conversation_id}: {e}"))?
+        .with_context(|| format!("no peer reference for {conversation_id}"))?;
+
+    let messages = client
+        .get_messages_by_id(peer_ref, &[msg_id])
+        .await
+        .context("re-fetching the message")?;
+    // ⚠ `get_messages_by_id` answers positionally and a deleted message comes back
+    // as a HOLE rather than an error, so the `Option` is the real case: a reader can
+    // ask for a picture whose message was retracted since it was offered.
+    let Some(message) = messages.into_iter().next().flatten() else {
+        anyhow::bail!("telegram no longer has message {msg_id}");
+    };
+    let Some(media) = message.media() else {
+        anyhow::bail!("message {msg_id} no longer carries media");
+    };
+
+    let stored_name = format!("{conversation_id}_{msg_id}");
+    let path = std::path::Path::new(&cfg.media_dir).join(&stored_name);
+    match message.download_media(&path).await {
+        Ok(true) => {
+            db.record_telegram_media_stored(
+                conversation_id,
+                msg_id,
+                &stored_name,
+                media_content_type(&media).as_deref(),
+            )
+            .await?;
+            tracing::info!("fetched requested media {conversation_id}/{msg_id}");
+            Ok(())
+        }
+        Ok(false) => anyhow::bail!("telegram returned no file"),
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&path).await;
+            Err(anyhow::anyhow!("{e}"))
+        }
     }
 }
 
