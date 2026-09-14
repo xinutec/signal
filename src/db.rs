@@ -610,6 +610,26 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (conversation_id, msg_id),
         INDEX idx_tg_media_state (state, requested_at)
     )",
+    // v25: the size column comes out again, one day after going in.
+    //
+    // ⚠ **IT WAS A SECOND COPY OF A NUMBER, AND THE COPY WAS WRONG.** It recorded
+    // `metadata(path).len()` taken straight after `download_media` returned, which
+    // reads the length before the write is visible: 950 files totalling 218MB on
+    // disk were recorded as 86MB, and **the four smallest rows said 0 bytes for
+    // files of 158KB, 214KB, 288KB and 126KB**. `tokio::fs::File` performs its work
+    // on a blocking pool and does not promise the inode reflects it when the write
+    // call returns, so stat-after-download is a race and always was.
+    //
+    // The size is already in `telegram_messages.media_size`, from the message itself
+    // at no network cost, and it is accurate: 246KB mean reported against 240KB mean
+    // actually on disk, which is agreement within the noise of a set still growing.
+    //
+    // So the archive keeps ONE size, in the table whose subject is what Telegram
+    // said, and `telegram_media` records only what is on the volume. The
+    // consequence worth stating: **nothing here independently verifies the byte
+    // count.** A stat that can read zero is worse than no stat, and the flush that
+    // would make one reliable belongs to a file handle this code does not own.
+    r"ALTER TABLE telegram_media DROP COLUMN size_bytes",
 ];
 
 #[derive(Clone)]
@@ -1236,32 +1256,33 @@ impl Db {
 
     /// Record bytes written to the volume.
     ///
-    /// ⚠ Called AFTER the file is closed, never before. The row is what tells the
+    /// ⚠ Called AFTER the download returns, never before. The row is what tells the
     /// reader a file is there; writing it first would publish a path to a
     /// half-written file, and the reader has no way to tell a short file from a
     /// small one. Same ordering, and the same reason, as the Signal attachment path.
+    ///
+    /// ⚠ **It records no SIZE, deliberately — see the v25 migration.** The size lives
+    /// in `telegram_messages.media_size`, where it came from the message rather than
+    /// from a `stat` that races the write's visibility.
     pub async fn record_telegram_media_stored(
         &self,
         conversation_id: i64,
         msg_id: i32,
         stored_name: &str,
-        size_bytes: i64,
         content_type: Option<&str>,
     ) -> Result<()> {
         sqlx::query(
             "INSERT INTO telegram_media
-                (conversation_id, msg_id, state, stored_name, size_bytes, content_type,
-                 stored_at)
-             VALUES (?, ?, 'stored', ?, ?, ?, CURRENT_TIMESTAMP)
+                (conversation_id, msg_id, state, stored_name, content_type, stored_at)
+             VALUES (?, ?, 'stored', ?, ?, CURRENT_TIMESTAMP)
              ON DUPLICATE KEY UPDATE
                  state = 'stored', stored_name = VALUES(stored_name),
-                 size_bytes = VALUES(size_bytes), content_type = VALUES(content_type),
+                 content_type = VALUES(content_type),
                  note = NULL, stored_at = CURRENT_TIMESTAMP",
         )
         .bind(conversation_id)
         .bind(msg_id)
         .bind(stored_name)
-        .bind(size_bytes)
         .bind(content_type)
         .execute(&self.pool)
         .await?;

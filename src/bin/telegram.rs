@@ -520,15 +520,16 @@ async fn fetch_media(
     // archive claims to hold.
     match message.download_media(&path).await {
         Ok(true) => {
-            let on_disk = tokio::fs::metadata(&path)
-                .await
-                .map(|m| i64::try_from(m.len()).unwrap_or(size))
-                .unwrap_or(size);
+            // ⚠ **NO `stat` HERE, AND THAT IS A FIX RATHER THAN AN OMISSION.** This
+            // recorded `metadata(path).len()` at exactly this point and got 0 for
+            // files of 158KB: `tokio::fs::File` does its work on a blocking pool and
+            // makes no promise that the inode reflects the write when the call
+            // returns. The size is already known from the message — see the v25
+            // migration for the measurement.
             db.record_telegram_media_stored(
                 conversation_id,
                 msg_id,
                 &stored_name,
-                on_disk,
                 media_content_type(&media).as_deref(),
             )
             .await?;
