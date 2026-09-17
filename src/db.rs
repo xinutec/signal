@@ -688,6 +688,41 @@ const MIGRATIONS: &[&str] = &[
     // remembers and Telegram does not.
     r"ALTER TABLE telegram_reactions
         ADD COLUMN removed_at TIMESTAMP NULL",
+    // v29: who has read how far.
+    //
+    // ⚠ **THIS IS THE ONE THING IN THIS ARCHIVE WITH NO HISTORY TO GO BACK FOR.**
+    // Every other column here can be recovered by re-reading Telegram, because
+    // Telegram keeps the messages. It keeps NO log of reading — a dialog carries
+    // only `read_inbox_max_id` and `read_outbox_max_id`, the CURRENT high-water
+    // marks — so a read that is not recorded as it happens is gone permanently.
+    // That is why this table exists at all, and why it went in the day it was
+    // asked for rather than after the re-walk.
+    //
+    // **APPEND-ONLY, which is the point.** A high-water mark is a moving value, and
+    // storing only the latest would make this a cache of Telegram's current state
+    // rather than a record. Each ADVANCE is its own row, so the table answers
+    // "when did they read this?" and not merely "how far have they read?".
+    //
+    // ⚠ **`observed_at` IS WHEN WE SAW IT, NOT WHEN THEY READ IT**, and the two are
+    // not the same. `updateReadHistoryOutbox` carries a peer, a `max_id` and a
+    // `pts` — no date — so Telegram never says when the reading happened. A live
+    // update lands within seconds; a mark first seen by the hourly sweep may be up
+    // to an hour late, and one seen after downtime later still. The column is named
+    // for what it can honestly hold.
+    //
+    // ⚠ **`direction` uses Telegram's OWN words, which read backwards at first.**
+    // `outbox` is the OUT-tray: MY messages, and how far the other side has read
+    // them — the blue-tick marker. `inbox` is theirs, and how far I have read. The
+    // vendor vocabulary is kept because anyone checking this against Telegram's
+    // documentation will be searching for those two words.
+    r"CREATE TABLE IF NOT EXISTS telegram_read_marks (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+        conversation_id BIGINT NOT NULL,
+        direction ENUM('inbox','outbox') NOT NULL,
+        max_id INT NOT NULL,
+        observed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE KEY uniq_tg_read (conversation_id, direction, max_id)
+    ) DEFAULT CHARSET=utf8mb4",
 ];
 
 #[derive(Clone)]
@@ -1360,6 +1395,60 @@ impl Db {
 
     /// Whether this message's bytes are already accounted for — stored, offered or
     /// failed — so the eager pass can skip it without a download attempt.
+    /// Record how far somebody has read, if it is further than we already knew.
+    ///
+    /// Returns whether a row was written — a mark we had already seen writes
+    /// nothing, which is what keeps the hourly sweep from adding 21 rows an hour
+    /// to a quiet archive.
+    ///
+    /// ⚠ **`INSERT IGNORE` on `(conversation, direction, max_id)`, NOT an upsert.**
+    /// Each distinct mark keeps its own first-observation time forever; re-seeing
+    /// one must not move that time, or the record would drift forward every hour
+    /// and the answer to "when was this read?" would always be "recently".
+    ///
+    /// ⚠ **A `max_id` of 0 is NOT a mark**, it is Telegram's way of saying nothing
+    /// has been read in that direction. Storing it would put a row at the bottom of
+    /// every conversation claiming a read that never happened.
+    pub async fn record_telegram_read_mark(
+        &self,
+        conversation_id: i64,
+        direction: TelegramReadDirection,
+        max_id: i32,
+    ) -> Result<bool> {
+        if max_id <= 0 {
+            return Ok(false);
+        }
+        let done = sqlx::query(
+            "INSERT IGNORE INTO telegram_read_marks (conversation_id, direction, max_id)
+             VALUES (?, ?, ?)",
+        )
+        .bind(conversation_id)
+        .bind(direction.as_str())
+        .bind(max_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() != 0)
+    }
+
+    /// The furthest mark the archive holds for one conversation and direction, and
+    /// when it was first seen. `None` when nothing has been read.
+    pub async fn telegram_read_mark(
+        &self,
+        conversation_id: i64,
+        direction: TelegramReadDirection,
+    ) -> Result<Option<(i32, i64)>> {
+        let row: Option<(i32, i64)> = sqlx::query_as(
+            "SELECT max_id, UNIX_TIMESTAMP(observed_at) FROM telegram_read_marks
+              WHERE conversation_id = ? AND direction = ?
+              ORDER BY max_id DESC LIMIT 1",
+        )
+        .bind(conversation_id)
+        .bind(direction.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
     pub async fn telegram_media_state(
         &self,
         conversation_id: i64,
@@ -1618,6 +1707,28 @@ pub struct TelegramBackfill {
     /// conversation has no more history.
     pub complete: bool,
     pub messages_stored: i64,
+}
+
+/// Whose reading a mark describes.
+///
+/// ⚠ Telegram's own words, and they read backwards until you hold the metaphor:
+/// the OUT-tray is MY messages, so `Outbox` is how far THE OTHER SIDE has read
+/// what I sent — the blue ticks. `Inbox` is how far I have read what they sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelegramReadDirection {
+    /// How far I have read their messages.
+    Inbox,
+    /// How far they have read mine.
+    Outbox,
+}
+
+impl TelegramReadDirection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TelegramReadDirection::Inbox => "inbox",
+            TelegramReadDirection::Outbox => "outbox",
+        }
+    }
 }
 
 /// What the archive holds, or does not, for one message's media.

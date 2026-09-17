@@ -55,7 +55,9 @@ use grammers_client::session::types::PeerRef;
 use grammers_client::session::updates::UpdatesLike;
 use grammers_client::update::Update;
 use grammers_mtsender::SenderPool;
-use signal_archiver::db::{Db, TelegramDeleteScope, TelegramMediaState, TelegramStored};
+use signal_archiver::db::{
+    Db, TelegramDeleteScope, TelegramMediaState, TelegramReadDirection, TelegramStored,
+};
 use signal_archiver::telegram::map::{self, Row};
 use signal_archiver::telegram::session::DbSession;
 use signal_archiver::telegram::{ConvKind, peer_name};
@@ -344,6 +346,45 @@ async fn archive(
 /// The conversation upsert happens HERE rather than in the walk because this is
 /// where the peer is in hand: `ConvKind::from_peer` can tell a supergroup from a
 /// broadcast, which an id cannot.
+/// A channel's id in the archive's one id space.
+///
+/// ⚠ The channel read updates name a BARE `channel_id`, not a `Peer`, so the
+/// normalisation every other id here goes through has to be reached deliberately.
+/// Skipping it would file a supergroup's read marks under a different id from its
+/// own messages — see `PeerSpace`.
+fn channel_peer(channel_id: i64) -> i64 {
+    map::normalise_peer(&grammers_tl_types::enums::Peer::Channel(
+        grammers_tl_types::types::PeerChannel { channel_id },
+    ))
+    .0
+}
+
+/// Both read marks a dialog carries, stored if either has moved.
+///
+/// ⚠ **`getDialogs` HAS ALWAYS CARRIED THESE and the sweep threw them away.** The
+/// hourly pass read a dialog's peer, kind, name and username and dropped the rest,
+/// so the one fact in this archive that cannot be re-fetched later was being
+/// discarded on the floor every hour. No extra API call was ever needed for it.
+async fn read_marks(db: &Db, id: i64, dialog: &grammers_client::peer::Dialog) -> Result<()> {
+    let (inbox, outbox) = match &dialog.raw {
+        grammers_tl_types::enums::Dialog::Dialog(d) => (d.read_inbox_max_id, d.read_outbox_max_id),
+        // A folder is a grouping, not a conversation, and has no marks of its own.
+        grammers_tl_types::enums::Dialog::Folder(_) => return Ok(()),
+    };
+    for (direction, max_id) in [
+        (TelegramReadDirection::Inbox, inbox),
+        (TelegramReadDirection::Outbox, outbox),
+    ] {
+        if db.record_telegram_read_mark(id, direction, max_id).await? {
+            tracing::info!(
+                "conversation {id}: {} read up to {max_id}",
+                direction.as_str()
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn sweep(client: &Client, db: &Db) -> Result<Vec<(i64, PeerRef)>> {
     let mut dialogs = client.iter_dialogs();
     let mut pending = Vec::new();
@@ -360,6 +401,17 @@ async fn sweep(client: &Client, db: &Db) -> Result<Vec<(i64, PeerRef)>> {
             peer.username(),
         )
         .await?;
+        // ⚠ **BEFORE the `complete` check below, and that is not a detail.** Every
+        // conversation in this archive is already backfilled, so anything recorded
+        // after that `continue` would be recorded for nothing — the sweep's read
+        // marks would silently never be written at all.
+        //
+        // The sweep is the FLOOR for read marks. The live updates below catch a read
+        // within seconds, but Telegram guarantees delivery only for message updates,
+        // and this feed has already been seen dropping 71 queued updates on a
+        // restart. `getDialogs` re-states the current marks every hour regardless,
+        // so a missed update costs lateness rather than the fact.
+        read_marks(db, id, &dialog).await?;
         if db
             .telegram_backfill_state(id)
             .await?
@@ -451,8 +503,55 @@ async fn apply(db: &Db, cfg: &Cfg, self_id: i64, update: &Update) -> Result<()> 
             tracing::info!("{n} message(s) marked deleted ({scope:?})");
             Ok(())
         }
-        // Everything else is somebody typing, a bot callback, or a raw update this
-        // archive has no column for.
+        // ⚠ **The read updates arrive as `Raw`**, because grammers gives friendly
+        // variants only for the events it wraps and these are not among them. That
+        // is the documented way to reach one, not a workaround being smuggled in —
+        // and a minor version that promotes them to their own variant will make
+        // this arm stop matching rather than misbehave.
+        //
+        // Four constructors for two facts: Telegram splits DMs and small groups
+        // (`ReadHistory*`) from channels and supergroups (`ReadChannel*`), and the
+        // channel pair names a bare `channel_id` where the other names a `Peer`.
+        // Both end up normalised into the archive's one id space.
+        Update::Raw(raw) => {
+            use grammers_tl_types::enums::Update as Tl;
+            let (peer, direction, max_id) = match &raw.raw {
+                Tl::ReadHistoryInbox(u) => (
+                    map::normalise_peer(&u.peer).0,
+                    TelegramReadDirection::Inbox,
+                    u.max_id,
+                ),
+                Tl::ReadHistoryOutbox(u) => (
+                    map::normalise_peer(&u.peer).0,
+                    TelegramReadDirection::Outbox,
+                    u.max_id,
+                ),
+                Tl::ReadChannelInbox(u) => (
+                    channel_peer(u.channel_id),
+                    TelegramReadDirection::Inbox,
+                    u.max_id,
+                ),
+                Tl::ReadChannelOutbox(u) => (
+                    channel_peer(u.channel_id),
+                    TelegramReadDirection::Outbox,
+                    u.max_id,
+                ),
+                // Somebody typing, a bot callback, a raw update this archive has no
+                // column for.
+                _ => return Ok(()),
+            };
+            if db
+                .record_telegram_read_mark(peer, direction, max_id)
+                .await?
+            {
+                tracing::info!(
+                    "conversation {peer}: {} read up to {max_id}",
+                    direction.as_str()
+                );
+            }
+            Ok(())
+        }
+        // Everything else is somebody typing or a bot callback.
         _ => Ok(()),
     }
 }

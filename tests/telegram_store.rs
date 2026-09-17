@@ -16,7 +16,9 @@
 //!
 //! Skips when `SIGNAL_TEST_DATABASE_URL` is unset, and refuses to skip in CI.
 
-use signal_archiver::db::{Db, TelegramBackfill, TelegramDeleteScope, TelegramStored};
+use signal_archiver::db::{
+    Db, TelegramBackfill, TelegramDeleteScope, TelegramReadDirection, TelegramStored,
+};
 use signal_archiver::telegram::ConvKind;
 use signal_archiver::telegram::map::{MsgKind, PeerSpace, Reaction, Row};
 use signal_archiver::telegram::session::DbSession;
@@ -687,5 +689,110 @@ async fn a_name_the_first_delivery_could_not_resolve_is_filled_by_a_later_one() 
     assert_eq!(
         sender_name_of(&pool, id.conversation, msg).await.as_deref(),
         Some("Tessa")
+    );
+}
+
+/// ⚠ **THE ONE FACT IN THIS ARCHIVE THAT CANNOT BE RE-FETCHED.** Telegram keeps
+/// messages, so anything about them can be recovered by reading again. It keeps
+/// no log of READING — a dialog carries only the current high-water marks — so a
+/// read not recorded as it happens is gone for good.
+///
+/// That is why this table is append-only rather than a column holding the latest
+/// value, and these are the properties that make it a record rather than a cache
+/// of Telegram's current state.
+#[tokio::test]
+async fn a_read_mark_is_kept_per_advance_and_never_re_dated() {
+    let Some((db, pool)) = connect().await else {
+        return;
+    };
+    let id = ids(12);
+
+    // Nothing read yet.
+    assert_eq!(
+        db.telegram_read_mark(id.conversation, TelegramReadDirection::Outbox)
+            .await
+            .expect("read"),
+        None
+    );
+
+    // ⚠ Zero is Telegram's "nothing has been read", not a mark. Storing it would
+    // put a row at the bottom of every conversation claiming a read that never
+    // happened.
+    assert!(
+        !db.record_telegram_read_mark(id.conversation, TelegramReadDirection::Outbox, 0)
+            .await
+            .expect("zero"),
+        "0 is not a mark"
+    );
+
+    assert!(
+        db.record_telegram_read_mark(id.conversation, TelegramReadDirection::Outbox, 100)
+            .await
+            .expect("first")
+    );
+    let (max_id, first_seen) = db
+        .telegram_read_mark(id.conversation, TelegramReadDirection::Outbox)
+        .await
+        .expect("read")
+        .expect("a mark");
+    assert_eq!(max_id, 100);
+
+    // ⚠ **RE-SEEING A MARK MUST NOT RE-DATE IT.** The sweep re-states every
+    // conversation's marks once an hour, so an upsert here would push the
+    // observation time forward on every pass — and the answer to "when was this
+    // read?" would always be "in the last hour", for every message, forever.
+    assert!(
+        !db.record_telegram_read_mark(id.conversation, TelegramReadDirection::Outbox, 100)
+            .await
+            .expect("again"),
+        "a mark already held writes nothing"
+    );
+    assert_eq!(
+        db.telegram_read_mark(id.conversation, TelegramReadDirection::Outbox)
+            .await
+            .expect("read"),
+        Some((100, first_seen)),
+        "the first sighting keeps its time"
+    );
+
+    // An ADVANCE is its own row, which is what makes the table a history: the
+    // pair (100, then) and (140, later) says when each stretch was read.
+    assert!(
+        db.record_telegram_read_mark(id.conversation, TelegramReadDirection::Outbox, 140)
+            .await
+            .expect("advance")
+    );
+    assert_eq!(
+        db.telegram_read_mark(id.conversation, TelegramReadDirection::Outbox)
+            .await
+            .expect("read")
+            .map(|(m, _)| m),
+        Some(140)
+    );
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM telegram_read_marks WHERE conversation_id = ? AND direction = 'outbox'",
+    )
+    .bind(id.conversation)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(rows, 2, "both advances are kept, not one row moved");
+
+    // ⚠ The two directions are separate facts about separate people. Sharing a
+    // row would make "they read mine" and "I read theirs" overwrite each other,
+    // and the outbox one — the only one that says anything about them — would be
+    // the loser every time the archive owner opened the chat.
+    assert!(
+        db.record_telegram_read_mark(id.conversation, TelegramReadDirection::Inbox, 7)
+            .await
+            .expect("inbox")
+    );
+    assert_eq!(
+        db.telegram_read_mark(id.conversation, TelegramReadDirection::Outbox)
+            .await
+            .expect("read")
+            .map(|(m, _)| m),
+        Some(140),
+        "the outbox mark is untouched by an inbox one"
     );
 }

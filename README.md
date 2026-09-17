@@ -204,6 +204,27 @@ container to exec into. In-cluster it is a throwaway pod with the same environme
 `kubes/signal/k8s/secret.sh` prints the command. Locally it is the form above, with
 `signal-db` port-forwarded.
 
+⚠ **`telegram_read_marks` IS THE ONE TABLE HERE THAT CANNOT BE REBUILT.** Every
+other fact in this archive can be recovered by reading Telegram again, because
+Telegram keeps the messages. It keeps **no log of reading** — a dialog carries only
+the current `read_inbox_max_id` / `read_outbox_max_id` — so a read not recorded as
+it happens is gone permanently. Capture started 2026-09-17 and there is nothing
+before that date, by nature rather than by omission.
+
+It is append-only: each ADVANCE of a mark is its own row, so the table answers
+"when was this read?" and not just "how far". `observed_at` is **when we saw it,
+not when they read it** — Telegram's read updates carry no date — so a live update
+is seconds late and one first seen by the hourly sweep may be up to an hour late.
+`direction` uses Telegram's own words: `outbox` is the OUT-tray, meaning how far the
+other side has read MY messages; `inbox` is how far I have read theirs.
+
+Two capture points, deliberately overlapping. The live updates
+(`updateReadHistory{Inbox,Outbox}` and the `ReadChannel` pair) land within seconds
+but are **not guaranteed delivery** — only message updates are, and this feed has
+been seen dropping 71 queued updates on a restart. The hourly dialog sweep re-states
+every mark regardless and needs no extra API call, so a missed update costs
+lateness rather than the fact.
+
 ⚠ **A forward was invisible here until 2026-09-17, and the column said otherwise.**
 `fwd_from_name` existed from the first Telegram migration and held **0 rows out of
 159,946**, because it was filled from the header's `from_name` — which Telegram sets
