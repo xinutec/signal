@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
+use sqlx::AssertSqlSafe;
 use sqlx::Row;
 use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
 
@@ -671,6 +672,22 @@ const MIGRATIONS: &[&str] = &[
     // history. That is a decision to take with the cost in view, not a migration.
     r"ALTER TABLE telegram_messages
         ADD COLUMN fwd_from_id BIGINT NULL",
+    // v28: a reaction that goes away STOPS BEING CURRENT rather than ceasing to
+    // have happened.
+    //
+    // ⚠ **`replace_telegram_reactions` used to DELETE, and a re-walk could
+    // therefore lose history.** A message reacted to with 👍 and ❤️ whose ❤️ was
+    // later taken back came back from Telegram carrying only the 👍 — and the
+    // replace threw the ❤️ away, so the archive forgot a thing that had genuinely
+    // happened. The whole point of this archive is that it remembers what the
+    // service no longer shows: a deleted message keeps its words, an edited one
+    // keeps every version, and a reaction should be no different.
+    //
+    // So the row stays and gains a date. `removed_at IS NULL` is "currently on the
+    // message", which is what the viewer draws; a non-NULL one is what the archive
+    // remembers and Telegram does not.
+    r"ALTER TABLE telegram_reactions
+        ADD COLUMN removed_at TIMESTAMP NULL",
 ];
 
 #[derive(Clone)]
@@ -1277,20 +1294,26 @@ impl Db {
         msg_id: i32,
         reactions: &[crate::telegram::map::Reaction],
     ) -> Result<()> {
+        // ⚠ **AN EMPTY SET IS NOT EVIDENCE OF REMOVAL, so it marks nothing.**
+        // `None` reactions on the wire and "every reaction was taken back" arrive
+        // here identically, and treating the pair as removal would retract a
+        // message's reactions every time a delivery simply did not carry them.
+        // A NON-empty set is different: Telegram reports the current reactions in
+        // full, so anything missing from one is genuinely gone.
         if reactions.is_empty() {
             return Ok(());
         }
         let mut tx = self.pool.begin().await?;
-        sqlx::query("DELETE FROM telegram_reactions WHERE conversation_id = ? AND msg_id = ?")
-            .bind(conversation_id)
-            .bind(msg_id)
-            .execute(&mut *tx)
-            .await?;
+
+        // Present again: the count moves, and a reaction that had been marked
+        // removed is current once more — somebody put it back.
         for r in reactions {
             sqlx::query(
                 "INSERT INTO telegram_reactions
                     (conversation_id, msg_id, emoji, custom_emoji_id, cnt, chosen)
-                 VALUES (?, ?, ?, ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?)
+                 ON DUPLICATE KEY UPDATE
+                    cnt = VALUES(cnt), chosen = VALUES(chosen), removed_at = NULL",
             )
             .bind(conversation_id)
             .bind(msg_id)
@@ -1301,6 +1324,36 @@ impl Db {
             .execute(&mut *tx)
             .await?;
         }
+
+        // Gone from a complete report: dated, not deleted.
+        //
+        // ⚠ Matched on `reaction_key`, the generated column, because that is the
+        // only NON-NULL identity a reaction has — an emoji and a custom emoji id
+        // are a sum type with one NULL half, and `NOT IN` over a nullable column
+        // is never true for anything. The same reason the UNIQUE key is on it.
+        let keep = reactions
+            .iter()
+            .map(|r| match (&r.emoji, r.custom_emoji_id) {
+                (Some(e), _) => e.clone(),
+                (None, Some(id)) => format!("custom:{id}"),
+                (None, None) => String::new(),
+            })
+            .collect::<Vec<_>>();
+        let placeholders = vec!["?"; keep.len()].join(",");
+        let sql = format!(
+            "UPDATE telegram_reactions SET removed_at = CURRENT_TIMESTAMP
+              WHERE conversation_id = ? AND msg_id = ? AND removed_at IS NULL
+                AND reaction_key NOT IN ({placeholders})",
+        );
+        // Fixed template, computed placeholder count, every value bound.
+        let mut q = sqlx::query(AssertSqlSafe(sql))
+            .bind(conversation_id)
+            .bind(msg_id);
+        for k in &keep {
+            q = q.bind(k);
+        }
+        q.execute(&mut *tx).await?;
+
         tx.commit().await?;
         Ok(())
     }

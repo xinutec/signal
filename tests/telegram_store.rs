@@ -294,7 +294,7 @@ async fn a_deletion_keeps_the_words() {
 /// An upsert alone leaves every reaction a message ever had, at its high-water
 /// mark, forever.
 #[tokio::test]
-async fn a_withdrawn_reaction_stops_being_counted() {
+async fn a_withdrawn_reaction_stops_being_current_without_being_forgotten() {
     let Some((db, pool)) = connect().await else {
         return;
     };
@@ -313,19 +313,50 @@ async fn a_withdrawn_reaction_stops_being_counted() {
         cnt: 1,
         chosen: true,
     };
-    db.replace_telegram_reactions(id.conversation, msg, &[thumb.clone(), heart])
+    db.replace_telegram_reactions(id.conversation, msg, &[thumb.clone(), heart.clone()])
         .await
         .expect("two reactions");
     assert_eq!(reactions(&pool, id.conversation, msg).await.len(), 2);
 
-    db.replace_telegram_reactions(id.conversation, msg, &[thumb])
+    db.replace_telegram_reactions(id.conversation, msg, std::slice::from_ref(&thumb))
         .await
         .expect("one reaction");
     assert_eq!(
         reactions(&pool, id.conversation, msg).await,
         vec![("👍".to_owned(), 2)],
-        "the heart is gone, not kept at its last count"
+        "the heart is no longer on the message"
     );
+
+    // ⚠ **BUT THE ARCHIVE STILL HOLDS IT.** It used to be DELETEd, and that made a
+    // re-walk destructive: Telegram returns only the reactions a message has NOW,
+    // so re-reading a message whose ❤️ had been taken back erased the archive's
+    // record that it ever existed. A deleted message here keeps its words and an
+    // edited one keeps every version; a reaction is no different.
+    let held = all_reactions(&pool, id.conversation, msg).await;
+    assert_eq!(held.len(), 2, "both rows are still here");
+    assert_eq!(
+        held.iter()
+            .find(|(e, _)| e == "❤")
+            .map(|(_, removed)| *removed),
+        Some(true),
+        "the heart is dated, not gone"
+    );
+
+    // And putting it back makes it current again rather than adding a second row.
+    db.replace_telegram_reactions(id.conversation, msg, &[thumb.clone(), heart.clone()])
+        .await
+        .expect("the heart returns");
+    assert_eq!(reactions(&pool, id.conversation, msg).await.len(), 2);
+    assert_eq!(
+        all_reactions(&pool, id.conversation, msg).await.len(),
+        2,
+        "restored in place — a reaction that comes back is the same reaction"
+    );
+
+    // Back to one, for the empty-set case below.
+    db.replace_telegram_reactions(id.conversation, msg, &[thumb])
+        .await
+        .expect("withdrawn again");
 
     // ⚠ The documented limit, pinned so it is a decision rather than a surprise:
     // Telegram OMITS the field for a message with no reactions, so an empty list
@@ -341,10 +372,30 @@ async fn a_withdrawn_reaction_stops_being_counted() {
     );
 }
 
+/// Every reaction row the archive holds, current or not, with whether it has been
+/// withdrawn.
+async fn all_reactions(pool: &MySqlPool, conversation: i64, msg_id: i32) -> Vec<(String, bool)> {
+    sqlx::query(
+        "SELECT COALESCE(emoji, '') AS emoji, removed_at IS NOT NULL AS removed
+           FROM telegram_reactions
+          WHERE conversation_id = ? AND msg_id = ? ORDER BY emoji",
+    )
+    .bind(conversation)
+    .bind(msg_id)
+    .fetch_all(pool)
+    .await
+    .expect("read reactions")
+    .iter()
+    .map(|r| (r.get("emoji"), r.get::<i8, _>("removed") != 0))
+    .collect()
+}
+
+/// What is on the message NOW — the set the viewer draws.
 async fn reactions(pool: &MySqlPool, conversation: i64, msg_id: i32) -> Vec<(String, i32)> {
     sqlx::query(
         "SELECT COALESCE(emoji, '') AS emoji, cnt FROM telegram_reactions
-          WHERE conversation_id = ? AND msg_id = ? ORDER BY emoji",
+          WHERE conversation_id = ? AND msg_id = ? AND removed_at IS NULL
+          ORDER BY emoji",
     )
     .bind(conversation)
     .bind(msg_id)
