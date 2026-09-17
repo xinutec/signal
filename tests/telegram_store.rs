@@ -82,6 +82,7 @@ fn row(conversation: i64, space: PeerSpace, msg_id: i32, text: &str) -> Row {
         edited_at: None,
         edit_hidden: false,
         reply_to_msg_id: None,
+        fwd_from_id: None,
         fwd_from_name: None,
         reactions: Vec::new(),
     }

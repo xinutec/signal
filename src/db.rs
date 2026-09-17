@@ -646,6 +646,31 @@ const MIGRATIONS: &[&str] = &[
     // on `(state, requested_at)` is what makes the poll a lookup rather than a scan.
     r"ALTER TABLE telegram_media
         MODIFY COLUMN state ENUM('offered','wanted','stored','failed') NOT NULL",
+    // v27: WHO a forward came from, when the header names a peer rather than a
+    // string.
+    //
+    // ⚠ **`fwd_from_name` was the ONLY thing read, and it is the RARE half.**
+    // Telegram's forward header carries `from_id` — the original sender's peer —
+    // and fills `from_name` only when that account has forward-privacy on, so it
+    // hides behind a bare string instead. Reading the string alone meant a
+    // forward was recorded exactly when the sender had asked not to be
+    // identified, and dropped in every ordinary case: 0 rows out of 159,946 at
+    // the point this was found, in an archive spanning years.
+    //
+    // A forward was therefore INDISTINGUISHABLE from something the sender wrote,
+    // which is the part that matters — not the missing name, but the missing fact
+    // that the words are somebody else's.
+    //
+    // The id is normalised the way every other peer here is, so a forwarder in a
+    // group and the DM with that same person are one id.
+    //
+    // ⚠ This fills from now on, and the rows already walked stay NULL until
+    // something re-reads them — the backfill is marked complete and does not
+    // return on its own. They are not unfillable: both forward columns are in the
+    // enrichment UPDATE below, which is what a deliberate re-walk needs to repair
+    // history. That is a decision to take with the cost in view, not a migration.
+    r"ALTER TABLE telegram_messages
+        ADD COLUMN fwd_from_id BIGINT NULL",
 ];
 
 #[derive(Clone)]
@@ -1074,8 +1099,8 @@ impl Db {
             "INSERT IGNORE INTO telegram_messages
                 (conversation_id, msg_id, sent_at, sender_id, sender_name,
                  is_outgoing, kind, text, media_kind, media_size, media_mime,
-                 edited_at, edit_hidden, reply_to_msg_id, fwd_from_name)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 edited_at, edit_hidden, reply_to_msg_id, fwd_from_id, fwd_from_name)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(row.conversation_id)
         .bind(row.msg_id)
@@ -1091,6 +1116,7 @@ impl Db {
         .bind(row.edited_at)
         .bind(row.edit_hidden)
         .bind(row.reply_to_msg_id)
+        .bind(row.fwd_from_id)
         .bind(row.fwd_from_name.as_deref())
         .execute(&self.pool)
         .await?;
@@ -1120,22 +1146,30 @@ impl Db {
                 SET media_kind = COALESCE(media_kind, ?),
                     media_size = COALESCE(media_size, ?),
                     media_mime = COALESCE(media_mime, ?),
-                    edit_hidden = COALESCE(edit_hidden, ?)
+                    edit_hidden = COALESCE(edit_hidden, ?),
+                    fwd_from_id = COALESCE(fwd_from_id, ?),
+                    fwd_from_name = COALESCE(fwd_from_name, ?)
               WHERE conversation_id = ? AND msg_id = ?
                 AND ((media_size IS NULL AND ? IS NOT NULL)
                   OR (media_mime IS NULL AND ? IS NOT NULL)
                   OR (media_kind IS NULL AND ? IS NOT NULL)
+                  OR (fwd_from_id IS NULL AND ? IS NOT NULL)
+                  OR (fwd_from_name IS NULL AND ? IS NOT NULL)
                   OR edit_hidden IS NULL)",
         )
         .bind(row.media_kind.map(|m| m.as_str()))
         .bind(row.media_size)
         .bind(row.media_mime.as_deref())
         .bind(row.edit_hidden)
+        .bind(row.fwd_from_id)
+        .bind(row.fwd_from_name.as_deref())
         .bind(row.conversation_id)
         .bind(row.msg_id)
         .bind(row.media_size)
         .bind(row.media_mime.as_deref())
         .bind(row.media_kind.map(|m| m.as_str()))
+        .bind(row.fwd_from_id)
+        .bind(row.fwd_from_name.as_deref())
         .execute(&self.pool)
         .await?
         .rows_affected()

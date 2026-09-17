@@ -506,3 +506,91 @@ fn an_edit_telegram_asks_us_to_hide_is_recorded_but_marked_hidden() {
         "and carries the instruction not to show it"
     );
 }
+
+/// A forward header, with only the fields any one case needs set.
+fn fwd(
+    from_id: Option<tl::enums::Peer>,
+    from_name: Option<String>,
+    post_author: Option<String>,
+) -> tl::enums::MessageFwdHeader {
+    tl::enums::MessageFwdHeader::Header(tl::types::MessageFwdHeader {
+        imported: false,
+        saved_out: false,
+        from_id,
+        from_name,
+        date: 1_699_000_000,
+        channel_post: None,
+        post_author,
+        saved_from_peer: None,
+        saved_from_msg_id: None,
+        saved_from_id: None,
+        saved_from_name: None,
+        saved_date: None,
+        psa_type: None,
+    })
+}
+
+/// ⚠ **A forward is recorded by PEER, which is the case that was being dropped.**
+///
+/// The header carries `from_id` for an ordinary forward and falls back to
+/// `from_name` only when the original sender has forward-privacy on. Reading the
+/// name alone meant the archive recorded a forward exactly when its sender had
+/// asked not to be identified, and recorded nothing at all otherwise — so a
+/// forwarded message was indistinguishable from something the sender had
+/// written. Zero rows out of 159,946 when that was noticed, which is what a
+/// silently-never-true condition looks like from the outside.
+#[test]
+fn an_ordinary_forward_is_recorded_by_its_peer() {
+    let mut m = dm();
+    m.fwd_from = Some(fwd(Some(user(555)), None, None));
+    let row = mapped(m);
+
+    // Normalised like every other peer here, so a forwarder in a group and the
+    // DM with that same person are one id.
+    assert_eq!(row.fwd_from_id, Some(normalise_peer(&user(555)).0));
+    assert_eq!(row.fwd_from_name, None, "a peer is not a name");
+}
+
+/// The rarer half, which was the ONLY half being read.
+#[test]
+fn a_forward_from_a_hidden_account_keeps_the_name_it_offered() {
+    let mut m = dm();
+    m.fwd_from = Some(fwd(None, Some("Someone".to_owned()), None));
+    let row = mapped(m);
+
+    assert_eq!(row.fwd_from_name.as_deref(), Some("Someone"));
+    assert_eq!(row.fwd_from_id, None, "privacy on → there is no peer");
+}
+
+/// ⚠ A CHANNEL POST'S AUTHOR IS NOT ITS PEER. `from_id` for a forwarded channel
+/// post names the CHANNEL, so the person who signed it is only in `post_author`
+/// — and reading `from_id` alone would credit the channel for what a named human
+/// wrote. Both are kept, because they answer different questions.
+#[test]
+fn a_forwarded_channel_post_keeps_the_channel_and_the_author() {
+    let mut m = dm();
+    let channel = tl::enums::Peer::Channel(tl::types::PeerChannel { channel_id: 55 });
+    m.fwd_from = Some(fwd(Some(channel.clone()), None, Some("Ada".to_owned())));
+    let row = mapped(m);
+
+    assert_eq!(row.fwd_from_id, Some(normalise_peer(&channel).0));
+    assert_eq!(row.fwd_from_name.as_deref(), Some("Ada"));
+}
+
+/// An empty string is not a name. Telegram sends `Some("")` rather than `None`
+/// in places, and storing that gives a row that claims to know who forwarded it
+/// and then shows nothing — the distinction the rest of this mapping keeps with
+/// `non_empty`.
+#[test]
+fn an_empty_forward_name_is_no_name() {
+    let mut m = dm();
+    m.fwd_from = Some(fwd(None, Some(String::new()), None));
+    assert_eq!(mapped(m).fwd_from_name, None);
+}
+
+/// A message nobody forwarded says so in both fields, rather than in one.
+#[test]
+fn a_message_that_was_not_forwarded_carries_neither_half() {
+    let row = mapped(dm());
+    assert_eq!((row.fwd_from_id, row.fwd_from_name), (None, None));
+}

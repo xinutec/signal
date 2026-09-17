@@ -156,8 +156,22 @@ pub struct Row {
     /// contract. The edit is still RECORDED; what the flag governs is display.
     pub edit_hidden: bool,
     pub reply_to_msg_id: Option<i32>,
-    /// Who a forward came from, when the header carried a NAME. A forward from a
-    /// peer whose name is only in the peer map is left to the caller.
+    /// Who a forward came from, as a peer — normalised the way `conversation_id`
+    /// and `sender_id` are, so a forwarder in a group and the DM with that same
+    /// person are one id.
+    ///
+    /// ⚠ **This is the field a forward USUALLY has, and it was not read.** The
+    /// header carries a peer for an ordinary forward and falls back to
+    /// [`Row::fwd_from_name`] only when the original sender has forward-privacy
+    /// on. Reading the name alone recorded a forward exactly when its sender had
+    /// asked not to be named, and dropped every other one — so a forwarded
+    /// message was indistinguishable from something the sender wrote. Zero rows
+    /// in 159,946 when that was noticed.
+    pub fwd_from_id: Option<i64>,
+    /// Who a forward came from, when the header names one in WORDS rather than by
+    /// peer: an account with forward-privacy on, or a channel post's author. A
+    /// forward whose sender is only a peer id has this NULL and
+    /// [`Row::fwd_from_id`] set.
     pub fwd_from_name: Option<String>,
     pub reactions: Vec<Reaction>,
 }
@@ -233,6 +247,7 @@ pub fn map_message(msg: &tl::enums::Message, self_id: i64) -> Option<Row> {
                 edited_at: m.edit_date.map(i64::from),
                 edit_hidden: m.edit_hide,
                 reply_to_msg_id: m.reply_to.as_ref().and_then(reply_target),
+                fwd_from_id: m.fwd_from.as_ref().and_then(fwd_peer),
                 fwd_from_name: m.fwd_from.as_ref().and_then(fwd_name),
                 reactions: m.reactions.as_ref().map(reactions).unwrap_or_default(),
             })
@@ -267,6 +282,8 @@ pub fn map_message(msg: &tl::enums::Message, self_id: i64) -> Option<Row> {
                 // `edit_date` and no `edit_hide`.
                 edit_hidden: false,
                 reply_to_msg_id: m.reply_to.as_ref().and_then(reply_target),
+                // `messageService` carries no forward header at all.
+                fwd_from_id: None,
                 fwd_from_name: None,
                 reactions: m.reactions.as_ref().map(reactions).unwrap_or_default(),
             })
@@ -302,9 +319,26 @@ fn reply_target(header: &tl::enums::MessageReplyHeader) -> Option<i32> {
     }
 }
 
+/// The forwarded-from peer, normalised like every other peer here.
+fn fwd_peer(header: &tl::enums::MessageFwdHeader) -> Option<i64> {
+    match header {
+        tl::enums::MessageFwdHeader::Header(h) => h.from_id.as_ref().map(|p| normalise_peer(p).0),
+    }
+}
+
+/// A forward's origin in WORDS, for the two cases that have no usable peer.
+///
+/// `from_name` is Telegram's fallback for a sender with forward-privacy on —
+/// there is no peer to normalise, only the string they chose to be known by.
+/// `post_author` names the person who signed a CHANNEL post, which `from_id`
+/// cannot give: that peer is the channel, not the author.
 fn fwd_name(header: &tl::enums::MessageFwdHeader) -> Option<String> {
     match header {
-        tl::enums::MessageFwdHeader::Header(h) => h.from_name.clone(),
+        tl::enums::MessageFwdHeader::Header(h) => h
+            .from_name
+            .clone()
+            .or_else(|| h.post_author.clone())
+            .and_then(|n| non_empty(&n)),
     }
 }
 

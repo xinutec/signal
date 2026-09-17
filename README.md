@@ -204,6 +204,21 @@ container to exec into. In-cluster it is a throwaway pod with the same environme
 `kubes/signal/k8s/secret.sh` prints the command. Locally it is the form above, with
 `signal-db` port-forwarded.
 
+⚠ **A forward was invisible here until 2026-09-17, and the column said otherwise.**
+`fwd_from_name` existed from the first Telegram migration and held **0 rows out of
+159,946**, because it was filled from the header's `from_name` — which Telegram sets
+only when the original sender has forward-privacy on. The ordinary case names a PEER
+in `from_id`, and that was never read, so a forwarded message was indistinguishable
+from something the sender wrote. `fwd_from_id` (v27) is that half; `post_author` now
+feeds the name for a forwarded channel post, whose `from_id` is the channel rather
+than the person who signed it.
+
+⚠ **The rows already walked are still NULL.** The backfill is marked complete and
+does not return on its own. Both forward columns are in `store_telegram_message`'s
+enrichment UPDATE, so a deliberate re-walk would fill them — 160k messages of API
+traffic, which is a decision to take with the cost in view rather than something to
+start by accident.
+
 `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` come from <https://my.telegram.org>, are
 Pippijn's own, and live in `signal-secret`.
 
