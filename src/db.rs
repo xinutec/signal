@@ -1141,6 +1141,19 @@ impl Db {
         // the wrong instinct here: media facts come from the message and do not
         // change, so a disagreement means one of the two readings is wrong, and
         // silently taking the newer one would hide that.
+        //
+        // ⚠ **`sender_name` BELONGS HERE AND WAS LEFT OUT, WHICH IS WHY A RE-WALK
+        // WOULD NOT HAVE BEEN COMPLETE.** It is not derived from the row — it comes
+        // from the caller's peer lookup, which returns nothing when the peer is not
+        // in the session cache — so 652 stored messages have a `sender_id` and no
+        // name, and the viewer draws them with a BLANK sender. 527 of them are one
+        // conversation whose peer never resolved at all. Every other column here
+        // was added the moment its column was; this one predates the enrichment and
+        // was never revisited, so the gap was silent in exactly the way a missing
+        // enrichment always is: nothing fails, the column simply stays NULL.
+        //
+        // The lesson generalises past this row — **a column that can be NULL for a
+        // reason OTHER than "the message does not have one" needs to be here.**
         let enriched = sqlx::query(
             "UPDATE telegram_messages
                 SET media_kind = COALESCE(media_kind, ?),
@@ -1148,13 +1161,15 @@ impl Db {
                     media_mime = COALESCE(media_mime, ?),
                     edit_hidden = COALESCE(edit_hidden, ?),
                     fwd_from_id = COALESCE(fwd_from_id, ?),
-                    fwd_from_name = COALESCE(fwd_from_name, ?)
+                    fwd_from_name = COALESCE(fwd_from_name, ?),
+                    sender_name = COALESCE(sender_name, ?)
               WHERE conversation_id = ? AND msg_id = ?
                 AND ((media_size IS NULL AND ? IS NOT NULL)
                   OR (media_mime IS NULL AND ? IS NOT NULL)
                   OR (media_kind IS NULL AND ? IS NOT NULL)
                   OR (fwd_from_id IS NULL AND ? IS NOT NULL)
                   OR (fwd_from_name IS NULL AND ? IS NOT NULL)
+                  OR (sender_name IS NULL AND ? IS NOT NULL)
                   OR edit_hidden IS NULL)",
         )
         .bind(row.media_kind.map(|m| m.as_str()))
@@ -1163,6 +1178,7 @@ impl Db {
         .bind(row.edit_hidden)
         .bind(row.fwd_from_id)
         .bind(row.fwd_from_name.as_deref())
+        .bind(sender_name)
         .bind(row.conversation_id)
         .bind(row.msg_id)
         .bind(row.media_size)
@@ -1170,6 +1186,7 @@ impl Db {
         .bind(row.media_kind.map(|m| m.as_str()))
         .bind(row.fwd_from_id)
         .bind(row.fwd_from_name.as_deref())
+        .bind(sender_name)
         .execute(&self.pool)
         .await?
         .rows_affected()

@@ -568,3 +568,73 @@ async fn media_facts(
     .expect("read the media facts");
     row
 }
+
+async fn sender_name_of(pool: &MySqlPool, conversation: i64, msg_id: i32) -> Option<String> {
+    sqlx::query_scalar(
+        "SELECT sender_name FROM telegram_messages WHERE conversation_id = ? AND msg_id = ?",
+    )
+    .bind(conversation)
+    .bind(msg_id)
+    .fetch_one(pool)
+    .await
+    .expect("the row is there")
+}
+
+/// ⚠ **THE ENRICHMENT'S ONE GAP, WHICH IS WHY A RE-WALK WOULD NOT HAVE BEEN
+/// COMPLETE.**
+///
+/// `sender_name` is unlike every other column here: it is not derived from the
+/// message, it comes from the caller's peer lookup — and that returns nothing
+/// when the peer is not in the session cache. So a message can be stored with a
+/// `sender_id` and no name through no fault of the message, and the viewer draws
+/// it with a BLANK sender.
+///
+/// It was left out of the enrichment because it predates it, and the gap was
+/// silent in the way a missing enrichment always is: nothing fails, the column
+/// just stays NULL forever. 652 stored rows were in that state when this was
+/// found — 527 of them one conversation whose peer never resolved.
+///
+/// This pins the repair, and pins that a name once known is not replaced by a
+/// later delivery that happens not to know it.
+#[tokio::test]
+async fn a_name_the_first_delivery_could_not_resolve_is_filled_by_a_later_one() {
+    let Some((db, pool)) = connect().await else {
+        return;
+    };
+    let id = ids(11);
+    let msg = id.msg_base + 1;
+    let r = row(id.conversation, PeerSpace::User, msg, "who said this?");
+
+    // Stored with no name, which is what an unresolved peer looks like.
+    assert_eq!(
+        db.store_telegram_message(&r, None).await.expect("insert"),
+        TelegramStored::Inserted
+    );
+    assert_eq!(sender_name_of(&pool, id.conversation, msg).await, None);
+
+    // The same message again, this time with the peer resolved.
+    assert_eq!(
+        db.store_telegram_message(&r, Some("Tessa"))
+            .await
+            .expect("enrich"),
+        TelegramStored::Enriched
+    );
+    assert_eq!(
+        sender_name_of(&pool, id.conversation, msg).await.as_deref(),
+        Some("Tessa")
+    );
+
+    // ⚠ And a later delivery that does NOT know the name leaves the one we have.
+    // A peer drops out of the cache for reasons that have nothing to do with the
+    // message, so "I could not resolve it this time" is not evidence the stored
+    // name is wrong — and blanking it would make the repair undo itself on the
+    // next pass.
+    assert_eq!(
+        db.store_telegram_message(&r, None).await.expect("replay"),
+        TelegramStored::Unchanged
+    );
+    assert_eq!(
+        sender_name_of(&pool, id.conversation, msg).await.as_deref(),
+        Some("Tessa")
+    );
+}
