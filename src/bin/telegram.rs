@@ -464,6 +464,45 @@ async fn sweep(client: &Client, db: &Db) -> Result<Vec<(i64, PeerRef)>> {
 struct Names(tokio::sync::Mutex<HashMap<PeerId, String>>);
 
 impl Names {
+    /// Learn our own name, once, because `resolve_peer` cannot tell us.
+    ///
+    /// ⚠ **THE SELF SENTINEL DOES NOT RESOLVE, AND THE ERROR READS BACKWARDS.**
+    /// `Message::sender_id` answers `PeerId::self_user()` — `2^40`, not a user id —
+    /// for an outgoing message in a one-to-one chat. Handing that to `resolve_peer`
+    /// fails with `Dropped`, which sounds like a lost request and is not one: the
+    /// call reaches Telegram, gets the right user back, and then looks the result up
+    /// in its own map under the SENTINEL key it was handed rather than the real id.
+    /// The miss is the last line of `resolve_peer`, not the wire. Retrying, backing
+    /// off or blaming the connection would all be chasing a network fault that never
+    /// happened.
+    ///
+    /// `get_me` is the call that does answer, so it is made once and both keys are
+    /// seeded: an outgoing DM is attributed to the sentinel, an outgoing group
+    /// message to the real id.
+    async fn learn_self(&self, client: &Client, self_id: i64) {
+        let name = match client.get_me().await {
+            Ok(me) => me.full_name(),
+            // Not fatal. A feed that will not archive because it could not read its
+            // own name would be a worse failure than outgoing rows missing one, and
+            // the enrichment fills those in on any later delivery.
+            Err(e) => {
+                tracing::warn!(
+                    "could not ask Telegram who this session is: {e}; \
+                     outgoing messages will be stored without a sender name"
+                );
+                return;
+            }
+        };
+        if name.is_empty() {
+            return;
+        }
+        let mut cache = self.0.lock().await;
+        cache.insert(PeerId::self_user(), name.clone());
+        if let Some(id) = PeerId::user(self_id) {
+            cache.insert(id, name);
+        }
+    }
+
     async fn of(
         &self,
         client: &Client,
@@ -521,6 +560,7 @@ async fn follow(
         .map_err(|e| anyhow::anyhow!("opening the update stream: {e}"))?;
 
     let names = Names::default();
+    names.learn_self(client, self_id).await;
     loop {
         let update = stream.next().await.context("reading an update")?;
         if let Err(e) = apply(client, db, cfg, &names, self_id, &update).await {
