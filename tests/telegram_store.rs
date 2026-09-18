@@ -19,6 +19,7 @@
 use signal_archiver::db::{
     Db, TelegramBackfill, TelegramDeleteScope, TelegramReadDirection, TelegramStored,
 };
+use signal_archiver::parse::{CallEvent, CallEventKind, Receipt, ReceiptKind};
 use signal_archiver::telegram::ConvKind;
 use signal_archiver::telegram::map::{
     Call, Entity, MsgKind, PeerSpace, Reaction, ReactionAuthor, Reactions, Row,
@@ -1133,5 +1134,116 @@ async fn the_recapture_frontier_only_moves_forward() {
             .expect("a batch")
             .is_empty(),
         "an exhausted conversation stops the loop"
+    );
+}
+
+/// ⚠ **A RECEIPT IS AN EVENT SIGNAL SAYS ONCE, so re-seeing it must not restamp
+/// it.** Telegram restates its read marks on every `getDialogs`, so lateness is
+/// recoverable there; Signal restates nothing. The first observation is the
+/// answer to "when was this read", and an upsert would walk that answer forward
+/// every time the socket replayed a frame.
+#[tokio::test]
+async fn a_signal_receipt_is_kept_once_and_never_re_dated() {
+    let Some((db, pool)) = connect().await else {
+        return;
+    };
+    // Timestamps rather than ids() slots: signal_receipts is keyed on the
+    // message's own send time, which is global rather than per conversation.
+    let base = 1_900_000_000_000 + i64::from(std::process::id() % 20_000) * 100;
+
+    let first = Receipt {
+        author: "alice".to_owned(),
+        kind: ReceiptKind::Read,
+        when_ts: base + 10,
+        targets: vec![base + 1, base + 2],
+    };
+    assert_eq!(
+        db.record_signal_receipt(&first).await.expect("first"),
+        2,
+        "one receipt, two messages, two rows"
+    );
+
+    // The same frame again, reporting a later `when`.
+    let replay = Receipt {
+        when_ts: base + 999,
+        ..first.clone()
+    };
+    assert_eq!(
+        db.record_signal_receipt(&replay).await.expect("replay"),
+        0,
+        "a replayed receipt teaches nothing"
+    );
+
+    let when: i64 = sqlx::query_scalar(
+        "SELECT when_ts FROM signal_receipts
+          WHERE target_ts = ? AND author_uuid = 'alice' AND kind = 'read'",
+    )
+    .bind(base + 1)
+    .fetch_one(&pool)
+    .await
+    .expect("read it back");
+    assert_eq!(when, base + 10, "the first observation stands");
+
+    // ⚠ A DELIVERY receipt for the same message is a DIFFERENT fact, not a
+    // duplicate — the message was delivered at one moment and read at another,
+    // and a key without `kind` would keep only whichever arrived first.
+    let delivered = Receipt {
+        author: "alice".to_owned(),
+        kind: ReceiptKind::Delivery,
+        when_ts: base + 5,
+        targets: vec![base + 1],
+    };
+    assert_eq!(
+        db.record_signal_receipt(&delivered)
+            .await
+            .expect("delivery"),
+        1,
+        "delivered and read coexist on one message"
+    );
+}
+
+/// ⚠ Two hangups for one call are NORMAL — one per device the other party has —
+/// so `event_ts` is part of the key. Collapsing on (call, peer, event) would
+/// keep one and drop the rest, which is the shape of a call this archive could
+/// then never explain.
+#[tokio::test]
+async fn a_call_keeps_every_frame_that_arrived() {
+    let Some((db, _pool)) = connect().await else {
+        return;
+    };
+    let call_id = 8_000_000 + i64::from(std::process::id() % 20_000);
+
+    let offer = CallEvent {
+        call_id,
+        peer: "bob".to_owned(),
+        event: CallEventKind::Offer,
+        detail: Some("audio_call".to_owned()),
+        device_id: None,
+        event_ts: 1_900_000_000_000,
+    };
+    assert_eq!(db.record_signal_call_event(&offer).await.expect("offer"), 1);
+    assert_eq!(
+        db.record_signal_call_event(&offer).await.expect("replay"),
+        0,
+        "the same frame twice is one frame"
+    );
+
+    let hangup_a = CallEvent {
+        event: CallEventKind::Hangup,
+        detail: Some("normal".to_owned()),
+        device_id: Some(1),
+        event_ts: 1_900_000_060_000,
+        ..offer.clone()
+    };
+    let hangup_b = CallEvent {
+        device_id: Some(2),
+        event_ts: 1_900_000_060_500,
+        ..hangup_a.clone()
+    };
+    assert_eq!(db.record_signal_call_event(&hangup_a).await.expect("a"), 1);
+    assert_eq!(
+        db.record_signal_call_event(&hangup_b).await.expect("b"),
+        1,
+        "a second device hanging up is a second frame, not a duplicate"
     );
 }

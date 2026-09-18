@@ -163,6 +163,33 @@ async fn dispatch(ctx: &Ctx, frame: &Value) -> Result<()> {
 
     match parsed.action {
         Action::Skip => {}
+        Action::Receipt(r) => {
+            let n = ctx.db.record_signal_receipt(&r).await?;
+            // Quiet when it taught us nothing: receipts are re-delivered often
+            // and a line per replay would drown the log that matters.
+            if n > 0 {
+                tracing::info!(
+                    "{} {n} message(s) for {} at {}",
+                    r.kind.as_str(),
+                    r.author,
+                    r.when_ts
+                );
+            }
+        }
+        Action::Call(c) => {
+            if ctx.db.record_signal_call_event(&c).await? > 0 {
+                tracing::info!(
+                    "call {} {} with {}{}",
+                    c.call_id,
+                    c.event.as_str(),
+                    c.peer,
+                    c.detail
+                        .as_deref()
+                        .map(|d| format!(" ({d})"))
+                        .unwrap_or_default()
+                );
+            }
+        }
         Action::Delete { sender, target_ts } => {
             let n = ctx.db.mark_deleted(&sender, target_ts).await?;
             tracing::info!(

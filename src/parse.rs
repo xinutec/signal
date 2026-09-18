@@ -106,8 +106,96 @@ pub enum Action {
     Message(Message),
     Reaction(Reaction),
     Edit(Edit),
-    Delete { sender: String, target_ts: i64 },
+    Delete {
+        sender: String,
+        target_ts: i64,
+    },
+    /// ⚠ **THE ONLY THING SIGNAL SAYS ONCE.** A receipt is an EVENT with its own
+    /// clock — who, which messages, delivered/read/viewed, and when — not a
+    /// high-water mark like Telegram's `read_outbox_max_id`. Nothing restates it,
+    /// so a receipt that is not stored as it arrives is gone. See migration v37.
+    Receipt(Receipt),
+    /// One WebRTC signalling frame of a call. Stored raw rather than folded into
+    /// a duration — see [`CallEvent`].
+    Call(CallEvent),
     Skip,
+}
+
+/// Delivery, read or viewed, for one or more messages at once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Receipt {
+    /// Who acknowledged. For `syncMessage.readMessages` this is US, reading on
+    /// another device, which is why the column is an author rather than a peer.
+    pub author: String,
+    pub kind: ReceiptKind,
+    /// Signal's own `when`, in milliseconds — when the receipt was generated,
+    /// not when we saw it.
+    pub when_ts: i64,
+    /// ⚠ One receipt acknowledges MANY messages. Flattening to one row per
+    /// target is what makes the table answerable per message.
+    pub targets: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiptKind {
+    Delivery,
+    Read,
+    Viewed,
+}
+
+impl ReceiptKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReceiptKind::Delivery => "delivery",
+            ReceiptKind::Read => "read",
+            ReceiptKind::Viewed => "viewed",
+        }
+    }
+}
+
+/// One frame of a call's signalling.
+///
+/// ⚠ **RAW EVENTS, NOT A DURATION, AND THAT IS DELIBERATE.** Telegram hands over
+/// a finished call as one service message with `duration` and `reason` already
+/// computed. Signal hands over WebRTC signalling: an offer, maybe an answer,
+/// maybe a busy, maybe a hangup, all sharing a `call_id`, each arriving as its
+/// own envelope with its own timestamp. A duration is offer→hangup — but only if
+/// both frames reached THIS device, and whether they do depends on where the
+/// call was answered.
+///
+/// So this stores what arrived. Computing a duration from events we have not yet
+/// seen in the wild would be inventing a state machine and then trusting it; the
+/// events are the unrecoverable part and can be interpreted later, against data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallEvent {
+    pub call_id: i64,
+    /// The other party. A call has no thread of its own.
+    pub peer: String,
+    pub event: CallEventKind,
+    /// `audio` or `video` on an offer; the hangup's reason on a hangup.
+    pub detail: Option<String>,
+    pub device_id: Option<i64>,
+    /// The envelope's timestamp, in milliseconds.
+    pub event_ts: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallEventKind {
+    Offer,
+    Answer,
+    Busy,
+    Hangup,
+}
+
+impl CallEventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CallEventKind::Offer => "offer",
+            CallEventKind::Answer => "answer",
+            CallEventKind::Busy => "busy",
+            CallEventKind::Hangup => "hangup",
+        }
+    }
 }
 
 /// The full outcome of parsing one frame: the primary action, plus optional
@@ -373,6 +461,115 @@ pub fn parse_frame(frame: &Value) -> Parsed {
             contact,
             dm_name,
         };
+    }
+
+    // ⚠ **BEFORE the syncMessage arm below, because a read receipt synced from
+    // another device arrives INSIDE `syncMessage` and the `sentMessage` arm would
+    // not match it — it would simply fall through to `Skip`, which is how every
+    // receipt since this feed started was lost.**
+    if let Some(reads) = env
+        .get("syncMessage")
+        .and_then(|s| s.get("readMessages"))
+        .and_then(Value::as_array)
+        && !reads.is_empty()
+    {
+        // ⚠ The AUTHOR here is us. `readMessages` is our own device telling the
+        // others what we have read, so the receipt is ours about somebody else's
+        // message — the mirror of an inbound `receiptMessage`, and the reason the
+        // column is `author_uuid` rather than a peer.
+        let me = id_of(env.get("sourceUuid"), env.get("source"));
+        let targets: Vec<i64> = reads
+            .iter()
+            .filter_map(|r| r.get("timestamp").and_then(Value::as_i64))
+            .collect();
+        if !targets.is_empty() {
+            return Parsed {
+                action: Action::Receipt(Receipt {
+                    author: me,
+                    kind: ReceiptKind::Read,
+                    // No `when` on a sync read; the envelope's own clock is the
+                    // closest honest answer and is what we saw it at.
+                    when_ts: env.get("timestamp").and_then(Value::as_i64).unwrap_or(0),
+                    targets,
+                }),
+                contact: None,
+                dm_name: None,
+            };
+        }
+    }
+
+    if let Some(receipt) = env.get("receiptMessage") {
+        let targets: Vec<i64> = receipt
+            .get("timestamps")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_i64).collect())
+            .unwrap_or_default();
+        // ⚠ The three flags are NOT exclusive — a single receipt can report both
+        // delivery and read — so this yields the STRONGEST one rather than
+        // matching. Storing only "delivery" for a frame that also said "read"
+        // would record the weaker fact and silently lose the stronger.
+        let flag = |k: &str| receipt.get(k).and_then(Value::as_bool).unwrap_or(false);
+        let kind = if flag("isViewed") {
+            Some(ReceiptKind::Viewed)
+        } else if flag("isRead") {
+            Some(ReceiptKind::Read)
+        } else if flag("isDelivery") {
+            Some(ReceiptKind::Delivery)
+        } else {
+            None
+        };
+        if let Some(kind) = kind
+            && !targets.is_empty()
+        {
+            return Parsed {
+                action: Action::Receipt(Receipt {
+                    author: id_of(env.get("sourceUuid"), env.get("source")),
+                    kind,
+                    when_ts: receipt
+                        .get("when")
+                        .and_then(Value::as_i64)
+                        .or_else(|| env.get("timestamp").and_then(Value::as_i64))
+                        .unwrap_or(0),
+                    targets,
+                }),
+                contact: None,
+                dm_name: None,
+            };
+        }
+        return Parsed::skip();
+    }
+
+    if let Some(call) = env.get("callMessage") {
+        let peer = id_of(env.get("sourceUuid"), env.get("source"));
+        let event_ts = env.get("timestamp").and_then(Value::as_i64).unwrap_or(0);
+        // ⚠ `iceUpdateMessages` is deliberately absent: it is transport plumbing,
+        // many frames per call carrying only opaque blobs, and storing it would
+        // bury the four frames that say what happened.
+        let found = [
+            ("offerMessage", CallEventKind::Offer),
+            ("answerMessage", CallEventKind::Answer),
+            ("busyMessage", CallEventKind::Busy),
+            ("hangupMessage", CallEventKind::Hangup),
+        ]
+        .into_iter()
+        .find_map(|(key, kind)| call.get(key).map(|v| (kind, v)));
+        if let Some((event, body)) = found
+            && let Some(call_id) = body.get("id").and_then(Value::as_i64)
+        {
+            return Parsed {
+                action: Action::Call(CallEvent {
+                    call_id,
+                    peer,
+                    event,
+                    detail: body.get("type").and_then(Value::as_str).map(str::to_string),
+                    device_id: body.get("deviceId").and_then(Value::as_i64),
+                    event_ts,
+                }),
+                contact: None,
+                dm_name: None,
+            };
+        }
+        return Parsed::skip();
     }
 
     if let Some(sent) = env.get("syncMessage").and_then(|s| s.get("sentMessage")) {

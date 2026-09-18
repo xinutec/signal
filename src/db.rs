@@ -876,6 +876,69 @@ const MIGRATIONS: &[&str] = &[
     // Re-runnable by deleting a row: the next pass re-reads that conversation from
     // the beginning, which costs time and changes nothing, because every write it
     // makes is an enrichment of a NULL.
+    // v37: Signal's delivery and read receipts.
+    //
+    // ⚠ **RICHER THAN TELEGRAM'S AND LESS RECOVERABLE, WHICH IS THE WHOLE
+    // POINT.** Telegram gives a high-water mark per conversation and restates it
+    // on every `getDialogs`, so a missed update costs lateness. Signal gives an
+    // EVENT — who, which messages, delivered/read/viewed, and its own `when` —
+    // and says it exactly once, on the live socket. Nothing restates it, and the
+    // Android export carries none, so the 15 months before this table existed are
+    // permanently blank.
+    //
+    // `parse.rs` handled `dataMessage`, `sentMessage` and `editMessage`, and every
+    // `receiptMessage` fell through to `Skip`. It was never a decision — the arm
+    // was simply not written, and a test named `the_other_origins_report_no_read_state`
+    // passing green made the absence look like a property of Signal.
+    //
+    // ⚠ **ONE RECEIPT ACKNOWLEDGES MANY MESSAGES**, so it is flattened: a row per
+    // (message, author, kind). Keyed that way rather than on the receipt, because
+    // the question is always "when was THIS message read", never "what did that
+    // frame say".
+    //
+    // ⚠ **`when_ts` IS NEVER UPDATED.** Re-seeing a receipt must not restamp it —
+    // same rule as `telegram_read_marks.observed_at`, and for the same reason: the
+    // first observation is the one that answers the question.
+    r"CREATE TABLE IF NOT EXISTS signal_receipts (
+        id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        target_ts BIGINT NOT NULL,
+        author_uuid VARCHAR(64) NOT NULL,
+        kind ENUM('delivery','read','viewed') NOT NULL,
+        when_ts BIGINT NOT NULL,
+        observed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE KEY uniq_signal_receipt (target_ts, author_uuid, kind),
+        INDEX idx_signal_receipt_target (target_ts)
+    ) DEFAULT CHARSET=utf8mb4",
+    // v38: Signal calls, as the frames that actually arrive.
+    //
+    // ⚠ **NOT A DURATION, BECAUSE SIGNAL DOES NOT SEND ONE.** Telegram reports a
+    // finished call as one service message with `duration` and `reason` already
+    // computed — 65 of them in this archive. Signal sends WebRTC signalling: an
+    // offer, maybe an answer, maybe a busy, maybe a hangup, sharing a `call_id`,
+    // each its own envelope with its own timestamp. Offer→hangup IS the duration,
+    // but only when both frames reach THIS device, which depends on where the
+    // call was picked up.
+    //
+    // So this stores what arrived and interprets nothing. The events are the
+    // unrecoverable half; a duration derived from a state machine nobody has
+    // watched run would be a guess wearing a number's clothes, and it can be
+    // computed later against real rows.
+    //
+    // ⚠ `iceUpdateMessages` is excluded on purpose — many frames per call,
+    // carrying only opaque transport blobs, which would bury the four that say
+    // what happened.
+    r"CREATE TABLE IF NOT EXISTS signal_call_events (
+        id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        call_id BIGINT NOT NULL,
+        peer_uuid VARCHAR(64) NOT NULL,
+        event ENUM('offer','answer','busy','hangup') NOT NULL,
+        detail VARCHAR(32) NULL,
+        device_id BIGINT NULL,
+        event_ts BIGINT NOT NULL,
+        observed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE KEY uniq_signal_call_event (call_id, peer_uuid, event, event_ts),
+        INDEX idx_signal_call (call_id)
+    ) DEFAULT CHARSET=utf8mb4",
     r"CREATE TABLE IF NOT EXISTS telegram_recapture_state (
         conversation_id BIGINT NOT NULL PRIMARY KEY,
         through_msg_id INT NOT NULL,
@@ -1784,6 +1847,56 @@ impl Db {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Record a receipt, once, without ever restamping when it happened.
+    ///
+    /// ⚠ `INSERT IGNORE`, not an upsert. A receipt can be re-delivered; the first
+    /// observation is the one that answers "when was this read", and an upsert
+    /// would walk that answer forward every time the socket replayed.
+    ///
+    /// Returns how many rows were new, so a caller can log a receipt that taught
+    /// the archive something and stay quiet about one that did not.
+    pub async fn record_signal_receipt(&self, receipt: &crate::parse::Receipt) -> Result<u64> {
+        let mut written = 0;
+        for target in &receipt.targets {
+            written += sqlx::query(
+                "INSERT IGNORE INTO signal_receipts
+                    (target_ts, author_uuid, kind, when_ts)
+                 VALUES (?, ?, ?, ?)",
+            )
+            .bind(target)
+            .bind(&receipt.author)
+            .bind(receipt.kind.as_str())
+            .bind(receipt.when_ts)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        }
+        Ok(written)
+    }
+
+    /// Record one frame of a call's signalling.
+    ///
+    /// ⚠ `event_ts` is part of the KEY rather than a value, because a call can
+    /// legitimately carry two frames of the same kind — a hangup from each of the
+    /// other party's devices, say — and collapsing them on `(call, peer, event)`
+    /// would keep one and silently drop the rest.
+    pub async fn record_signal_call_event(&self, call: &crate::parse::CallEvent) -> Result<u64> {
+        Ok(sqlx::query(
+            "INSERT IGNORE INTO signal_call_events
+                (call_id, peer_uuid, event, detail, device_id, event_ts)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(call.call_id)
+        .bind(&call.peer)
+        .bind(call.event.as_str())
+        .bind(call.detail.as_deref())
+        .bind(call.device_id)
+        .bind(call.event_ts)
+        .execute(&self.pool)
+        .await?
+        .rows_affected())
     }
 
     /// The next batch of stored message ids to re-read, oldest first.

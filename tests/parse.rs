@@ -2,7 +2,8 @@
 
 use serde_json::json;
 use signal_archiver::parse::{
-    Action, Attachment, Contact, Edit, Message, Reaction, ThreadId, ThreadKind, parse_frame,
+    Action, Attachment, CallEvent, CallEventKind, Contact, Edit, Message, Reaction, Receipt,
+    ReceiptKind, ThreadId, ThreadKind, parse_frame,
 };
 
 #[test]
@@ -191,12 +192,19 @@ fn jsonrpc_params_wrapped_envelope_is_accepted() {
     }
 }
 
+/// ⚠ **THIS TEST USED TO SAY RECEIPTS WERE SKIPPED, AND THAT WAS NOT A
+/// DECISION.** The arm had simply never been written, and the name made the
+/// omission read as intent — it went on passing after receipts started being
+/// stored, because its receipt carried no `timestamps` and so skipped for an
+/// entirely different reason. A green test asserting the wrong rule is worse
+/// than a missing one.
+///
+/// What is actually skipped: typing, which is not a fact about a conversation,
+/// and a frame this parser does not recognise. Receipts have their own tests.
 #[test]
-fn receipt_typing_and_unknown_frames_are_skipped() {
-    let receipt = json!({"envelope": {"sourceUuid": "u1", "receiptMessage": {"isDelivery": true}}});
+fn typing_and_unknown_frames_are_skipped() {
     let typing = json!({"envelope": {"sourceUuid": "u1", "typingMessage": {"action": "STARTED"}}});
     let junk = json!({"hello": "world"});
-    assert_eq!(parse_frame(&receipt).action, Action::Skip);
     assert_eq!(parse_frame(&typing).action, Action::Skip);
     assert_eq!(parse_frame(&junk).action, Action::Skip);
 }
@@ -305,4 +313,115 @@ fn edit_with_no_target_timestamp_is_skipped() {
         "editMessage": {"dataMessage": {"message": "orphan edit"}}
     }});
     assert_eq!(parse_frame(&f).action, Action::Skip);
+}
+
+/// ⚠ **THE THREE RECEIPT FLAGS ARE NOT EXCLUSIVE.**
+///
+/// A single `receiptMessage` can report delivery AND read at once, so matching
+/// on them in the wrong order stores the weaker fact and loses the stronger —
+/// silently, because a `delivery` row looks perfectly correct on its own. This
+/// asserts the precedence rather than the arms, which is the part that can drift.
+#[test]
+fn a_receipt_reports_the_strongest_thing_it_says() {
+    let both = json!({"envelope": {
+        "sourceUuid": "u1", "timestamp": 5000,
+        "receiptMessage": {"when": 4321, "isDelivery": true, "isRead": true,
+                           "isViewed": false, "timestamps": [1000, 2000]}
+    }});
+    assert_eq!(
+        parse_frame(&both).action,
+        Action::Receipt(Receipt {
+            author: "u1".into(),
+            kind: ReceiptKind::Read,
+            when_ts: 4321,
+            targets: vec![1000, 2000],
+        }),
+        "delivery AND read is a READ receipt, and it acknowledges BOTH messages"
+    );
+
+    let delivered = json!({"envelope": {
+        "sourceUuid": "u1", "timestamp": 5000,
+        "receiptMessage": {"when": 4000, "isDelivery": true, "isRead": false,
+                           "isViewed": false, "timestamps": [1000]}
+    }});
+    let Action::Receipt(r) = parse_frame(&delivered).action else {
+        panic!("a delivery receipt is a receipt");
+    };
+    assert_eq!(r.kind, ReceiptKind::Delivery);
+
+    // ⚠ A receipt naming nothing is not a receipt about nothing — it is a frame
+    // we cannot attach to any message, and storing it would make a row that no
+    // query can ever reach.
+    let empty = json!({"envelope": {
+        "sourceUuid": "u1", "timestamp": 5000,
+        "receiptMessage": {"when": 4000, "isDelivery": true, "timestamps": []}
+    }});
+    assert_eq!(parse_frame(&empty).action, Action::Skip);
+}
+
+/// ⚠ A read receipt from ANOTHER OF OUR DEVICES arrives inside `syncMessage`,
+/// where the `sentMessage` arm does not match it — so before this existed it
+/// fell through to `Skip` like every other receipt.
+///
+/// The author is US: it is our own device saying what we have read.
+#[test]
+fn reading_on_the_phone_is_a_receipt_from_ourselves() {
+    let f = json!({"envelope": {
+        "sourceUuid": "me", "timestamp": 9000,
+        "syncMessage": {"readMessages": [
+            {"senderUuid": "u1", "timestamp": 1000},
+            {"senderUuid": "u2", "timestamp": 2000}
+        ]}
+    }});
+    assert_eq!(
+        parse_frame(&f).action,
+        Action::Receipt(Receipt {
+            author: "me".into(),
+            kind: ReceiptKind::Read,
+            when_ts: 9000,
+            targets: vec![1000, 2000],
+        })
+    );
+}
+
+/// A call is signalling frames sharing an id, not a finished call with a
+/// duration — see `CallEvent`. Each frame is its own row.
+#[test]
+fn a_call_arrives_as_the_frames_it_is_made_of() {
+    let offer = json!({"envelope": {
+        "sourceUuid": "u1", "timestamp": 7000,
+        "callMessage": {"offerMessage": {"id": 42, "type": "audio_call", "opaque": "x"}}
+    }});
+    assert_eq!(
+        parse_frame(&offer).action,
+        Action::Call(CallEvent {
+            call_id: 42,
+            peer: "u1".into(),
+            event: CallEventKind::Offer,
+            detail: Some("audio_call".into()),
+            device_id: None,
+            event_ts: 7000,
+        })
+    );
+
+    let hangup = json!({"envelope": {
+        "sourceUuid": "u1", "timestamp": 7600,
+        "callMessage": {"hangupMessage": {"id": 42, "type": "normal", "deviceId": 2}}
+    }});
+    let Action::Call(c) = parse_frame(&hangup).action else {
+        panic!("a hangup is a call event");
+    };
+    assert_eq!(
+        (c.call_id, c.event, c.device_id),
+        (42, CallEventKind::Hangup, Some(2))
+    );
+
+    // ⚠ Ice updates are transport plumbing and are deliberately NOT stored: many
+    // frames per call carrying opaque blobs, which would bury the four that say
+    // what happened.
+    let ice = json!({"envelope": {
+        "sourceUuid": "u1", "timestamp": 7100,
+        "callMessage": {"iceUpdateMessages": [{"id": 42, "opaque": "y"}]}
+    }});
+    assert_eq!(parse_frame(&ice).action, Action::Skip);
 }
