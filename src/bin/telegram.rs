@@ -27,7 +27,7 @@
 //! construction — the server never holds them — so no login reaches them. Nothing
 //! in this archive will say so; this line is the only record.
 //!
-//! Two modes:
+//! Three modes:
 //!
 //! * `telegram login <phone>` — interactive, once per account lifetime. Asks
 //!   Telegram for a code, reads it from stdin, and stores the resulting session.
@@ -40,11 +40,15 @@
 //!   number is an input to a one-off command, so it is passed like one.
 //! * `telegram` — the archiver. Refuses to start without a stored session, because
 //!   a feed that is quietly not logged in looks exactly like a quiet week.
+//! * `telegram probe` — read-only. Counts how often each optional field Telegram
+//!   CAN send is actually filled in, over a sample of the archive's own messages,
+//!   so a capture plan is sized against measurements rather than against the TL
+//!   schema's promises. Run it with the feed scaled to zero; see [`probe`].
 //!
 //! Config via env: `DB_HOST`, `DB_PORT` (3306), `DB_NAME`, `DB_USER`,
 //! `DB_PASSWORD`, `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -62,6 +66,7 @@ use signal_archiver::db::{
 use signal_archiver::telegram::map::{self, Row};
 use signal_archiver::telegram::session::DbSession;
 use signal_archiver::telegram::{ConvKind, peer_name};
+use sqlx::{AssertSqlSafe, Row as _};
 
 /// How often the session is written back when anything in it changed.
 ///
@@ -184,8 +189,11 @@ async fn main() -> Result<()> {
             tracing::info!("logged in; the session is stored");
             Ok(())
         }
+        Some("probe") => probe(&client, &db).await,
         None => archive(&client, &db, &cfg, &session, updates).await,
-        Some(other) => bail!("unknown mode {other:?}; expected `login <phone>` or no argument"),
+        Some(other) => {
+            bail!("unknown mode {other:?}; expected `login <phone>`, `probe`, or no argument")
+        }
     }
 }
 
@@ -531,6 +539,220 @@ impl Names {
         };
         self.0.lock().await.insert(id, name.clone());
         Some(name)
+    }
+}
+
+/// Count how often each optional field Telegram CAN send is actually filled in.
+///
+/// ⚠ **THE SCHEMA SAYS A FIELD EXISTS; IT DOES NOT SAY THE SERVER SENDS IT.**
+/// Almost everything interesting on `message#` is behind a flag, so reading
+/// `tl/api.tl` tells you what is possible and nothing about what arrives. This
+/// counts, over a sample of the archive's own messages, how many came back with
+/// each field set — so a capture plan is sized against measurements rather than
+/// against the schema's promises.
+///
+/// Run as a ONE-OFF against the same database, with the feed scaled to zero:
+/// two clients sharing one session would both write the update state. Nothing is
+/// missed by the pause, because `catch_up` closes the gap on restart.
+///
+/// ⚠ Counts only. No message text is printed: the tally is the answer, and a
+/// dump of somebody's conversations is not a diagnostic.
+async fn probe(client: &Client, db: &Db) -> Result<()> {
+    let mut refs: HashMap<i64, PeerRef> = HashMap::new();
+    let mut dialogs = client.iter_dialogs();
+    while let Some(dialog) = dialogs.next().await.context("listing dialogs")? {
+        let peer = dialog.peer();
+        if let Some(id) = peer.id().bot_api_dialog_id()
+            && let Ok(Some(peer_ref)) = peer.to_ref().await
+        {
+            refs.insert(id, peer_ref);
+        }
+    }
+
+    // Sampled by SHAPE, not at random over the whole archive: a uniform sample of
+    // 160k DM lines would be 99% plain text and would say nothing about how a
+    // reply, a forward or a call comes back.
+    let sql = "(SELECT DISTINCT conversation_id, msg_id FROM telegram_reactions \
+                 WHERE removed_at IS NULL ORDER BY RAND() LIMIT 200) \
+               UNION (SELECT conversation_id, msg_id FROM telegram_messages WHERE kind = 'service') \
+               UNION (SELECT conversation_id, msg_id FROM telegram_messages \
+                 WHERE reply_to_msg_id IS NOT NULL ORDER BY RAND() LIMIT 150) \
+               UNION (SELECT conversation_id, msg_id FROM telegram_messages \
+                 WHERE fwd_from_id IS NOT NULL OR fwd_from_name IS NOT NULL) \
+               UNION (SELECT conversation_id, msg_id FROM telegram_messages \
+                 WHERE text LIKE '%http%' ORDER BY RAND() LIMIT 150) \
+               UNION (SELECT conversation_id, msg_id FROM telegram_messages \
+                 WHERE media_kind IS NOT NULL ORDER BY RAND() LIMIT 150) \
+               UNION (SELECT conversation_id, msg_id FROM telegram_messages \
+                 WHERE kind = 'message' ORDER BY RAND() LIMIT 150)";
+    let rows = sqlx::query(AssertSqlSafe(sql)).fetch_all(db.pool()).await?;
+
+    let mut by_conversation: HashMap<i64, Vec<i32>> = HashMap::new();
+    for row in &rows {
+        let conversation_id: i64 = row.try_get("conversation_id")?;
+        let msg_id: i32 = row.try_get("msg_id")?;
+        by_conversation
+            .entry(conversation_id)
+            .or_default()
+            .push(msg_id);
+    }
+
+    let mut seen = 0usize;
+    let mut tally: BTreeMap<String, usize> = BTreeMap::new();
+    let mut note = |tally: &mut BTreeMap<String, usize>, k: &str, on: bool| {
+        if on {
+            *tally.entry(k.to_owned()).or_default() += 1;
+        }
+    };
+
+    for (conversation_id, ids) in &by_conversation {
+        let Some(peer_ref) = refs.get(conversation_id) else {
+            tracing::warn!("conversation {conversation_id} is not in the dialog list; skipped");
+            continue;
+        };
+        // `messages.getMessages` takes at most 100 ids per call.
+        for chunk in ids.chunks(100) {
+            let fetched = client
+                .get_messages_by_id(*peer_ref, chunk)
+                .await
+                .with_context(|| format!("fetching {} ids from {conversation_id}", chunk.len()))?;
+            for message in fetched.into_iter().flatten() {
+                seen += 1;
+                probe_one(&message.raw, &mut tally, &mut note);
+            }
+        }
+    }
+
+    tracing::info!("probed {seen} message(s); fields present:");
+    for (field, n) in &tally {
+        let pct = (*n as f64) * 100.0 / (seen.max(1) as f64);
+        tracing::info!("  {field:<34} {n:>6}  ({pct:.1}%)");
+    }
+    Ok(())
+}
+
+fn probe_one(
+    raw: &grammers_tl_types::enums::Message,
+    tally: &mut BTreeMap<String, usize>,
+    note: &mut impl FnMut(&mut BTreeMap<String, usize>, &str, bool),
+) {
+    use grammers_tl_types::enums::Message as M;
+    match raw {
+        M::Empty(_) => note(tally, "messageEmpty", true),
+        M::Message(m) => {
+            note(tally, "message", true);
+            note(tally, "  entities", m.entities.is_some());
+            note(tally, "  grouped_id (album)", m.grouped_id.is_some());
+            note(tally, "  ttl_period", m.ttl_period.is_some());
+            note(tally, "  via_bot_id", m.via_bot_id.is_some());
+            note(tally, "  pinned", m.pinned);
+            note(tally, "  noforwards", m.noforwards);
+            note(tally, "  silent", m.silent);
+            note(tally, "  media", m.media.is_some());
+            note(tally, "  edit_date", m.edit_date.is_some());
+            note(tally, "  effect", m.effect.is_some());
+            note(tally, "  factcheck", m.factcheck.is_some());
+            if let Some(n) = m.entities.as_ref().map(Vec::len) {
+                *tally
+                    .entry("  entities (total count)".to_owned())
+                    .or_default() += n;
+            }
+            if let Some(r) = &m.reply_to {
+                note(tally, "  reply_to", true);
+                let grammers_tl_types::enums::MessageReplyHeader::Header(r) = r else {
+                    return;
+                };
+                note(tally, "    quote_text", r.quote_text.is_some());
+                note(tally, "    quote_entities", r.quote_entities.is_some());
+                note(
+                    tally,
+                    "    reply_to_peer_id (cross-chat)",
+                    r.reply_to_peer_id.is_some(),
+                );
+                note(tally, "    reply_media", r.reply_media.is_some());
+                note(tally, "    reply_to_top_id", r.reply_to_top_id.is_some());
+            }
+            if let Some(grammers_tl_types::enums::MessageFwdHeader::Header(f)) = &m.fwd_from {
+                note(tally, "  fwd_from", true);
+                note(tally, "    fwd date (always sent)", true);
+                note(tally, "    fwd from_id", f.from_id.is_some());
+                note(tally, "    fwd from_name", f.from_name.is_some());
+                note(tally, "    fwd channel_post", f.channel_post.is_some());
+                note(
+                    tally,
+                    "    fwd saved_from_peer",
+                    f.saved_from_peer.is_some(),
+                );
+                note(tally, "    fwd imported", f.imported);
+            }
+            probe_reactions(m.reactions.as_ref(), tally, note);
+        }
+        M::Service(m) => {
+            note(tally, "messageService", true);
+            note(tally, &format!("  action {}", action_name(&m.action)), true);
+            if let grammers_tl_types::enums::MessageAction::PhoneCall(c) = &m.action {
+                note(tally, "    call duration", c.duration.is_some());
+                note(tally, "    call reason", c.reason.is_some());
+                note(tally, "    call video", c.video);
+            }
+            probe_reactions(m.reactions.as_ref(), tally, note);
+        }
+    }
+}
+
+fn probe_reactions(
+    reactions: Option<&grammers_tl_types::enums::MessageReactions>,
+    tally: &mut BTreeMap<String, usize>,
+    note: &mut impl FnMut(&mut BTreeMap<String, usize>, &str, bool),
+) {
+    let Some(grammers_tl_types::enums::MessageReactions::Reactions(r)) = reactions else {
+        return;
+    };
+    note(tally, "  reactions", true);
+    note(tally, "    reactions.min (partial)", r.min);
+    note(tally, "    reactions.can_see_list", r.can_see_list);
+    // ⚠ THE ONE THE PLAN RESTS ON. If this is rare, per-author capture cannot come
+    // from the message and needs `messages.getMessageReactionsList` — one call per
+    // message rather than one per hundred.
+    note(
+        tally,
+        "    recent_reactions (WHO)",
+        r.recent_reactions.is_some(),
+    );
+    if let Some(recent) = &r.recent_reactions {
+        *tally
+            .entry("    recent_reactions (named, total)".to_owned())
+            .or_default() += recent.len();
+        let counted: i32 = r
+            .results
+            .iter()
+            .map(|c| {
+                let grammers_tl_types::enums::ReactionCount::Count(c) = c;
+                c.count
+            })
+            .sum();
+        note(
+            tally,
+            "    recent_reactions NAMES EVERY REACTOR",
+            i32::try_from(recent.len()).is_ok_and(|n| n >= counted),
+        );
+    }
+}
+
+fn action_name(action: &grammers_tl_types::enums::MessageAction) -> &'static str {
+    use grammers_tl_types::enums::MessageAction as A;
+    match action {
+        A::ChatCreate(_) => "chatCreate",
+        A::ChatEditTitle(_) => "chatEditTitle",
+        A::ChatEditPhoto(_) => "chatEditPhoto",
+        A::ChatAddUser(_) => "chatAddUser",
+        A::ChatDeleteUser(_) => "chatDeleteUser",
+        A::PhoneCall(_) => "phoneCall",
+        A::ContactSignUp => "contactSignUp",
+        A::SetMessagesTtl(_) => "setMessagesTtl",
+        A::GroupCall(_) => "groupCall",
+        A::PinMessage => "pinMessage",
+        _ => "other",
     }
 }
 
