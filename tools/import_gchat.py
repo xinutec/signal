@@ -10,7 +10,13 @@ schema. They share the database only.
 Source is the decoded archive produced by ~/Code/gchat-archive (NOT a Takeout):
 each `conversations/<group_id>.json` has {group_id, name, message_count, messages[]},
 and each message has {msg_id, thread_id, sender_id, sender_name, text, ts, ts_raw,
-reactions[{emoji, count}]}. `sender_name` carries a trailing " (you)" for self.
+reactions[{emoji, count, reactors[{id, name}]}]}. `sender_name` carries a trailing
+" (you)" for self.
+
+⚠ `reactors` is the ONLY record of who reacted — Google Chat's `list_topics`
+gives a reaction as `[emoji, count]` and never an author, so the names come from
+a second rpc sync.py replays and merges into this export. It is budget-capped per
+run, so a reaction with no `reactors` means "not resolved yet", never "nobody".
 
 Idempotent: messages dedupe on (group_id, msg_id) via INSERT IGNORE; conversation
 names and reaction counts are upserted, so re-running picks up a fresh export.
@@ -50,6 +56,14 @@ DDL = [
         UNIQUE KEY uniq_gchat_msg (group_id, msg_id),
         INDEX idx_gchat_conv_ts (group_id, ts_us)
     ) DEFAULT CHARSET=utf8mb4""",
+    """CREATE TABLE IF NOT EXISTS gchat_reaction_authors (
+        id         BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        message_id BIGINT NOT NULL,
+        emoji      VARCHAR(64) NOT NULL,
+        reactor_id VARCHAR(32) NOT NULL,
+        UNIQUE KEY uniq_gchat_reactor (message_id, emoji, reactor_id),
+        INDEX idx_gchat_reactor_msg (message_id)
+    ) DEFAULT CHARSET=utf8mb4""",
     """CREATE TABLE IF NOT EXISTS gchat_reactions (
         id         BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
         message_id BIGINT NOT NULL,
@@ -88,7 +102,8 @@ def main():
         for stmt in DDL:
             cur.execute(stmt)
 
-    stats = {"conversations": 0, "messages": 0, "dups": 0, "reactions": 0, "skipped": 0}
+    stats = {"conversations": 0, "messages": 0, "dups": 0, "reactions": 0,
+             "reactors": 0, "skipped": 0}
     for path in files:
         with open(path) as f:
             conv = json.load(f)
@@ -143,6 +158,27 @@ def main():
                     "INSERT INTO gchat_reactions (message_id, emoji, cnt) VALUES (%s,%s,%s) "
                     "ON DUPLICATE KEY UPDATE cnt=VALUES(cnt)",
                     (message_id, emoji, int(r.get("count") or 0)))
+
+                # ⚠ **WHO reacted, which `list_topics` does NOT give.** A reaction
+                # arrives as [emoji, count]; the names come from a second rpc that
+                # gchat-archive's sync.py replays per reacted message and merges
+                # into this same export as `reactors: [{id, name}]`.
+                #
+                # ⚠ **AN ABSENT `reactors` IS NOT "NOBODY REACTED".** That replay
+                # is budget-capped per run and carries an unfinished backlog on
+                # purpose, so most reaction groups have no names yet and running
+                # the sync again resolves more. Rows are therefore only ever
+                # ADDED here — never cleared to match a short list, which would
+                # discard on every import what the previous one had learned.
+                for who in (r.get("reactors") or []):
+                    rid = who.get("id") if isinstance(who, dict) else who
+                    if not rid:
+                        continue
+                    stats["reactors"] += 1
+                    cur.execute(
+                        "INSERT IGNORE INTO gchat_reaction_authors "
+                        "(message_id, emoji, reactor_id) VALUES (%s,%s,%s)",
+                        (message_id, emoji, str(rid)))
 
     if apply:
         conn.commit()
