@@ -1,0 +1,43 @@
+# Things the archive MUST be able to answer, checked against the live database.
+#
+# ⚠ **THESE ARE POSITIVE CONTROLS, NOT COVERAGE.** On 2026-09-18 four separate
+# absences were reported that the checking method had manufactured: Google Chat
+# "had no replies" (126 existed), the capture was "clean" (it took no
+# attachments at all), Signal "had no read state" (receipts had been discarded
+# for fifteen months), formatting affected "28,000 messages" (1,145). Each null
+# came from a check that could not have produced a positive, and each was
+# written as a fact about the service rather than about the measurement.
+#
+# A row here is an instance Pippijn KNOWS is true, independent of this archive.
+# If the query stops returning it, the pipeline has lost something — and unlike
+# an audit, that failure announces itself. Silence from a check that has never
+# been shown to detect anything is worth nothing.
+#
+# ⚠ **A ROW MUST BE TRUE NOW, NOT EXPECTED TO BECOME TRUE.** The first version of
+# this file asserted that some message carried both a delivery AND a read
+# receipt — plausible, and false: receipt capture had started hours earlier and
+# no message had both yet. It reported LOST on a pipeline that had lost nothing.
+# A control that fails for a reason other than loss teaches the reader to ignore
+# it, which is how a check dies.
+#
+# ⚠ **DO NOT GENERATE ROWS FROM THE DATABASE.** A row derived from the archive
+# tests that the archive agrees with itself, which is the exact failure above.
+# Every row must come from somewhere else: his memory, his phone, the Chat UI.
+#
+# Run:  tools/check_known_truths.py
+# Format: name <TAB> expected <TAB> sql
+#
+name	expect	sql
+gchat: "Me too." answers the message about living long enough	1	SELECT COUNT(*) FROM gchat_messages r JOIN gchat_messages t ON t.group_id=r.group_id AND t.msg_id=r.reply_to_msg_id WHERE r.msg_id='NUy91jT1Uwg' AND t.text LIKE 'I hope I%ll live long enough%'
+gchat: Herve sent pictures too, not only Pippijn	2	SELECT COUNT(*) FROM gchat_attachments a JOIN gchat_messages g ON g.id=a.message_id WHERE g.group_id='_GUE9CAAAAE' AND g.sender_name='Herve Quiroz'
+gchat: that DM carries videos, not only stills	7	SELECT COUNT(*) FROM gchat_attachments a JOIN gchat_messages g ON g.id=a.message_id WHERE g.group_id='_GUE9CAAAAE' AND a.mime='video/mp4'
+gchat: reactions name who reacted	115	SELECT COUNT(*) FROM gchat_reaction_authors
+telegram: calls keep how they ended, not just that they happened	65	SELECT COUNT(*) FROM telegram_calls WHERE reason IS NOT NULL
+telegram: the longest call is most of an hour, not a flag	1	SELECT COUNT(*) FROM telegram_calls WHERE duration_s > 3000
+telegram: reactions name a person	21697	SELECT COUNT(*) FROM telegram_reaction_authors WHERE removed_at IS NULL
+telegram: a forward remembers when the original was written	32	SELECT COUNT(*) FROM telegram_messages WHERE fwd_date IS NOT NULL
+telegram: albums are reconstructable	765	SELECT COUNT(DISTINCT grouped_id) FROM telegram_messages WHERE grouped_id IS NOT NULL
+telegram: Dasha's Thursday messages have a sender	0	SELECT COUNT(*) FROM telegram_messages WHERE conversation_id=308074546 AND sender_name IS NULL AND sent_at > UNIX_TIMESTAMP('2026-09-16')
+signal: a read receipt records WHEN, not just that it happened	1	SELECT COUNT(*) FROM signal_receipts WHERE kind='read' AND when_ts > 0
+signal: a reaction knows who made it	1382	SELECT COUNT(*) FROM reactions WHERE author_uuid IS NOT NULL AND author_uuid <> ''
+irc: the archive goes back to 2013	1	SELECT COUNT(*) FROM irc_messages WHERE sent_at < '2014-01-01' LIMIT 1
