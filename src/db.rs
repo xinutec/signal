@@ -859,7 +859,10 @@ const MIGRATIONS: &[&str] = &[
     r"ALTER TABLE telegram_messages
         ADD COLUMN reply_quote TEXT NULL,
         ADD COLUMN reply_to_peer_id BIGINT NULL",
-    // v36: how far a re-capture has got, so hours of work survive a restart.
+    // v38 (written as v36, and it ran at BOTH — at 36 on the first deploy and
+    // again at 38 after the insertion below shifted it; `IF NOT EXISTS` is why
+    // that cost nothing). How far a re-capture has got, so hours of work survive
+    // a restart.
     //
     // ⚠ **NOT `telegram_backfill_state`, and the difference is the direction.**
     // That table walks OLDER, from `oldest_seen` outward, and is finished when it
@@ -876,7 +879,21 @@ const MIGRATIONS: &[&str] = &[
     // Re-runnable by deleting a row: the next pass re-reads that conversation from
     // the beginning, which costs time and changes nothing, because every write it
     // makes is an enrichment of a NULL.
-    // v37: Signal's delivery and read receipts.
+    // v36 (DEAD — SEE v39). ⚠ **THIS ENTRY NEVER RAN AND NEVER WILL.**
+    //
+    // It was INSERTED here rather than appended, which renumbered the slot
+    // `telegram_recapture_state` had already occupied. `schema_version` had 36
+    // recorded from the earlier deploy, so this statement was skipped, the two
+    // below shifted up by one, and the result went to production as a table that
+    // does not exist while `SELECT MAX(version)` read 39 and looked healthy.
+    //
+    // The rule at the top of this file says append-only, and this is what
+    // breaking it looks like: not an error, not a failed migration — a silent
+    // no-op, and a schema the version number vouches for. Left in place rather
+    // than deleted, because removing it would shift every index after it and
+    // break the next database to migrate from scratch.
+    //
+    // Signal's delivery and read receipts.
     //
     // ⚠ **RICHER THAN TELEGRAM'S AND LESS RECOVERABLE, WHICH IS THE WHOLE
     // POINT.** Telegram gives a high-water mark per conversation and restates it
@@ -909,7 +926,8 @@ const MIGRATIONS: &[&str] = &[
         UNIQUE KEY uniq_signal_receipt (target_ts, author_uuid, kind),
         INDEX idx_signal_receipt_target (target_ts)
     ) DEFAULT CHARSET=utf8mb4",
-    // v38: Signal calls, as the frames that actually arrive.
+    // v37 (labelled v38 when written; it landed at 37). Signal calls, as the
+    // frames that actually arrive.
     //
     // ⚠ **NOT A DURATION, BECAUSE SIGNAL DOES NOT SEND ONE.** Telegram reports a
     // finished call as one service message with `duration` and `reason` already
@@ -943,6 +961,22 @@ const MIGRATIONS: &[&str] = &[
         conversation_id BIGINT NOT NULL PRIMARY KEY,
         through_msg_id INT NOT NULL,
         updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    ) DEFAULT CHARSET=utf8mb4",
+    // v39: Signal's receipts, APPENDED this time.
+    //
+    // The same statement as the dead v36 above. It is here because appending is
+    // the only way to add one: every index below 39 is already in
+    // `schema_version`, so a statement placed anywhere earlier is skipped
+    // regardless of whether it ever ran. See v36's note for what that cost.
+    r"CREATE TABLE IF NOT EXISTS signal_receipts (
+        id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        target_ts BIGINT NOT NULL,
+        author_uuid VARCHAR(64) NOT NULL,
+        kind ENUM('delivery','read','viewed') NOT NULL,
+        when_ts BIGINT NOT NULL,
+        observed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE KEY uniq_signal_receipt (target_ts, author_uuid, kind),
+        INDEX idx_signal_receipt_target (target_ts)
     ) DEFAULT CHARSET=utf8mb4",
 ];
 
