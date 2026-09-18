@@ -863,12 +863,30 @@ async fn follow(
     // conversation simply has no rows for those minutes. It is safe to ask for
     // because a replayed update is free: `(conversation_id, msg_id)` already holds
     // it.
+    //
+    // ⚠ **AND `catch_up` ALONE WAS QUIETLY THROWING MOST OF IT AWAY.** grammers
+    // defaults `update_queue_limit` to 100 and DROPS the excess — `truncate`, not
+    // backpressure — so every restart logged "72 updates were dropped because the
+    // update_queue_limit was exceeded" and then carried on. The two settings work
+    // against each other at exactly the moment they matter: asking for the backlog
+    // and then discarding it past the hundredth is worse than not asking, because
+    // the log reads like a warning about load rather than a report of data loss.
+    //
+    // Messages survive it — the dedupe key makes a re-read free and the sweep
+    // finds them — but READ MARKS do not: Telegram keeps only a current
+    // high-water mark, so a dropped `updateReadHistoryOutbox` is a read event
+    // that never happened as far as this archive is concerned. The hourly sweep
+    // restates where things stand, never the steps in between.
+    //
+    // 10,000 rather than `None`: the buffer is PRE-ALLOCATED, so this is a
+    // deliberate megabyte or so against a 128Mi limit, and an unbounded queue
+    // trades a visible drop for an invisible OOM.
     let mut stream = client
         .stream_updates(
             updates,
             UpdatesConfiguration {
                 catch_up: true,
-                ..Default::default()
+                update_queue_limit: Some(10_000),
             },
         )
         .await
