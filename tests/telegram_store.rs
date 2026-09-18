@@ -20,7 +20,9 @@ use signal_archiver::db::{
     Db, TelegramBackfill, TelegramDeleteScope, TelegramReadDirection, TelegramStored,
 };
 use signal_archiver::telegram::ConvKind;
-use signal_archiver::telegram::map::{MsgKind, PeerSpace, Reaction, Row};
+use signal_archiver::telegram::map::{
+    Call, Entity, MsgKind, PeerSpace, Reaction, ReactionAuthor, Reactions, Row,
+};
 use signal_archiver::telegram::session::DbSession;
 use sqlx::Row as _;
 use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
@@ -86,7 +88,17 @@ fn row(conversation: i64, space: PeerSpace, msg_id: i32, text: &str) -> Row {
         reply_to_msg_id: None,
         fwd_from_id: None,
         fwd_from_name: None,
-        reactions: Vec::new(),
+        fwd_date: None,
+        fwd_channel_post: None,
+        grouped_id: None,
+        via_bot_id: None,
+        ttl_period: None,
+        reply_quote: None,
+        reply_to_peer_id: None,
+        service_action: None,
+        call: None,
+        entities: Vec::new(),
+        reactions: Reactions::default(),
     }
 }
 
@@ -795,4 +807,264 @@ async fn a_read_mark_is_kept_per_advance_and_never_re_dated() {
         Some(140),
         "the outbox mark is untouched by an inbox one"
     );
+}
+
+async fn reaction_authors(
+    pool: &MySqlPool,
+    conversation: i64,
+    msg_id: i32,
+) -> Vec<(i64, String, bool)> {
+    sqlx::query(
+        "SELECT peer_id, COALESCE(emoji, '') AS emoji, removed_at IS NOT NULL AS removed
+           FROM telegram_reaction_authors
+          WHERE conversation_id = ? AND msg_id = ? ORDER BY peer_id, emoji",
+    )
+    .bind(conversation)
+    .bind(msg_id)
+    .fetch_all(pool)
+    .await
+    .expect("read reaction authors")
+    .iter()
+    .map(|r| {
+        (
+            r.get("peer_id"),
+            r.get("emoji"),
+            r.get::<i8, _>("removed") != 0,
+        )
+    })
+    .collect()
+}
+
+fn author(peer_id: i64, emoji: &str, reacted_at: i64) -> ReactionAuthor {
+    ReactionAuthor {
+        peer_id,
+        emoji: Some(emoji.to_owned()),
+        custom_emoji_id: None,
+        reacted_at,
+    }
+}
+
+/// ⚠ **A SAMPLE MUST NOT RETRACT THE PEOPLE IT COULD NOT SEE.**
+///
+/// This is v28's lesson one layer down and easier to get wrong, because a short
+/// list looks like data rather than like absence. Telegram truncates
+/// `recent_reactions` for a message with many reactors, so naming two out of
+/// twenty is not a statement that eighteen people changed their minds.
+///
+/// The complete case is asserted too. Without it this test would pass just as
+/// well if the writer never retracted anybody at all, which is a different bug
+/// with the same green tick.
+#[tokio::test]
+async fn a_sampled_list_of_reactors_retracts_nobody() {
+    let Some((db, pool)) = connect().await else {
+        return;
+    };
+    let id = ids(11);
+    let msg = id.msg_base + 1;
+
+    // Two people, and Telegram says two reacted: a complete statement.
+    db.record_telegram_reaction_authors(
+        id.conversation,
+        msg,
+        &Reactions {
+            counts: Vec::new(),
+            authors: vec![
+                author(101, "👍", 1_700_000_100),
+                author(102, "❤", 1_700_000_200),
+            ],
+            complete: true,
+        },
+    )
+    .await
+    .expect("two reactors");
+    assert_eq!(reaction_authors(&pool, id.conversation, msg).await.len(), 2);
+
+    // Now only 101 is named, but the list is a SAMPLE. 102 is still reacting.
+    db.record_telegram_reaction_authors(
+        id.conversation,
+        msg,
+        &Reactions {
+            counts: Vec::new(),
+            authors: vec![author(101, "👍", 1_700_000_100)],
+            complete: false,
+        },
+    )
+    .await
+    .expect("a sample");
+    assert_eq!(
+        reaction_authors(&pool, id.conversation, msg).await,
+        vec![(101, "👍".to_owned(), false), (102, "❤".to_owned(), false),],
+        "a truncated list may not date anybody"
+    );
+
+    // The same short list, now a COMPLETE statement: 102 really has gone.
+    db.record_telegram_reaction_authors(
+        id.conversation,
+        msg,
+        &Reactions {
+            counts: Vec::new(),
+            authors: vec![author(101, "👍", 1_700_000_100)],
+            complete: true,
+        },
+    )
+    .await
+    .expect("a complete list");
+    assert_eq!(
+        reaction_authors(&pool, id.conversation, msg).await,
+        vec![(101, "👍".to_owned(), false), (102, "❤".to_owned(), true)],
+        "a complete list dates who is missing — and keeps the row"
+    );
+}
+
+/// ⚠ Re-reading a reaction must not restamp WHEN it happened. The first
+/// observation is the one that answers the question; an upsert that wrote
+/// `reacted_at` again would drift the answer forward every re-capture, exactly
+/// as `telegram_read_marks` documents for its own `observed_at`.
+#[tokio::test]
+async fn re_reading_a_reaction_keeps_the_moment_it_happened() {
+    let Some((db, pool)) = connect().await else {
+        return;
+    };
+    let id = ids(12);
+    let msg = id.msg_base + 1;
+
+    let first = Reactions {
+        counts: Vec::new(),
+        authors: vec![author(303, "👍", 1_700_000_100)],
+        complete: true,
+    };
+    db.record_telegram_reaction_authors(id.conversation, msg, &first)
+        .await
+        .expect("first read");
+
+    // A later delivery reports the same reaction with a different date.
+    let later = Reactions {
+        counts: Vec::new(),
+        authors: vec![author(303, "👍", 1_888_888_888)],
+        complete: true,
+    };
+    db.record_telegram_reaction_authors(id.conversation, msg, &later)
+        .await
+        .expect("second read");
+
+    let when: i64 = sqlx::query_scalar(
+        "SELECT reacted_at FROM telegram_reaction_authors
+          WHERE conversation_id = ? AND msg_id = ? AND peer_id = 303",
+    )
+    .bind(id.conversation)
+    .bind(msg)
+    .fetch_one(&pool)
+    .await
+    .expect("read the date");
+    assert_eq!(when, 1_700_000_100, "the first observation stands");
+}
+
+/// ⚠ An entity's identity is its SPAN. Keying on a position in the list would
+/// mean an edit that inserts one bold run at the start renumbers everything
+/// after it, and the writer would date spans that merely moved.
+#[tokio::test]
+async fn an_entity_that_only_moved_is_not_an_entity_that_went_away() {
+    let Some((db, pool)) = connect().await else {
+        return;
+    };
+    let id = ids(13);
+    let msg = id.msg_base + 1;
+
+    let link = Entity {
+        kind: "textUrl",
+        offset_utf16: 4,
+        length_utf16: 4,
+        url: Some("https://example.org/somewhere".to_owned()),
+        user_id: None,
+        language: None,
+        document_id: None,
+    };
+    db.replace_telegram_entities(id.conversation, msg, std::slice::from_ref(&link))
+        .await
+        .expect("one link");
+
+    // An edit puts a bold run in front. The link is now SECOND in the list but
+    // is the same span — had it been keyed by index, it would read as removed.
+    let bold = Entity {
+        kind: "bold",
+        offset_utf16: 0,
+        length_utf16: 3,
+        url: None,
+        user_id: None,
+        language: None,
+        document_id: None,
+    };
+    db.replace_telegram_entities(id.conversation, msg, &[bold, link.clone()])
+        .await
+        .expect("two entities");
+
+    let live: Vec<(String, i32)> = sqlx::query(
+        "SELECT kind, offset_utf16 FROM telegram_message_entities
+          WHERE conversation_id = ? AND msg_id = ? AND removed_at IS NULL
+          ORDER BY offset_utf16",
+    )
+    .bind(id.conversation)
+    .bind(msg)
+    .fetch_all(&pool)
+    .await
+    .expect("read entities")
+    .iter()
+    .map(|r| (r.get("kind"), r.get("offset_utf16")))
+    .collect();
+    assert_eq!(
+        live,
+        vec![("bold".to_owned(), 0), ("textUrl".to_owned(), 4)],
+        "both are current; the link did not move and was not retracted"
+    );
+}
+
+/// ⚠ A call's service message exists from the moment the call STARTS, so an early
+/// delivery has no duration and a later one does. Enriching rather than
+/// overwriting is what stops a re-capture from erasing how long a call took.
+#[tokio::test]
+async fn a_call_learns_its_duration_without_losing_it_again() {
+    let Some((db, pool)) = connect().await else {
+        return;
+    };
+    let id = ids(14);
+    let msg = id.msg_base + 1;
+
+    db.record_telegram_call(
+        id.conversation,
+        msg,
+        &Call {
+            call_id: 5150,
+            duration_s: Some(2_820),
+            reason: Some("hangup"),
+            video: true,
+        },
+    )
+    .await
+    .expect("a finished call");
+
+    // A re-capture that happens to carry no duration must not blank it.
+    db.record_telegram_call(
+        id.conversation,
+        msg,
+        &Call {
+            call_id: 5150,
+            duration_s: None,
+            reason: None,
+            video: true,
+        },
+    )
+    .await
+    .expect("a thinner report");
+
+    let (duration, reason): (Option<i32>, Option<String>) = sqlx::query_as(
+        "SELECT duration_s, reason FROM telegram_calls
+          WHERE conversation_id = ? AND msg_id = ?",
+    )
+    .bind(id.conversation)
+    .bind(msg)
+    .fetch_one(&pool)
+    .await
+    .expect("read the call");
+    assert_eq!(duration, Some(2_820), "47 minutes is not forgotten");
+    assert_eq!(reason.as_deref(), Some("hangup"));
 }

@@ -723,6 +723,142 @@ const MIGRATIONS: &[&str] = &[
         observed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
         UNIQUE KEY uniq_tg_read (conversation_id, direction, max_id)
     ) DEFAULT CHARSET=utf8mb4",
+    // v30: WHICH PERSON reacted, and when.
+    //
+    // ⚠ **v17 says Telegram hands over a count rather than a list of people. That
+    // was wrong, and it cost 21,696 reactions their authors.** `messageReactions`
+    // carries `recent_reactions: Vector<MessagePeerReaction>` in the same struct
+    // whose `results` the aggregate was read from — `{peer_id, date, reaction}`,
+    // arriving free with every message already being fetched. Measured over 901
+    // messages on 2026-09-18: present on 295 of 296 reacted messages, and naming
+    // EVERY reactor on all 295, not merely the most recent few.
+    //
+    // The aggregate in `telegram_reactions` STAYS. The two are different facts and
+    // the count is the authoritative one: `results` is a complete tally by
+    // construction, while `recent_reactions` is a list Telegram may truncate.
+    //
+    // ⚠ **A SHORT LIST IS NOT A RETRACTION.** The rule mirrors v28's, one step
+    // sharper. An absent `recent_reactions` says nothing at all. A present one is a
+    // complete statement ONLY when it names at least as many reactors as `results`
+    // counts; below that it has been truncated, and dating the unnamed would
+    // invent removals for people who are still there. So a short list upserts what
+    // it names and retracts nothing. Everything in this archive reacts alone today,
+    // so the truncated case is untested by the data and guarded by a test instead.
+    //
+    // `reacted_at` is Telegram's own `date` on the peer reaction — unlike
+    // `telegram_read_marks.observed_at`, this one really is when the person acted.
+    // `reaction_key` is generated exactly as v17 explains at length; read that
+    // entry before touching the spelling here.
+    r"CREATE TABLE IF NOT EXISTS telegram_reaction_authors (
+        id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        conversation_id BIGINT NOT NULL,
+        msg_id INT NOT NULL,
+        peer_id BIGINT NOT NULL,
+        emoji VARCHAR(32) NULL,
+        custom_emoji_id BIGINT NULL,
+        reaction_key VARCHAR(64) GENERATED ALWAYS AS
+            (COALESCE(emoji, CONCAT('custom:', custom_emoji_id), '')) STORED,
+        reacted_at BIGINT NOT NULL,
+        removed_at TIMESTAMP NULL,
+        UNIQUE KEY uniq_tg_reaction_author (conversation_id, msg_id, peer_id, reaction_key),
+        KEY idx_tg_reaction_author_peer (peer_id)
+    ) DEFAULT CHARSET=utf8mb4",
+    // v31: the formatting, and the LINKS THAT ARE NOT IN THE TEXT.
+    //
+    // ⚠ **THIS IS CONTENT LOSS, NOT DECORATION.** `messageEntityTextUrl` carries a
+    // url the visible text does not contain — "see here" linking somewhere is
+    // stored as the word "here" and nothing else. Same for `messageEntityMentionName`,
+    // whose user id is the only record of who was meant. Measured at 17.8% of
+    // messages, which over this archive is on the order of 28,000.
+    //
+    // ⚠ **`offset` AND `length` ARE UTF-16 CODE UNITS.** Not bytes, not Rust chars.
+    // Every emoji outside the BMP counts as TWO, so slicing a Rust string by these
+    // numbers silently misplaces every span after the first emoji — and this is a
+    // chat archive, where that is most of them. The columns are named for the unit
+    // so the next reader cannot use them innocently.
+    //
+    // Identity is the SPAN, not a position in the list. Keying on an index would
+    // mean that an edit inserting one bold run at the start renumbers everything
+    // after it, and the dating below would then record removals that never
+    // happened. A span is what an entity actually is.
+    r"CREATE TABLE IF NOT EXISTS telegram_message_entities (
+        id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        conversation_id BIGINT NOT NULL,
+        msg_id INT NOT NULL,
+        kind VARCHAR(32) NOT NULL,
+        offset_utf16 INT NOT NULL,
+        length_utf16 INT NOT NULL,
+        url TEXT NULL,
+        user_id BIGINT NULL,
+        language VARCHAR(32) NULL,
+        document_id BIGINT NULL,
+        removed_at TIMESTAMP NULL,
+        UNIQUE KEY uniq_tg_entity (conversation_id, msg_id, kind, offset_utf16, length_utf16)
+    ) DEFAULT CHARSET=utf8mb4",
+    // v32: WHICH event a service message was.
+    //
+    // ⚠ **`telegram_messages.text` for a service message is OUR ENGLISH, not
+    // Telegram's.** `describe_action` maps the action to a phrase, and its final arm
+    // is `_ => "an event"` — so an action this archive had never seen was stored as
+    // two words that name nothing, unrecoverably. This column holds the TL
+    // constructor name, which is the identity rather than a rendering, so an
+    // unhandled action is still exactly identifiable afterwards.
+    r"ALTER TABLE telegram_messages
+        ADD COLUMN service_action VARCHAR(64) NULL",
+    // v33: how long the call was, and how it ended.
+    //
+    // ⚠ **65 CALLS WERE STORED AS THE WORDS "a call".** `messageActionPhoneCall`
+    // carries `duration`, `video` and `reason` — busy, hangup, missed, disconnect —
+    // and `describe_action` returns `&'static str`, so all of it was discarded at
+    // the mapper. In a personal archive the fact that a call happened is the least
+    // interesting part of it.
+    //
+    // A table rather than columns on `telegram_messages`, because these are facts
+    // about a call and only 0.05% of rows are one. Measured 2026-09-18: `reason` on
+    // 65 of 65, `duration` on 38 — an unanswered call has no duration, which is
+    // itself the record of it being unanswered.
+    r"CREATE TABLE IF NOT EXISTS telegram_calls (
+        id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        conversation_id BIGINT NOT NULL,
+        msg_id INT NOT NULL,
+        call_id BIGINT NULL,
+        duration_s INT NULL,
+        reason VARCHAR(32) NULL,
+        video TINYINT(1) NOT NULL DEFAULT 0,
+        UNIQUE KEY uniq_tg_call (conversation_id, msg_id)
+    ) DEFAULT CHARSET=utf8mb4",
+    // v34: four facts the message already carried.
+    //
+    // `grouped_id` is the ALBUM: without it a set of photos sent together is N
+    // unrelated messages, and nothing can put them back. 4.0% of messages.
+    //
+    // ⚠ `fwd_date` is when the ORIGINAL was written, and it is NOT optional in the
+    // header — `messageFwdHeader` has `date:int` outright. A forward stored with
+    // only the forwarder's clock says a thing was said today that was said years
+    // ago. `fwd_channel_post` is the original's id in its channel.
+    //
+    // `ttl_period` is the disappearing-message timer, which is the only explanation
+    // an archive can offer for why a conversation has holes.
+    r"ALTER TABLE telegram_messages
+        ADD COLUMN grouped_id BIGINT NULL,
+        ADD COLUMN fwd_date BIGINT NULL,
+        ADD COLUMN fwd_channel_post INT NULL,
+        ADD COLUMN via_bot_id BIGINT NULL,
+        ADD COLUMN ttl_period INT NULL",
+    // v35: WHICH PART of the message was replied to.
+    //
+    // Telegram lets a reply quote a fragment rather than the whole message, and
+    // `reply_to_msg_id` alone cannot express that — the archive would show a reply
+    // to a long message with no way to tell which sentence it answered.
+    // `quote_text` is that fragment, verbatim.
+    //
+    // `reply_to_peer_id` is a reply reaching into ANOTHER conversation, normalised
+    // the way every other peer here is. Without it such a reply points at a
+    // `msg_id` that does not exist in its own conversation, which reads as a
+    // dangling reference rather than a cross-chat one.
+    r"ALTER TABLE telegram_messages
+        ADD COLUMN reply_quote TEXT NULL,
+        ADD COLUMN reply_to_peer_id BIGINT NULL",
 ];
 
 #[derive(Clone)]
@@ -1151,8 +1287,11 @@ impl Db {
             "INSERT IGNORE INTO telegram_messages
                 (conversation_id, msg_id, sent_at, sender_id, sender_name,
                  is_outgoing, kind, text, media_kind, media_size, media_mime,
-                 edited_at, edit_hidden, reply_to_msg_id, fwd_from_id, fwd_from_name)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 edited_at, edit_hidden, reply_to_msg_id, fwd_from_id, fwd_from_name,
+                 fwd_date, fwd_channel_post, grouped_id, via_bot_id, ttl_period,
+                 reply_quote, reply_to_peer_id, service_action)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                     ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(row.conversation_id)
         .bind(row.msg_id)
@@ -1170,6 +1309,14 @@ impl Db {
         .bind(row.reply_to_msg_id)
         .bind(row.fwd_from_id)
         .bind(row.fwd_from_name.as_deref())
+        .bind(row.fwd_date)
+        .bind(row.fwd_channel_post)
+        .bind(row.grouped_id)
+        .bind(row.via_bot_id)
+        .bind(row.ttl_period)
+        .bind(row.reply_quote.as_deref())
+        .bind(row.reply_to_peer_id)
+        .bind(row.service_action)
         .execute(&self.pool)
         .await?;
         if inserted.rows_affected() != 0 {
@@ -1206,6 +1353,13 @@ impl Db {
         //
         // The lesson generalises past this row — **a column that can be NULL for a
         // reason OTHER than "the message does not have one" needs to be here.**
+        //
+        // ⚠ **v30–v35 ARE ALL HERE, AND THAT IS NOT OPTIONAL.** Every one of those
+        // columns is NULL on all 159,956 rows stored before it existed, which is
+        // precisely the "NULL for a reason other than the message not having one"
+        // case above. Leaving any of them out would mean a column the re-capture
+        // pass could never fill — the failure `sender_name` already demonstrated
+        // once, silently, for months.
         let enriched = sqlx::query(
             "UPDATE telegram_messages
                 SET media_kind = COALESCE(media_kind, ?),
@@ -1214,7 +1368,15 @@ impl Db {
                     edit_hidden = COALESCE(edit_hidden, ?),
                     fwd_from_id = COALESCE(fwd_from_id, ?),
                     fwd_from_name = COALESCE(fwd_from_name, ?),
-                    sender_name = COALESCE(sender_name, ?)
+                    sender_name = COALESCE(sender_name, ?),
+                    fwd_date = COALESCE(fwd_date, ?),
+                    fwd_channel_post = COALESCE(fwd_channel_post, ?),
+                    grouped_id = COALESCE(grouped_id, ?),
+                    via_bot_id = COALESCE(via_bot_id, ?),
+                    ttl_period = COALESCE(ttl_period, ?),
+                    reply_quote = COALESCE(reply_quote, ?),
+                    reply_to_peer_id = COALESCE(reply_to_peer_id, ?),
+                    service_action = COALESCE(service_action, ?)
               WHERE conversation_id = ? AND msg_id = ?
                 AND ((media_size IS NULL AND ? IS NOT NULL)
                   OR (media_mime IS NULL AND ? IS NOT NULL)
@@ -1222,6 +1384,14 @@ impl Db {
                   OR (fwd_from_id IS NULL AND ? IS NOT NULL)
                   OR (fwd_from_name IS NULL AND ? IS NOT NULL)
                   OR (sender_name IS NULL AND ? IS NOT NULL)
+                  OR (fwd_date IS NULL AND ? IS NOT NULL)
+                  OR (fwd_channel_post IS NULL AND ? IS NOT NULL)
+                  OR (grouped_id IS NULL AND ? IS NOT NULL)
+                  OR (via_bot_id IS NULL AND ? IS NOT NULL)
+                  OR (ttl_period IS NULL AND ? IS NOT NULL)
+                  OR (reply_quote IS NULL AND ? IS NOT NULL)
+                  OR (reply_to_peer_id IS NULL AND ? IS NOT NULL)
+                  OR (service_action IS NULL AND ? IS NOT NULL)
                   OR edit_hidden IS NULL)",
         )
         .bind(row.media_kind.map(|m| m.as_str()))
@@ -1231,6 +1401,14 @@ impl Db {
         .bind(row.fwd_from_id)
         .bind(row.fwd_from_name.as_deref())
         .bind(sender_name)
+        .bind(row.fwd_date)
+        .bind(row.fwd_channel_post)
+        .bind(row.grouped_id)
+        .bind(row.via_bot_id)
+        .bind(row.ttl_period)
+        .bind(row.reply_quote.as_deref())
+        .bind(row.reply_to_peer_id)
+        .bind(row.service_action)
         .bind(row.conversation_id)
         .bind(row.msg_id)
         .bind(row.media_size)
@@ -1239,6 +1417,14 @@ impl Db {
         .bind(row.fwd_from_id)
         .bind(row.fwd_from_name.as_deref())
         .bind(sender_name)
+        .bind(row.fwd_date)
+        .bind(row.fwd_channel_post)
+        .bind(row.grouped_id)
+        .bind(row.via_bot_id)
+        .bind(row.ttl_period)
+        .bind(row.reply_quote.as_deref())
+        .bind(row.reply_to_peer_id)
+        .bind(row.service_action)
         .execute(&self.pool)
         .await?
         .rows_affected()
@@ -1390,6 +1576,191 @@ impl Db {
         q.execute(&mut *tx).await?;
 
         tx.commit().await?;
+        Ok(())
+    }
+
+    /// Record WHO reacted, without letting a truncated list retract anybody.
+    ///
+    /// ⚠ **The rule is [`crate::telegram::map::Reactions::complete`], and it is NOT
+    /// the aggregate's rule.** `replace_telegram_reactions` may retract whenever it
+    /// is given a non-empty set, because `results` is a complete tally by
+    /// construction.
+    /// `recent_reactions` is a SAMPLE: Telegram truncates it for a message with
+    /// many reactors, so a list of three when the tally says twenty must mark
+    /// nothing at all. Dating the seventeen it could not see would invent
+    /// removals for people who are still there — the same error v28 fixed, one
+    /// layer down and easier to make, because here the short list looks like data
+    /// rather than like absence.
+    ///
+    /// Everything in this archive reacts alone today, so the truncated branch is
+    /// exercised by a test rather than by the data.
+    pub async fn record_telegram_reaction_authors(
+        &self,
+        conversation_id: i64,
+        msg_id: i32,
+        reactions: &crate::telegram::map::Reactions,
+    ) -> Result<()> {
+        if reactions.authors.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await?;
+
+        // ⚠ `reacted_at` is NOT in the update list. Telegram reports the date of
+        // the reaction as it currently stands, and re-reading the same reaction
+        // must not restamp it — the first observation is the one that answers
+        // "when did they do this?". A reaction taken back and put again is the
+        // same row by key, and the `removed_at = NULL` is what says it is current
+        // once more.
+        for a in &reactions.authors {
+            sqlx::query(
+                "INSERT INTO telegram_reaction_authors
+                    (conversation_id, msg_id, peer_id, emoji, custom_emoji_id, reacted_at)
+                 VALUES (?, ?, ?, ?, ?, ?)
+                 ON DUPLICATE KEY UPDATE removed_at = NULL",
+            )
+            .bind(conversation_id)
+            .bind(msg_id)
+            .bind(a.peer_id)
+            .bind(a.emoji.as_deref())
+            .bind(a.custom_emoji_id)
+            .bind(a.reacted_at)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        if reactions.complete {
+            // Matched on `(peer_id, reaction_key)` for the reason v17 and
+            // `replace_telegram_reactions` both give: `reaction_key` is the only
+            // non-null identity a reaction has, and `NOT IN` over a nullable
+            // column is never true for anything.
+            let keep = reactions
+                .authors
+                .iter()
+                .map(|a| {
+                    let key = match (&a.emoji, a.custom_emoji_id) {
+                        (Some(e), _) => e.clone(),
+                        (None, Some(id)) => format!("custom:{id}"),
+                        (None, None) => String::new(),
+                    };
+                    (a.peer_id, key)
+                })
+                .collect::<Vec<_>>();
+            let placeholders = vec!["(?,?)"; keep.len()].join(",");
+            let sql = format!(
+                "UPDATE telegram_reaction_authors SET removed_at = CURRENT_TIMESTAMP
+                  WHERE conversation_id = ? AND msg_id = ? AND removed_at IS NULL
+                    AND (peer_id, reaction_key) NOT IN ({placeholders})",
+            );
+            // Fixed template, computed placeholder count, every value bound.
+            let mut q = sqlx::query(AssertSqlSafe(sql))
+                .bind(conversation_id)
+                .bind(msg_id);
+            for (peer_id, key) in &keep {
+                q = q.bind(peer_id).bind(key);
+            }
+            q.execute(&mut *tx).await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Record the formatting and the links the text does not carry.
+    ///
+    /// ⚠ **An empty list is not evidence of removal**, the same asymmetry as
+    /// everywhere else here: a message with no formatting and a delivery that did
+    /// not mention entities arrive identically, as `None` flattened to nothing.
+    /// So an empty list marks nothing, and only a non-empty one — which is a
+    /// complete statement of the current text's spans — may date what is missing.
+    ///
+    /// ⚠ **Identity is the SPAN, not a position.** An edit that inserts a bold run
+    /// at the start renumbers every entity after it, so keying on an index would
+    /// date spans that merely moved. See migration v31.
+    pub async fn replace_telegram_entities(
+        &self,
+        conversation_id: i64,
+        msg_id: i32,
+        entities: &[crate::telegram::map::Entity],
+    ) -> Result<()> {
+        if entities.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await?;
+
+        for e in entities {
+            sqlx::query(
+                "INSERT INTO telegram_message_entities
+                    (conversation_id, msg_id, kind, offset_utf16, length_utf16,
+                     url, user_id, language, document_id)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ON DUPLICATE KEY UPDATE
+                    url = VALUES(url), user_id = VALUES(user_id),
+                    language = VALUES(language), document_id = VALUES(document_id),
+                    removed_at = NULL",
+            )
+            .bind(conversation_id)
+            .bind(msg_id)
+            .bind(e.kind)
+            .bind(e.offset_utf16)
+            .bind(e.length_utf16)
+            .bind(e.url.as_deref())
+            .bind(e.user_id)
+            .bind(e.language.as_deref())
+            .bind(e.document_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        let placeholders = vec!["(?,?,?)"; entities.len()].join(",");
+        let sql = format!(
+            "UPDATE telegram_message_entities SET removed_at = CURRENT_TIMESTAMP
+              WHERE conversation_id = ? AND msg_id = ? AND removed_at IS NULL
+                AND (kind, offset_utf16, length_utf16) NOT IN ({placeholders})",
+        );
+        // Fixed template, computed placeholder count, every value bound.
+        let mut q = sqlx::query(AssertSqlSafe(sql))
+            .bind(conversation_id)
+            .bind(msg_id);
+        for e in entities {
+            q = q.bind(e.kind).bind(e.offset_utf16).bind(e.length_utf16);
+        }
+        q.execute(&mut *tx).await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Record how long a call was and how it ended.
+    ///
+    /// ⚠ **`duration_s` is enriched, never overwritten with NULL.** A call's
+    /// service message can be delivered before the call ends — it is created when
+    /// the call starts — so a later read is the one that knows how long it took.
+    /// A plain upsert would let an early re-delivery erase a duration already
+    /// learned, which is `COALESCE`'s job here and the same shape as the message
+    /// enrichment above.
+    pub async fn record_telegram_call(
+        &self,
+        conversation_id: i64,
+        msg_id: i32,
+        call: &crate::telegram::map::Call,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO telegram_calls
+                (conversation_id, msg_id, call_id, duration_s, reason, video)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE
+                duration_s = COALESCE(duration_s, VALUES(duration_s)),
+                reason = COALESCE(reason, VALUES(reason)),
+                video = VALUES(video)",
+        )
+        .bind(conversation_id)
+        .bind(msg_id)
+        .bind(call.call_id)
+        .bind(call.duration_s)
+        .bind(call.reason)
+        .bind(call.video)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 

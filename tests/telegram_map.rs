@@ -10,7 +10,7 @@
 
 use grammers_tl_types as tl;
 use signal_archiver::telegram::map::{
-    MediaKind, MsgKind, PeerSpace, Reaction, Row, map_message, normalise_peer,
+    MediaKind, MsgKind, PeerSpace, Reaction, ReactionAuthor, Row, map_message, normalise_peer,
 };
 
 /// The logged-in account, in every test below.
@@ -345,8 +345,9 @@ fn a_custom_reaction_keeps_its_id_instead_of_an_emoji() {
         )),
         ..dm()
     };
+    let got = mapped(reacted).reactions;
     assert_eq!(
-        mapped(reacted).reactions,
+        got.counts,
         vec![
             Reaction {
                 emoji: Some("👍".to_owned()),
@@ -362,6 +363,11 @@ fn a_custom_reaction_keeps_its_id_instead_of_an_emoji() {
             },
         ]
     );
+    // ⚠ `recent_reactions: None` — Telegram named nobody, so the archive knows
+    // nobody, and four counted reactions with zero names is the clearest possible
+    // case of a list that must not retract anyone.
+    assert_eq!(got.authors, vec![]);
+    assert!(!got.complete);
 }
 
 /// `edit_date` is the only ordering an edit chain has, so it has to reach the row
@@ -508,6 +514,33 @@ fn an_edit_telegram_asks_us_to_hide_is_recorded_but_marked_hidden() {
 }
 
 /// A forward header, with only the fields any one case needs set.
+/// The date every [`fwd`] header carries, named so a test can say that the
+/// forward's clock and the forwarder's are different numbers.
+const FWD_DATE: i64 = 1_699_000_000;
+
+/// A service message carrying one action, for the tests that are about the
+/// action rather than about the envelope.
+fn service(action: tl::enums::MessageAction) -> tl::enums::Message {
+    tl::enums::Message::Service(tl::types::MessageService {
+        out: false,
+        mentioned: false,
+        media_unread: false,
+        reactions_are_possible: false,
+        silent: false,
+        post: false,
+        legacy: false,
+        id: 9003,
+        from_id: Some(user(THEM)),
+        peer_id: user(THEM),
+        saved_peer_id: None,
+        reply_to: None,
+        date: 1_700_000_300,
+        action,
+        reactions: None,
+        ttl_period: None,
+    })
+}
+
 fn fwd(
     from_id: Option<tl::enums::Peer>,
     from_name: Option<String>,
@@ -593,4 +626,185 @@ fn an_empty_forward_name_is_no_name() {
 fn a_message_that_was_not_forwarded_carries_neither_half() {
     let row = mapped(dm());
     assert_eq!((row.fwd_from_id, row.fwd_from_name), (None, None));
+}
+
+/// Build a reactions block with a tally and a (possibly short) list of names.
+fn reacted(counts: &[(&str, i32)], names: &[(i64, &str, i32)]) -> tl::enums::MessageReactions {
+    tl::enums::MessageReactions::Reactions(tl::types::MessageReactions {
+        min: false,
+        can_see_list: true,
+        reactions_as_tags: false,
+        results: counts
+            .iter()
+            .map(|(emoticon, count)| {
+                tl::enums::ReactionCount::Count(tl::types::ReactionCount {
+                    chosen_order: None,
+                    reaction: tl::enums::Reaction::Emoji(tl::types::ReactionEmoji {
+                        emoticon: (*emoticon).to_owned(),
+                    }),
+                    count: *count,
+                })
+            })
+            .collect(),
+        recent_reactions: Some(
+            names
+                .iter()
+                .map(|(peer, emoticon, date)| {
+                    tl::enums::MessagePeerReaction::Reaction(tl::types::MessagePeerReaction {
+                        big: false,
+                        unread: false,
+                        my: false,
+                        peer_id: user(*peer),
+                        date: *date,
+                        reaction: tl::enums::Reaction::Emoji(tl::types::ReactionEmoji {
+                            emoticon: (*emoticon).to_owned(),
+                        }),
+                    })
+                })
+                .collect(),
+        ),
+        top_reactors: None,
+    })
+}
+
+/// ⚠ **The one that decides whether anybody may be retracted.**
+///
+/// Telegram samples `recent_reactions` when a message has many reactors. A list
+/// that names three of twenty is not a statement that seventeen people stopped
+/// reacting, and the archive may only date what a COMPLETE list omits.
+///
+/// Both directions are asserted, because only the pair pins the rule: a list
+/// that covers the tally is complete, and the same list against a larger tally
+/// is not. Asserting the complete case alone would pass just as well if
+/// `complete` were hardcoded `true`.
+#[test]
+fn a_truncated_list_of_reactors_is_not_a_complete_one() {
+    let full = tl::types::Message {
+        reactions: Some(reacted(&[("👍", 2)], &[(1, "👍", 111), (2, "👍", 222)])),
+        ..dm()
+    };
+    let got = mapped(full).reactions;
+    assert_eq!(got.authors.len(), 2);
+    assert!(got.complete, "two names for a tally of two names everybody");
+
+    // Same two names, but Telegram counted twenty. The eighteen it did not list
+    // are still there.
+    let sampled = tl::types::Message {
+        reactions: Some(reacted(&[("👍", 20)], &[(1, "👍", 111), (2, "👍", 222)])),
+        ..dm()
+    };
+    let got = mapped(sampled).reactions;
+    assert_eq!(got.authors.len(), 2);
+    assert!(
+        !got.complete,
+        "two names for a tally of twenty is a SAMPLE, and must retract nobody"
+    );
+}
+
+/// A reactor is a person and a moment, and the moment is Telegram's own.
+#[test]
+fn a_reaction_carries_who_and_when() {
+    let m = tl::types::Message {
+        reactions: Some(reacted(&[("❤", 1)], &[(THEM, "❤", 1_700_000_500)])),
+        ..dm()
+    };
+    let got = mapped(m).reactions;
+    assert_eq!(
+        got.authors,
+        vec![ReactionAuthor {
+            peer_id: THEM,
+            emoji: Some("❤".to_owned()),
+            custom_emoji_id: None,
+            reacted_at: 1_700_000_500,
+        }]
+    );
+    assert!(got.complete);
+}
+
+/// ⚠ The url a `textUrl` carries is NOT in the text, which is the whole reason
+/// entities are stored: dropping them loses where a link went.
+#[test]
+fn a_link_keeps_the_address_the_words_do_not_say() {
+    let m = tl::types::Message {
+        message: "see here".to_owned(),
+        entities: Some(vec![
+            tl::enums::MessageEntity::Bold(tl::types::MessageEntityBold {
+                offset: 0,
+                length: 3,
+            }),
+            tl::enums::MessageEntity::TextUrl(tl::types::MessageEntityTextUrl {
+                offset: 4,
+                length: 4,
+                url: "https://example.org/somewhere".to_owned(),
+            }),
+        ]),
+        ..dm()
+    };
+    let got = mapped(m).entities;
+    assert_eq!(got.len(), 2);
+    assert_eq!(got[0].kind, "bold");
+    assert_eq!(got[0].url, None);
+    assert_eq!(got[1].kind, "textUrl");
+    assert_eq!(got[1].offset_utf16, 4);
+    assert_eq!(
+        got[1].url.as_deref(),
+        Some("https://example.org/somewhere"),
+        "the address is nowhere in the eight characters of the message"
+    );
+}
+
+/// ⚠ A call that nobody answered has NO duration, and that absence is the record
+/// of it not being answered — storing a zero would claim a call of no length
+/// actually took place.
+#[test]
+fn an_unanswered_call_is_a_reason_without_a_duration() {
+    let missed = service(tl::enums::MessageAction::PhoneCall(
+        tl::types::MessageActionPhoneCall {
+            video: false,
+            call_id: 77,
+            reason: Some(tl::enums::PhoneCallDiscardReason::Missed),
+            duration: None,
+        },
+    ));
+    let row = map_message(&missed, SELF_ID).expect("a service message is storable");
+    assert_eq!(row.service_action, Some("phoneCall"));
+    let call = row.call.expect("a phone call action carries a call");
+    assert_eq!(call.reason, Some("missed"));
+    assert_eq!(call.duration_s, None);
+    assert!(!call.video);
+
+    let answered = service(tl::enums::MessageAction::PhoneCall(
+        tl::types::MessageActionPhoneCall {
+            video: true,
+            call_id: 78,
+            reason: Some(tl::enums::PhoneCallDiscardReason::Hangup),
+            duration: Some(2_820),
+        },
+    ));
+    let call = map_message(&answered, SELF_ID)
+        .expect("storable")
+        .call
+        .expect("a call");
+    assert_eq!(call.duration_s, Some(2_820));
+    assert_eq!(call.reason, Some("hangup"));
+    assert!(call.video);
+}
+
+/// ⚠ `messageFwdHeader.date` is when the ORIGINAL was written. A forward kept
+/// with only `sent_at` says a thing was said today that was said years ago.
+#[test]
+fn a_forward_remembers_when_the_original_was_written() {
+    let m = tl::types::Message {
+        fwd_from: Some(fwd(Some(user(THEM)), None, None)),
+        date: 1_700_000_000,
+        ..dm()
+    };
+    let row = mapped(m);
+    assert_eq!(row.sent_at, 1_700_000_000);
+    assert_eq!(
+        row.fwd_date,
+        Some(FWD_DATE),
+        "the forward's own clock, not the forwarder's"
+    );
+    assert_ne!(row.sent_at, row.fwd_date.unwrap());
 }

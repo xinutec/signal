@@ -122,6 +122,72 @@ pub struct Reaction {
     pub chosen: bool,
 }
 
+/// WHO reacted, and when they did it.
+///
+/// ⚠ **The list this comes from can be TRUNCATED, and [`Reactions::complete`] is
+/// how you know.** Telegram returns `recent_reactions` as a sample when a message
+/// has many reactors, so a name missing from it is not a name that is gone. See
+/// migration v30.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReactionAuthor {
+    /// Normalised the way `conversation_id` and `sender_id` are.
+    pub peer_id: i64,
+    pub emoji: Option<String>,
+    pub custom_emoji_id: Option<i64>,
+    /// Unix seconds, from Telegram. Genuinely when they reacted, not when we saw
+    /// it — contrast `telegram_read_marks.observed_at`.
+    pub reacted_at: i64,
+}
+
+/// What a message's reactions amount to: the tally, and who — if Telegram said.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Reactions {
+    /// One bucket per distinct reaction, with its count. Authoritative.
+    pub counts: Vec<Reaction>,
+    pub authors: Vec<ReactionAuthor>,
+    /// Whether `authors` names EVERY reactor the counts add up to.
+    ///
+    /// ⚠ **Only a complete list may retract anybody.** False here means the store
+    /// must upsert what it has and date nothing, because the people it cannot see
+    /// are still reacting.
+    pub complete: bool,
+}
+
+/// One formatted span: bold, a link, a mention, a spoiler.
+///
+/// ⚠ **`offset` and `length` are UTF-16 CODE UNITS**, so they cannot index a Rust
+/// string. See migration v31 — this is the field most likely to be used
+/// innocently and wrongly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entity {
+    /// The TL constructor's name, less the `messageEntity` prefix: `bold`,
+    /// `textUrl`, `spoiler`.
+    pub kind: &'static str,
+    pub offset_utf16: i32,
+    pub length_utf16: i32,
+    /// ⚠ The whole reason this table exists: a `textUrl` links somewhere the
+    /// visible text does not say.
+    pub url: Option<String>,
+    /// Who a `mentionName` meant, which the text does not carry either.
+    pub user_id: Option<i64>,
+    /// A `pre` block's syntax, when it declares one.
+    pub language: Option<String>,
+    /// A `customEmoji`'s document id.
+    pub document_id: Option<i64>,
+}
+
+/// A call, as the service message describes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Call {
+    pub call_id: i64,
+    /// ⚠ `None` is not a zero-length call: an unanswered one has no duration at
+    /// all, and that absence IS the record of it not being answered.
+    pub duration_s: Option<i32>,
+    /// `busy`, `hangup`, `missed` or `disconnect`.
+    pub reason: Option<&'static str>,
+    pub video: bool,
+}
+
 /// A message as the archive stores it, less the parts that need a peer map.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
@@ -173,7 +239,30 @@ pub struct Row {
     /// forward whose sender is only a peer id has this NULL and
     /// [`Row::fwd_from_id`] set.
     pub fwd_from_name: Option<String>,
-    pub reactions: Vec<Reaction>,
+    /// ⚠ When the ORIGINAL was written, in unix seconds. A forward stored with
+    /// only `sent_at` claims a thing was said today that was said years ago.
+    /// `messageFwdHeader` sends this outright — it is not behind a flag.
+    pub fwd_date: Option<i64>,
+    /// The original's id inside the channel it was posted to.
+    pub fwd_channel_post: Option<i32>,
+    /// Which album this message belongs to, if it was sent as one. Without it a
+    /// set of photos sent together is N unrelated messages.
+    pub grouped_id: Option<i64>,
+    pub via_bot_id: Option<i64>,
+    /// The disappearing-message timer, and so the only account this archive can
+    /// give of why a conversation has holes.
+    pub ttl_period: Option<i32>,
+    /// The FRAGMENT a reply quoted, when it answered part rather than all.
+    pub reply_quote: Option<String>,
+    /// A reply reaching into another conversation, normalised like every peer
+    /// here. Without it the `reply_to_msg_id` looks dangling.
+    pub reply_to_peer_id: Option<i64>,
+    /// The TL constructor's name for a service message's action — the identity,
+    /// where `text` holds only our English rendering of it.
+    pub service_action: Option<&'static str>,
+    pub call: Option<Call>,
+    pub entities: Vec<Entity>,
+    pub reactions: Reactions,
 }
 
 /// Fold one of Telegram's three peer spaces into the single signed space the
@@ -249,6 +338,16 @@ pub fn map_message(msg: &tl::enums::Message, self_id: i64) -> Option<Row> {
                 reply_to_msg_id: m.reply_to.as_ref().and_then(reply_target),
                 fwd_from_id: m.fwd_from.as_ref().and_then(fwd_peer),
                 fwd_from_name: m.fwd_from.as_ref().and_then(fwd_name),
+                fwd_date: m.fwd_from.as_ref().map(fwd_date),
+                fwd_channel_post: m.fwd_from.as_ref().and_then(fwd_channel_post),
+                grouped_id: m.grouped_id,
+                via_bot_id: m.via_bot_id,
+                ttl_period: m.ttl_period,
+                reply_quote: m.reply_to.as_ref().and_then(reply_quote),
+                reply_to_peer_id: m.reply_to.as_ref().and_then(reply_peer),
+                service_action: None,
+                call: None,
+                entities: m.entities.as_deref().map(entities).unwrap_or_default(),
                 reactions: m.reactions.as_ref().map(reactions).unwrap_or_default(),
             })
         }
@@ -285,6 +384,17 @@ pub fn map_message(msg: &tl::enums::Message, self_id: i64) -> Option<Row> {
                 // `messageService` carries no forward header at all.
                 fwd_from_id: None,
                 fwd_from_name: None,
+                fwd_date: None,
+                fwd_channel_post: None,
+                // Nor an album, a bot, entities or a quote.
+                grouped_id: None,
+                via_bot_id: None,
+                ttl_period: m.ttl_period,
+                reply_quote: m.reply_to.as_ref().and_then(reply_quote),
+                reply_to_peer_id: m.reply_to.as_ref().and_then(reply_peer),
+                service_action: Some(action_name(&m.action)),
+                call: call_of(&m.action),
+                entities: Vec::new(),
                 reactions: m.reactions.as_ref().map(reactions).unwrap_or_default(),
             })
         }
@@ -319,6 +429,171 @@ fn reply_target(header: &tl::enums::MessageReplyHeader) -> Option<i32> {
     }
 }
 
+/// When the forwarded ORIGINAL was written.
+///
+/// ⚠ Not behind a flag: `messageFwdHeader` carries `date:int` outright, so a
+/// forward always knows how old it is and this archive threw that away for every
+/// one of them.
+fn fwd_date(header: &tl::enums::MessageFwdHeader) -> i64 {
+    match header {
+        tl::enums::MessageFwdHeader::Header(h) => i64::from(h.date),
+    }
+}
+
+/// The original's id inside the channel it was posted to.
+fn fwd_channel_post(header: &tl::enums::MessageFwdHeader) -> Option<i32> {
+    match header {
+        tl::enums::MessageFwdHeader::Header(h) => h.channel_post,
+    }
+}
+
+/// The FRAGMENT a reply quoted, when it answered part rather than all.
+fn reply_quote(header: &tl::enums::MessageReplyHeader) -> Option<String> {
+    match header {
+        tl::enums::MessageReplyHeader::Header(h) => h.quote_text.as_deref().and_then(non_empty),
+        tl::enums::MessageReplyHeader::MessageReplyStoryHeader(_) => None,
+    }
+}
+
+/// The conversation a reply reached INTO, when it was not this one.
+fn reply_peer(header: &tl::enums::MessageReplyHeader) -> Option<i64> {
+    match header {
+        tl::enums::MessageReplyHeader::Header(h) => {
+            h.reply_to_peer_id.as_ref().map(|p| normalise_peer(p).0)
+        }
+        tl::enums::MessageReplyHeader::MessageReplyStoryHeader(_) => None,
+    }
+}
+
+/// Every formatted span, with the payload the kinds that have one carry.
+///
+/// ⚠ **`offset` and `length` are UTF-16 code units** and are passed through
+/// unconverted — see [`Entity`]. Converting here would be the wrong place: the
+/// archive's job is to hold what Telegram said, and a reader that wants Rust
+/// indices has the text to convert against.
+fn entities(list: &[tl::enums::MessageEntity]) -> Vec<Entity> {
+    use tl::enums::MessageEntity as E;
+    list.iter()
+        .map(|e| {
+            // Every arm names its own kind rather than deriving one, because the
+            // string is a STORED identity: a `Debug` spelling could change under
+            // us on a crate upgrade and silently repartition the table.
+            let (kind, offset_utf16, length_utf16) = match e {
+                E::Unknown(x) => ("unknown", x.offset, x.length),
+                E::Mention(x) => ("mention", x.offset, x.length),
+                E::Hashtag(x) => ("hashtag", x.offset, x.length),
+                E::BotCommand(x) => ("botCommand", x.offset, x.length),
+                E::Url(x) => ("url", x.offset, x.length),
+                E::Email(x) => ("email", x.offset, x.length),
+                E::Bold(x) => ("bold", x.offset, x.length),
+                E::Italic(x) => ("italic", x.offset, x.length),
+                E::Code(x) => ("code", x.offset, x.length),
+                E::Pre(x) => ("pre", x.offset, x.length),
+                E::TextUrl(x) => ("textUrl", x.offset, x.length),
+                E::MentionName(x) => ("mentionName", x.offset, x.length),
+                E::Phone(x) => ("phone", x.offset, x.length),
+                E::Cashtag(x) => ("cashtag", x.offset, x.length),
+                E::Underline(x) => ("underline", x.offset, x.length),
+                E::Strike(x) => ("strike", x.offset, x.length),
+                E::BankCard(x) => ("bankCard", x.offset, x.length),
+                E::Spoiler(x) => ("spoiler", x.offset, x.length),
+                E::CustomEmoji(x) => ("customEmoji", x.offset, x.length),
+                E::Blockquote(x) => ("blockquote", x.offset, x.length),
+                E::InputMessageEntityMentionName(x) => ("inputMentionName", x.offset, x.length),
+                // A span this archive has no name for is still a span, and its
+                // extent is the part worth keeping. `_` rather than an exhaustive
+                // list because the TL schema grows: a new entity kind must not
+                // stop the build of a feed whose job is to keep running.
+                _ => ("other", 0, 0),
+            };
+            Entity {
+                kind,
+                offset_utf16,
+                length_utf16,
+                // ⚠ The point of the whole table: this url is NOT in the text.
+                url: match e {
+                    E::TextUrl(x) => non_empty(&x.url),
+                    _ => None,
+                },
+                user_id: match e {
+                    E::MentionName(x) => Some(x.user_id),
+                    _ => None,
+                },
+                language: match e {
+                    E::Pre(x) => non_empty(&x.language),
+                    _ => None,
+                },
+                document_id: match e {
+                    E::CustomEmoji(x) => Some(x.document_id),
+                    _ => None,
+                },
+            }
+        })
+        .collect()
+}
+
+/// The TL constructor's name for a service action.
+///
+/// ⚠ **`describe_action` renders; this IDENTIFIES.** The two exist together on
+/// purpose: the phrase is for a reader, the name is for the archive, and the
+/// phrase's `_ => "an event"` arm is exactly why storing only the phrase lost
+/// information that cannot be recovered from it.
+fn action_name(action: &tl::enums::MessageAction) -> &'static str {
+    use tl::enums::MessageAction as A;
+    match action {
+        A::Empty => "empty",
+        A::ChatCreate(_) => "chatCreate",
+        A::ChatEditTitle(_) => "chatEditTitle",
+        A::ChatEditPhoto(_) => "chatEditPhoto",
+        A::ChatDeletePhoto => "chatDeletePhoto",
+        A::ChatAddUser(_) => "chatAddUser",
+        A::ChatDeleteUser(_) => "chatDeleteUser",
+        A::ChatJoinedByLink(_) => "chatJoinedByLink",
+        A::ChannelCreate(_) => "channelCreate",
+        A::ChatMigrateTo(_) => "chatMigrateTo",
+        A::ChannelMigrateFrom(_) => "channelMigrateFrom",
+        A::PinMessage => "pinMessage",
+        A::HistoryClear => "historyClear",
+        A::GameScore(_) => "gameScore",
+        A::PhoneCall(_) => "phoneCall",
+        A::ScreenshotTaken => "screenshotTaken",
+        A::ContactSignUp => "contactSignUp",
+        A::SetMessagesTtl(_) => "setMessagesTtl",
+        A::GroupCall(_) => "groupCall",
+        A::SetChatTheme(_) => "setChatTheme",
+        A::WebViewDataSent(_) => "webViewDataSent",
+        A::GiftPremium(_) => "giftPremium",
+        A::TopicCreate(_) => "topicCreate",
+        A::TopicEdit(_) => "topicEdit",
+        A::SetChatWallPaper(_) => "setChatWallPaper",
+        // Same reasoning as `entities`: an unrecognised action must not stop the
+        // feed. Unlike `describe_action`'s "an event", this arm is reached only
+        // for something genuinely new rather than for anything unlisted.
+        _ => "other",
+    }
+}
+
+/// A call's duration, outcome and kind, from the service action that reports it.
+fn call_of(action: &tl::enums::MessageAction) -> Option<Call> {
+    let tl::enums::MessageAction::PhoneCall(c) = action else {
+        return None;
+    };
+    use tl::enums::PhoneCallDiscardReason as R;
+    Some(Call {
+        call_id: c.call_id,
+        // ⚠ `None` is the record of an unanswered call, not a zero.
+        duration_s: c.duration,
+        reason: c.reason.as_ref().map(|r| match r {
+            R::Missed => "missed",
+            R::Disconnect => "disconnect",
+            R::Hangup => "hangup",
+            R::Busy => "busy",
+            R::MigrateConferenceCall(_) => "migrateConferenceCall",
+        }),
+        video: c.video,
+    })
+}
+
 /// The forwarded-from peer, normalised like every other peer here.
 fn fwd_peer(header: &tl::enums::MessageFwdHeader) -> Option<i64> {
     match header {
@@ -342,19 +617,14 @@ fn fwd_name(header: &tl::enums::MessageFwdHeader) -> Option<String> {
     }
 }
 
-fn reactions(r: &tl::enums::MessageReactions) -> Vec<Reaction> {
+fn reactions(r: &tl::enums::MessageReactions) -> Reactions {
     let tl::enums::MessageReactions::Reactions(r) = r;
-    r.results
+    let counts: Vec<Reaction> = r
+        .results
         .iter()
         .map(|count| {
             let tl::enums::ReactionCount::Count(c) = count;
-            let (emoji, custom_emoji_id) = match &c.reaction {
-                tl::enums::Reaction::Emoji(e) => (Some(e.emoticon.clone()), None),
-                tl::enums::Reaction::CustomEmoji(e) => (None, Some(e.document_id)),
-                // `reactionEmpty` and paid reactions have no emoji and no
-                // document: the count is all there is to keep.
-                _ => (None, None),
-            };
+            let (emoji, custom_emoji_id) = emoji_of(&c.reaction);
             Reaction {
                 emoji,
                 custom_emoji_id,
@@ -362,7 +632,56 @@ fn reactions(r: &tl::enums::MessageReactions) -> Vec<Reaction> {
                 chosen: c.chosen_order.is_some(),
             }
         })
-        .collect()
+        .collect();
+
+    let authors: Vec<ReactionAuthor> = r
+        .recent_reactions
+        .iter()
+        .flatten()
+        .map(|peer_reaction| {
+            let tl::enums::MessagePeerReaction::Reaction(pr) = peer_reaction;
+            let (emoji, custom_emoji_id) = emoji_of(&pr.reaction);
+            ReactionAuthor {
+                peer_id: normalise_peer(&pr.peer_id).0,
+                emoji,
+                custom_emoji_id,
+                reacted_at: i64::from(pr.date),
+            }
+        })
+        .collect();
+
+    // ⚠ **THE COMPARISON THAT DECIDES WHETHER ANYONE MAY BE RETRACTED.** Telegram
+    // samples `recent_reactions` for a message with many reactors, and a sample
+    // that named three of twenty would otherwise read as seventeen people having
+    // taken their reaction back. The tally in `results` is the honest denominator,
+    // so the list is a complete statement exactly when it is no shorter than the
+    // tally — and `>=` rather than `==` because a reactor can appear under more
+    // than one emoji.
+    //
+    // ⚠ An ABSENT `recent_reactions` is not an empty one. It arrives as `None`,
+    // which flattens to no authors and — with any non-zero tally — to `complete:
+    // false`, so nothing is retracted on the strength of a field Telegram simply
+    // did not send.
+    let counted: i32 = counts.iter().map(|c| c.cnt).sum();
+    let complete = i32::try_from(authors.len()).is_ok_and(|named| named >= counted);
+
+    Reactions {
+        counts,
+        authors,
+        complete,
+    }
+}
+
+/// Which reaction it was: a unicode emoticon, or a custom emoji's document id.
+///
+/// `reactionEmpty` and paid reactions have neither — for a count that is still a
+/// row worth keeping, and for an author it is still a person worth naming.
+fn emoji_of(reaction: &tl::enums::Reaction) -> (Option<String>, Option<i64>) {
+    match reaction {
+        tl::enums::Reaction::Emoji(e) => (Some(e.emoticon.clone()), None),
+        tl::enums::Reaction::CustomEmoji(e) => (None, Some(e.document_id)),
+        _ => (None, None),
+    }
 }
 
 /// What a message's media IS, how big it is, and what type it holds.

@@ -910,8 +910,18 @@ async fn store(
     let outcome = db
         .store_telegram_message(&row, sender_name.as_deref())
         .await?;
-    db.replace_telegram_reactions(row.conversation_id, row.msg_id, &row.reactions)
+    // The tally and the names are two different facts with two different rules
+    // about retraction — see `Db::record_telegram_reaction_authors`.
+    db.replace_telegram_reactions(row.conversation_id, row.msg_id, &row.reactions.counts)
         .await?;
+    db.record_telegram_reaction_authors(row.conversation_id, row.msg_id, &row.reactions)
+        .await?;
+    db.replace_telegram_entities(row.conversation_id, row.msg_id, &row.entities)
+        .await?;
+    if let Some(call) = &row.call {
+        db.record_telegram_call(row.conversation_id, row.msg_id, call)
+            .await?;
+    }
     if outcome == TelegramStored::Edited {
         tracing::info!(
             "message {}/{} was edited; the previous text is kept",
