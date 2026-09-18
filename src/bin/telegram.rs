@@ -44,6 +44,7 @@
 //! Config via env: `DB_HOST`, `DB_PORT` (3306), `DB_NAME`, `DB_USER`,
 //! `DB_PASSWORD`, `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -51,7 +52,7 @@ use anyhow::{Context, Result, bail};
 use grammers_client::Client;
 use grammers_client::client::UpdatesConfiguration;
 use grammers_client::session::Session;
-use grammers_client::session::types::PeerRef;
+use grammers_client::session::types::{PeerId, PeerRef};
 use grammers_client::session::updates::UpdatesLike;
 use grammers_client::update::Update;
 use grammers_mtsender::SenderPool;
@@ -434,6 +435,66 @@ async fn sweep(client: &Client, db: &Db) -> Result<Vec<(i64, PeerRef)>> {
     Ok(pending)
 }
 
+/// Who sent it, for the updates that do not say.
+///
+/// ⚠ **A LIVE DM UPDATE CARRIES NO USERS AT ALL.** Telegram's compact
+/// `updateShortMessage` names the sender by id and nothing else, and
+/// `Message::sender` is an in-packet lookup rather than a fetch — so it answers
+/// `None` for essentially every ordinary line typed in a one-to-one chat. That
+/// is why every live DM row had a NULL `sender_name` while the backfill's rows
+/// were fine: `iter_messages` answers with the users attached, so a re-walk
+/// silently papered over the hole and the archive only looked complete.
+///
+/// So the name is asked for: `sender_ref` consults the session's peer cache —
+/// the dialog sweep put every dialog peer there — and `resolve_peer` turns that
+/// reference into a peer that has a name.
+///
+/// ⚠ **Memoised for the life of the process, deliberately.** `catch_up: true`
+/// can replay hundreds of updates at once after a restart, and one
+/// `users.getUsers` apiece would be a flood wait rather than an archive. The
+/// price is that a rename mid-process is not seen until the pod restarts, which
+/// `sender_name` can afford: it is a denormalised snapshot of who spoke, and the
+/// name anything reads as CURRENT comes from `telegram_conversations`, which the
+/// hourly sweep refreshes.
+///
+/// ⚠ **A failed lookup is not remembered.** It is a round trip that can fail for
+/// a minute at a time, and caching that minute would cost a process lifetime of
+/// nameless rows.
+#[derive(Default)]
+struct Names(tokio::sync::Mutex<HashMap<PeerId, String>>);
+
+impl Names {
+    async fn of(
+        &self,
+        client: &Client,
+        message: &grammers_client::message::Message,
+    ) -> Option<String> {
+        if let Some(name) = message.sender().and_then(peer_name) {
+            return Some(name);
+        }
+        let id = message.sender_id()?;
+        if let Some(name) = self.0.lock().await.get(&id) {
+            return Some(name.clone());
+        }
+        let peer_ref = match message.sender_ref().await {
+            Ok(peer_ref) => peer_ref?,
+            Err(e) => {
+                tracing::warn!("no reference for sender {id:?}: {e}");
+                return None;
+            }
+        };
+        let name = match client.resolve_peer(peer_ref).await {
+            Ok(peer) => peer_name(&peer)?,
+            Err(e) => {
+                tracing::warn!("could not resolve sender {id:?}: {e}");
+                return None;
+            }
+        };
+        self.0.lock().await.insert(id, name.clone());
+        Some(name)
+    }
+}
+
 /// Hold the update stream, storing what arrives.
 async fn follow(
     client: &Client,
@@ -459,9 +520,10 @@ async fn follow(
         .await
         .map_err(|e| anyhow::anyhow!("opening the update stream: {e}"))?;
 
+    let names = Names::default();
     loop {
         let update = stream.next().await.context("reading an update")?;
-        if let Err(e) = apply(db, cfg, self_id, &update).await {
+        if let Err(e) = apply(client, db, cfg, &names, self_id, &update).await {
             // One bad update must not end the feed. Logged with the update's shape
             // so the next one of its kind can be handled deliberately.
             tracing::error!("could not store an update: {e:#}");
@@ -469,7 +531,14 @@ async fn follow(
     }
 }
 
-async fn apply(db: &Db, cfg: &Cfg, self_id: i64, update: &Update) -> Result<()> {
+async fn apply(
+    client: &Client,
+    db: &Db,
+    cfg: &Cfg,
+    names: &Names,
+    self_id: i64,
+    update: &Update,
+) -> Result<()> {
     match update {
         Update::NewMessage(m) | Update::MessageEdited(m) => {
             // ⚠ **`m.raw` IS NOT THE MESSAGE.** `update::Message` has its own
@@ -480,7 +549,7 @@ async fn apply(db: &Db, cfg: &Cfg, self_id: i64, update: &Update) -> Result<()> 
             // through the deref target explicitly, once, with its type written
             // down.
             let inner: &grammers_client::message::Message = m;
-            store(db, self_id, &inner.raw, m.sender().and_then(peer_name)).await?;
+            store(db, self_id, &inner.raw, names.of(client, inner).await).await?;
             if let Some(row) = map::map_message(&inner.raw, self_id) {
                 fetch_media(db, cfg, inner, row.conversation_id).await?;
             }
