@@ -56,6 +56,20 @@ DDL = [
         UNIQUE KEY uniq_gchat_msg (group_id, msg_id),
         INDEX idx_gchat_conv_ts (group_id, ts_us)
     ) DEFAULT CHARSET=utf8mb4""",
+    """CREATE TABLE IF NOT EXISTS gchat_attachments (
+        id         BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        message_id BIGINT NOT NULL,
+        name       VARCHAR(255) NULL,
+        mime       VARCHAR(128) NULL,
+        width      INT NULL,
+        height     INT NULL,
+        uuid       VARCHAR(64) NULL,
+        token      TEXT NULL,
+        hash1      VARCHAR(128) NULL,
+        hash2      VARCHAR(128) NULL,
+        UNIQUE KEY uniq_gchat_attachment (message_id, uuid),
+        INDEX idx_gchat_attachment_msg (message_id)
+    ) DEFAULT CHARSET=utf8mb4""",
     """CREATE TABLE IF NOT EXISTS gchat_reaction_authors (
         id         BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
         message_id BIGINT NOT NULL,
@@ -103,7 +117,7 @@ def main():
             cur.execute(stmt)
 
     stats = {"conversations": 0, "messages": 0, "dups": 0, "reactions": 0,
-             "reactors": 0, "skipped": 0}
+             "reactors": 0, "attachments": 0, "skipped": 0}
     for path in files:
         with open(path) as f:
             conv = json.load(f)
@@ -148,6 +162,32 @@ def main():
                 cur.execute("SELECT id FROM gchat_messages WHERE group_id=%s AND msg_id=%s",
                             (gid, msg_id))
                 message_id = cur.fetchone()[0]
+
+            # ⚠ **THE PICTURES, WHICH THIS ARCHIVE HAD NEVER RECORDED AT ALL.**
+            # A Google Chat message is a 39-element array and the capture read six
+            # indices; attachments are at 10. 326 of 7,042 messages carry one —
+            # and only 20 of those are wordless, so the other 306 rendered as
+            # ordinary text messages with a caption and no picture. Nothing said a
+            # picture had been there.
+            #
+            # ⚠ **THE BYTES ARE NOT HERE AND THIS ROW CANNOT FETCH THEM.** The
+            # client mints a `lh3.googleusercontent.com/chat_attachment/AP1Ws4…`
+            # URL at render time from `token`; that URL appears nowhere in the
+            # capture, and it answers 403 without Pippijn's session. So this table
+            # records that a picture EXISTED, who sent it, when, its name and its
+            # dimensions — and the two content hashes, which are the only way a
+            # byte stream obtained later could ever be matched back to it.
+            for a in m.get("attachments") or []:
+                stats["attachments"] += 1
+                cur.execute(
+                    "INSERT INTO gchat_attachments "
+                    "(message_id, name, mime, width, height, uuid, token, hash1, hash2) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                    "ON DUPLICATE KEY UPDATE name=VALUES(name), mime=VALUES(mime), "
+                    "width=VALUES(width), height=VALUES(height), token=VALUES(token)",
+                    (message_id, a.get("name"), a.get("mime"), a.get("width"),
+                     a.get("height"), a.get("uuid"), a.get("token"),
+                     a.get("hash1"), a.get("hash2")))
 
             for r in m.get("reactions") or []:
                 emoji = r.get("emoji")
