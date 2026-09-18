@@ -46,6 +46,7 @@ DDL = [
         group_id    VARCHAR(64) NOT NULL,
         msg_id      VARCHAR(64) NOT NULL,
         thread_id   VARCHAR(64) NULL,
+        reply_to_msg_id VARCHAR(64) NULL,
         sender_id   VARCHAR(32) NULL,
         sender_name VARCHAR(255) NULL,
         is_self     TINYINT(1) NOT NULL DEFAULT 0,
@@ -149,10 +150,18 @@ def main():
                 continue
 
             cur.execute(
+                # ⚠ `reply_to_msg_id` is NOT `thread_id`. A topic id says which
+                # conversation a message belongs to; this says which MESSAGE it
+                # answers. Chat DMs have no topics and do have quote-replies, which
+                # is exactly why reading one as the other concluded — wrongly —
+                # that DMs carried no reply information at all.
                 "INSERT IGNORE INTO gchat_messages "
-                "(group_id, msg_id, thread_id, sender_id, sender_name, is_self, ts_us, sent_at, text) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                (gid, msg_id, m.get("thread_id"), m.get("sender_id"), disp, is_self,
+                "(group_id, msg_id, thread_id, reply_to_msg_id, sender_id, sender_name, "
+                " is_self, ts_us, sent_at, text) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (gid, msg_id, m.get("thread_id"),
+                 (m.get("reply_to") or {}).get("msg_id"),
+                 m.get("sender_id"), disp, is_self,
                  ts_us, sent_at, m.get("text")))
             if cur.rowcount != 0:
                 stats["messages"] += 1
