@@ -859,6 +859,28 @@ const MIGRATIONS: &[&str] = &[
     r"ALTER TABLE telegram_messages
         ADD COLUMN reply_quote TEXT NULL,
         ADD COLUMN reply_to_peer_id BIGINT NULL",
+    // v36: how far a re-capture has got, so hours of work survive a restart.
+    //
+    // ⚠ **NOT `telegram_backfill_state`, and the difference is the direction.**
+    // That table walks OLDER, from `oldest_seen` outward, and is finished when it
+    // reaches the start of a conversation. This one walks FORWARD through messages
+    // the archive already holds, re-reading them so columns added after they were
+    // stored get filled by the enrichment. Sharing one table would make
+    // `complete` mean two things and a re-capture would end the backfill.
+    //
+    // ⚠ **The frontier is `through_msg_id`, and it only moves once a batch is
+    // WRITTEN.** A pass that recorded progress before storing would skip whatever
+    // was in flight when the pod died — silently, and exactly the way the archive
+    // cannot detect afterwards.
+    //
+    // Re-runnable by deleting a row: the next pass re-reads that conversation from
+    // the beginning, which costs time and changes nothing, because every write it
+    // makes is an enrichment of a NULL.
+    r"CREATE TABLE IF NOT EXISTS telegram_recapture_state (
+        conversation_id BIGINT NOT NULL PRIMARY KEY,
+        through_msg_id INT NOT NULL,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    ) DEFAULT CHARSET=utf8mb4",
 ];
 
 #[derive(Clone)]
@@ -1762,6 +1784,65 @@ impl Db {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// The next batch of stored message ids to re-read, oldest first.
+    ///
+    /// Reads from what the archive HOLDS rather than from Telegram, because the
+    /// point is to re-ask about messages already stored. Empty means this
+    /// conversation is done.
+    pub async fn telegram_recapture_batch(
+        &self,
+        conversation_id: i64,
+        limit: u32,
+    ) -> Result<Vec<i32>> {
+        Ok(sqlx::query_scalar(
+            "SELECT m.msg_id FROM telegram_messages m
+               WHERE m.conversation_id = ?
+                 AND m.msg_id > COALESCE(
+                     (SELECT s.through_msg_id FROM telegram_recapture_state s
+                       WHERE s.conversation_id = m.conversation_id), 0)
+               ORDER BY m.msg_id
+               LIMIT ?",
+        )
+        .bind(conversation_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// Move the re-capture frontier, AFTER the batch has been written.
+    ///
+    /// ⚠ `GREATEST` rather than an assignment: two passes over one conversation
+    /// must not be able to walk the frontier backwards, which would silently
+    /// re-do work already finished and — worse — look like progress.
+    pub async fn record_telegram_recapture(
+        &self,
+        conversation_id: i64,
+        through_msg_id: i32,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO telegram_recapture_state (conversation_id, through_msg_id)
+             VALUES (?, ?)
+             ON DUPLICATE KEY UPDATE
+                through_msg_id = GREATEST(through_msg_id, VALUES(through_msg_id))",
+        )
+        .bind(conversation_id)
+        .bind(through_msg_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// How many messages this conversation holds, for a progress line that means
+    /// something.
+    pub async fn telegram_message_count(&self, conversation_id: i64) -> Result<i64> {
+        Ok(
+            sqlx::query_scalar("SELECT COUNT(*) FROM telegram_messages WHERE conversation_id = ?")
+                .bind(conversation_id)
+                .fetch_one(&self.pool)
+                .await?,
+        )
     }
 
     /// Whether this message's bytes are already accounted for — stored, offered or

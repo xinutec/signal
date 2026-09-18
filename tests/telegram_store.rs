@@ -1068,3 +1068,70 @@ async fn a_call_learns_its_duration_without_losing_it_again() {
     assert_eq!(duration, Some(2_820), "47 minutes is not forgotten");
     assert_eq!(reason.as_deref(), Some("hangup"));
 }
+
+/// ⚠ **A frontier that can move backwards turns re-done work into progress.**
+///
+/// The re-capture runs for hours, so its only protection against a restart is
+/// this marker — and the batch query has to honour it, or a pass would loop over
+/// the same hundred messages forever while logging that it was advancing.
+#[tokio::test]
+async fn the_recapture_frontier_only_moves_forward() {
+    let Some((db, _pool)) = connect().await else {
+        return;
+    };
+    let id = ids(15);
+
+    for offset in 0..3 {
+        db.store_telegram_message(
+            &row(
+                id.conversation,
+                PeerSpace::User,
+                id.msg_base + offset,
+                "held",
+            ),
+            None,
+        )
+        .await
+        .expect("store");
+    }
+
+    let first = db
+        .telegram_recapture_batch(id.conversation, 2)
+        .await
+        .expect("a batch");
+    assert_eq!(first, vec![id.msg_base, id.msg_base + 1]);
+
+    db.record_telegram_recapture(id.conversation, id.msg_base + 1)
+        .await
+        .expect("advance");
+    assert_eq!(
+        db.telegram_recapture_batch(id.conversation, 2)
+            .await
+            .expect("a batch"),
+        vec![id.msg_base + 2],
+        "the batch resumes past the frontier rather than repeating it"
+    );
+
+    // A stale worker reporting an older frontier must not undo the advance.
+    db.record_telegram_recapture(id.conversation, id.msg_base)
+        .await
+        .expect("a late, lower report");
+    assert_eq!(
+        db.telegram_recapture_batch(id.conversation, 2)
+            .await
+            .expect("a batch"),
+        vec![id.msg_base + 2],
+        "the frontier did not walk backwards"
+    );
+
+    db.record_telegram_recapture(id.conversation, id.msg_base + 2)
+        .await
+        .expect("finish");
+    assert!(
+        db.telegram_recapture_batch(id.conversation, 2)
+            .await
+            .expect("a batch")
+            .is_empty(),
+        "an exhausted conversation stops the loop"
+    );
+}

@@ -27,7 +27,7 @@
 //! construction — the server never holds them — so no login reaches them. Nothing
 //! in this archive will say so; this line is the only record.
 //!
-//! Three modes:
+//! Four modes:
 //!
 //! * `telegram login <phone>` — interactive, once per account lifetime. Asks
 //!   Telegram for a code, reads it from stdin, and stores the resulting session.
@@ -40,6 +40,9 @@
 //!   number is an input to a one-off command, so it is passed like one.
 //! * `telegram` — the archiver. Refuses to start without a stored session, because
 //!   a feed that is quietly not logged in looks exactly like a quiet week.
+//! * `telegram recapture` — re-reads every message the archive already holds so
+//!   that columns added after it was stored get filled. Hours, resumable, and a
+//!   no-op once there is nothing left to learn; see [`recapture`].
 //! * `telegram probe` — read-only. Counts how often each optional field Telegram
 //!   CAN send is actually filled in, over a sample of the archive's own messages,
 //!   so a capture plan is sized against measurements rather than against the TL
@@ -190,9 +193,16 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some("probe") => probe(&client, &db).await,
+        Some("recapture") => {
+            let self_id = session.self_id()?.context("not logged in")?;
+            recapture(&client, &db, self_id).await
+        }
         None => archive(&client, &db, &cfg, &session, updates).await,
         Some(other) => {
-            bail!("unknown mode {other:?}; expected `login <phone>`, `probe`, or no argument")
+            bail!(
+                "unknown mode {other:?}; expected `login <phone>`, `probe`, `recapture`, \
+             or no argument"
+            )
         }
     }
 }
@@ -540,6 +550,89 @@ impl Names {
         self.0.lock().await.insert(id, name.clone());
         Some(name)
     }
+}
+
+/// Messages per re-capture batch. `messages.getMessages` takes at most 100 ids.
+const RECAPTURE_PAGE: u32 = 100;
+
+/// Re-read every message the archive already holds, so columns added after it was
+/// stored get filled.
+///
+/// ⚠ **THIS IS THE TOOL THAT MAKES A NEW COLUMN FILLABLE AT ALL.** The backfill
+/// marks a conversation `complete` and never returns, and the live stream only
+/// sees what arrives next — so a column added today would stay NULL on all
+/// 159,956 existing rows forever. `store_telegram_message`'s enrichment is the
+/// other half: it fills a NULL and never overwrites a known value, which is what
+/// makes running this a safe no-op once there is nothing left to learn.
+///
+/// ⚠ **A HOLE IS NOT A DELETION.** `get_messages_by_id` answers positionally and
+/// returns nothing for a message Telegram no longer has. This pass SKIPS those
+/// and marks nothing: a message retracted on Telegram is one this archive
+/// deliberately still holds, and letting a re-read tombstone it would make the
+/// repair destructive — the exact failure v28 records for reactions.
+///
+/// ⚠ **Expect FLOOD_WAIT, and expect it to be fine.** The 9-call probe on
+/// 2026-09-18 was rate-limited three times at ~30s. `grammers` sleeps and retries
+/// on its own, so the pass is slow rather than fragile; a full run is hours, which
+/// is why the frontier is written after every batch.
+///
+/// Run as a ONE-OFF with the feed scaled to zero — two clients on one session
+/// would both write the update state.
+async fn recapture(client: &Client, db: &Db, self_id: i64) -> Result<()> {
+    let names = Names::default();
+    names.learn_self(client, self_id).await;
+
+    let mut conversations = Vec::new();
+    let mut dialogs = client.iter_dialogs();
+    while let Some(dialog) = dialogs.next().await.context("listing dialogs")? {
+        let peer = dialog.peer();
+        let Some(id) = peer.id().bot_api_dialog_id() else {
+            continue;
+        };
+        match peer.to_ref().await {
+            Ok(Some(peer_ref)) => conversations.push((id, peer_ref)),
+            // Reported rather than skipped silently: a conversation with no
+            // reference is one this pass can never repair, and a run that claims
+            // to have covered everything must not have covered it quietly.
+            _ => tracing::warn!("no reference for conversation {id}; it cannot be re-captured"),
+        }
+    }
+    tracing::info!("re-capturing {} conversation(s)", conversations.len());
+
+    let mut total = 0u64;
+    for (conversation_id, peer_ref) in conversations {
+        let held = db.telegram_message_count(conversation_id).await?;
+        let mut done = 0u64;
+        loop {
+            let ids = db
+                .telegram_recapture_batch(conversation_id, RECAPTURE_PAGE)
+                .await?;
+            let Some(&last) = ids.last() else {
+                break;
+            };
+            let fetched = client
+                .get_messages_by_id(peer_ref, &ids)
+                .await
+                .with_context(|| format!("re-reading {} ids from {conversation_id}", ids.len()))?;
+            let mut present = 0u64;
+            for message in fetched.into_iter().flatten() {
+                present += 1;
+                let sender = names.of(client, &message).await;
+                store(db, self_id, &message.raw, sender).await?;
+            }
+            // ⚠ AFTER the writes, never before. See migration v36.
+            db.record_telegram_recapture(conversation_id, last).await?;
+            done += ids.len() as u64;
+            total += present;
+            tracing::info!(
+                "conversation {conversation_id}: {done}/{held} re-read \
+                 ({present} of {} still on Telegram)",
+                ids.len()
+            );
+        }
+    }
+    tracing::info!("re-capture finished; {total} message(s) re-read");
+    Ok(())
 }
 
 /// Count how often each optional field Telegram CAN send is actually filled in.
