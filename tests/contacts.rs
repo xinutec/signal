@@ -181,15 +181,18 @@ async fn a_nameless_sighting_does_not_wipe_a_name() {
     assert_eq!(phone.as_deref(), Some("+447700900000"));
 }
 
-/// ⚠ **`profile_name` IS NO LONGER WRITTEN, AND THAT IS HALF A MIGRATION.** The
-/// viewer moved to `display_name` (messages 7098b95), so the column has no
-/// reader; this test pins that it has no WRITER either, which is the precondition
-/// for dropping it. `signal-ingester` is `RollingUpdate`, so a deploy that
-/// stopped the writes and dropped the column together would leave the old pod
-/// INSERTing into a column that is gone — and Signal keeps no history to re-walk,
-/// so those messages would be lost. Stop writing, ship, then drop.
+/// ⚠ **THE SUPERSEDED COLUMN IS GONE, AND THE ORDER IS WHAT MADE THAT SAFE.**
+/// `signal-ingester` is `RollingUpdate`, so old and new pods overlap: dropping
+/// the column in the same deploy that stopped writing it would have left the old
+/// pod INSERTing into a column that no longer exists — and Signal keeps no
+/// history to re-walk, so those messages would be gone. Writes stopped and
+/// shipped first (846974d); the drop is v46.
+///
+/// This asserts the END STATE rather than the sequence, because that is what a
+/// fresh database gets: v0 creates the column, v41 adds `display_name`, v42
+/// copies across, v46 drops it.
 #[tokio::test]
-async fn the_old_column_is_left_behind() {
+async fn the_superseded_column_is_gone() {
     let Some((db, pool)) = connect().await else {
         return;
     };
@@ -200,18 +203,32 @@ async fn the_old_column_is_left_behind() {
         .await
         .unwrap();
 
-    let both: (Option<String>, Option<String>) =
-        sqlx::query_as("SELECT display_name, profile_name FROM contacts WHERE uuid = ?")
+    let name: Option<String> =
+        sqlx::query_scalar("SELECT display_name FROM contacts WHERE uuid = ?")
             .bind(&id)
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(
-        both.0.as_deref(),
-        Some("Tania Boiko"),
-        "the live column moves"
-    );
-    assert_eq!(both.1, None, "and the superseded one is not touched at all");
+    assert_eq!(name.as_deref(), Some("Tania Boiko"));
+
+    // ⚠ Asked of the SCHEMA, not by selecting the column — a query naming a
+    // dropped column is an error, which a test could mistake for any other
+    // failure. This asks what columns exist and expects one to be absent.
+    // `information_schema` is the SERVER's catalogue, not this repo's schema, so
+    // no migration creates it and none should — asking it is the point.
+    // ⚠ The marker is the LAST comment line deliberately: it must sit within two
+    // lines of the FLAGGED line, which is the SQL string rather than the call,
+    // and prose after it pushes it out of range.
+    // dev-lint: allow-sqlx — the server's own catalogue, by design.
+    let still_there: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns
+          WHERE table_schema = DATABASE() AND table_name = 'contacts'
+            AND column_name = 'profile_name'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(still_there, 0, "v46 dropped it");
 }
 
 // ---- the frame itself -------------------------------------------------------

@@ -1093,6 +1093,30 @@ const MIGRATIONS: &[&str] = &[
         INDEX idx_signal_frame_ts (envelope_ts),
         INDEX idx_signal_frame_source (source_uuid, envelope_ts)
     ) DEFAULT CHARSET=utf8mb4",
+    // v46: the superseded name column goes, and this is the SECOND of two
+    // deploys (#1688).
+    //
+    // ⚠ **THE ORDER IS THE WHOLE OF THE RISK.** `signal-ingester` is
+    // `RollingUpdate`, so old and new pods overlap. Dropping the column in the
+    // same deploy that stopped writing it would leave the old pod INSERTing into
+    // a column that no longer exists — its writes fail, and Signal keeps no
+    // server-side history to re-walk, so those messages are gone. The writes
+    // stopped in the previous deploy (846974d) and shipped; this is safe only
+    // because that one is already running.
+    //
+    // ⚠ **VERIFIED BY THE STATEMENT, NOT BY `grep -c profile_name`.** The binary
+    // still contains the string twice — v0's `CREATE TABLE` and v42's backfill —
+    // and always will, so a count can never reach zero and reads as "never safe".
+    // What was checked on the live pod is that the two HOT-PATH writes are gone:
+    // `INSERT INTO contacts (uuid, phone, profile_name` → 0, and
+    // `SET display_name = ?, profile_name` → 0.
+    //
+    // ⚠ **A FRESH DATABASE STILL WORKS**, which is what append-only buys: v0
+    // creates the column, v41 adds `display_name`, v42 copies across, and this
+    // drops it — in that order, every time, on a database that has never seen any
+    // of them. Measured before dropping: 41 rows, all 41 identical across the two
+    // columns, so nothing is lost.
+    r"ALTER TABLE contacts DROP COLUMN profile_name",
 ];
 
 #[derive(Clone)]
