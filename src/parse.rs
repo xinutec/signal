@@ -607,3 +607,64 @@ pub fn parse_frame(frame: &Value) -> Parsed {
 
     Parsed::skip()
 }
+
+/// The display name Signal itself would show for a contact.
+///
+/// ⚠ **THIS IS SIGNAL-CLI'S OWN PRECEDENCE, NOT A CHOICE MADE HERE.** Copied from
+/// `ManagerImpl.getContactOrProfileName` at v0.14.7:
+///
+/// ```text
+/// final var nickname = contact.getDisplayNickname();
+/// if (!Util.isEmpty(nickname)) return nickname;
+/// if (!Util.isEmpty(contact.getName())) return contact.getName();
+/// return profile.getDisplayName();
+/// ```
+///
+/// — and `getDisplayNickname` / `getName` are each `given + " " + family`, falling
+/// back to whichever half is non-empty.
+///
+/// ⚠ **THE DEPLOYED 0.14.5 HAS NO NICKNAME BRANCH, WHICH IS WHY THIS EXISTS.** Its
+/// `getContactOrProfileName` goes straight from the system contact name to the
+/// profile name, and that function is what fills `envelope.sourceName` — so a
+/// contact renamed in Signal's own UI arrived here under whatever they call
+/// themselves. `/v1/contacts` serves the nickname at 0.14.5 regardless, so the
+/// fix is to read it rather than to wait for an image.
+pub fn display_name_of(c: &Value) -> Option<String> {
+    let joined = |obj: Option<&Value>, given: &str, family: &str| -> Option<String> {
+        let obj = obj?;
+        let part = |k: &str| {
+            obj.get(k)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        };
+        match (part(given), part(family)) {
+            (Some(g), Some(f)) => Some(format!("{g} {f}")),
+            (Some(g), None) => Some(g.to_string()),
+            (None, Some(f)) => Some(f.to_string()),
+            (None, None) => None,
+        }
+    };
+    let flat = |k: &str| {
+        c.get(k)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let nick = c.get("nickname");
+    // `nickname.name` is the single-field form; the UI writes first/last, so the
+    // split is the usual case and the flat one is checked first only because
+    // signal-cli's own `getDisplayNickname` does the same.
+    nick.and_then(|n| {
+        n.get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    })
+    .or_else(|| joined(nick, "given_name", "family_name"))
+    .or_else(|| flat("name"))
+    .or_else(|| joined(Some(c), "given_name", "family_name"))
+    .or_else(|| joined(c.get("profile"), "given_name", "lastname"))
+}

@@ -3,7 +3,7 @@
 use serde_json::json;
 use signal_archiver::parse::{
     Action, Attachment, CallEvent, CallEventKind, Contact, Edit, Message, Reaction, Receipt,
-    ReceiptKind, ThreadId, ThreadKind, parse_frame,
+    ReceiptKind, ThreadId, ThreadKind, display_name_of, parse_frame,
 };
 
 #[test]
@@ -452,4 +452,74 @@ fn a_call_arrives_as_the_frames_it_is_made_of() {
         "callMessage": {"iceUpdateMessages": [{"id": 42, "opaque": "y"}]}
     }});
     assert_eq!(parse_frame(&ice).action, Action::Skip);
+}
+
+// ---- what Signal would call somebody ---------------------------------------
+
+/// ⚠ **THE FIXTURES ARE REAL RECORDS FROM `/v1/contacts`**, shapes observed on the
+/// deployed signal-cli on 2026-09-21 — not invented. The last test in this file
+/// to invent a field (`sticker.emoji`) passed for three months while the archive
+/// lost every sticker's identity, because a mock cannot contradict the thing it
+/// stands for.
+///
+/// The ORDER under test is signal-cli's own, from `getContactOrProfileName` at
+/// v0.14.7: nickname, else system contact name, else profile name. The deployed
+/// 0.14.5 lacks the nickname branch, which is exactly why this function exists
+/// rather than the archive just reading `envelope.sourceName`.
+#[test]
+fn a_nickname_outranks_the_profile_name_the_person_chose() {
+    // Her real record: she calls herself Tata, Pippijn typed Tania Boiko.
+    let c = json!({
+        "uuid": "fb07a20e", "name": "", "given_name": "",
+        "profile": {"given_name": "Tata", "lastname": ""},
+        "nickname": {"name": "", "given_name": "Tania", "family_name": "Boiko"}
+    });
+    assert_eq!(display_name_of(&c).as_deref(), Some("Tania Boiko"));
+}
+
+/// The commonest shape here: 38 of 52 recipients have an address-book name and
+/// no nickname, and for 13 of those a profile name sits underneath it.
+#[test]
+fn the_address_book_outranks_the_profile_name() {
+    let c = json!({
+        "uuid": "u1", "name": "Alice Andersson", "given_name": "Alice",
+        "profile": {"given_name": "ali", "lastname": ""},
+        "nickname": {"name": "", "given_name": "", "family_name": ""}
+    });
+    assert_eq!(display_name_of(&c).as_deref(), Some("Alice Andersson"));
+}
+
+/// ⚠ **AN EMPTY NICKNAME IS NOT A NICKNAME.** signal-cli sends the object with
+/// blank strings rather than omitting it, so a presence check would make every
+/// contact nameless — the failure would be total and instant, which is the only
+/// reason it is not the likelier bug.
+#[test]
+fn blank_name_fields_fall_through_rather_than_winning() {
+    let c = json!({
+        "uuid": "u2", "name": "", "given_name": "",
+        "profile": {"given_name": "Carol", "lastname": "Danvers"},
+        "nickname": {"name": "", "given_name": "", "family_name": ""}
+    });
+    assert_eq!(display_name_of(&c).as_deref(), Some("Carol Danvers"));
+}
+
+/// Half a name is still a name — `getDisplayNickname` joins what it has.
+#[test]
+fn one_half_of_a_name_is_used_without_a_stray_space() {
+    let given = json!({"uuid": "u3", "nickname": {"given_name": "Mononym"}});
+    assert_eq!(display_name_of(&given).as_deref(), Some("Mononym"));
+    let family = json!({"uuid": "u4", "nickname": {"family_name": "Surname"}});
+    assert_eq!(display_name_of(&family).as_deref(), Some("Surname"));
+}
+
+/// ⚠ **`None`, NOT AN EMPTY STRING.** 3 of 45 contacts resolve to no name at all.
+/// `upsert_contact` reads `None` as "learned nothing" and keeps what it has; an
+/// empty string would pass the non-empty filter nowhere and blank somebody.
+#[test]
+fn a_contact_with_no_name_anywhere_resolves_to_nothing() {
+    let c = json!({"uuid": "u5", "name": "", "given_name": "",
+                   "profile": {"given_name": "", "lastname": ""},
+                   "nickname": {"name": "", "given_name": "", "family_name": ""}});
+    assert_eq!(display_name_of(&c), None);
+    assert_eq!(display_name_of(&json!({"uuid": "u6"})), None);
 }

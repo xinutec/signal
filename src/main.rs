@@ -30,7 +30,7 @@ const MAX_IDLE_PROBES: u32 = 3;
 
 use signal_archiver::attach;
 use signal_archiver::db::Db;
-use signal_archiver::parse::{Action, parse_frame};
+use signal_archiver::parse::{Action, display_name_of, parse_frame};
 
 /// Shared state for the per-frame dispatcher.
 #[derive(Clone)]
@@ -76,6 +76,7 @@ async fn main() -> Result<()> {
     tracing::info!("DB connected + migrated; ingesting from {ws_url}");
 
     tokio::spawn(refresh_group_names(ctx.clone()));
+    tokio::spawn(refresh_contact_names(ctx.clone()));
 
     loop {
         match run_ws(&ws_url, &ctx).await {
@@ -314,6 +315,63 @@ async fn download_attachment(ctx: &Ctx, id: &str) -> Option<String> {
 }
 
 /// Periodically pull group titles (the receive payload only carries the id).
+/// Keep contact names in step with what Signal shows.
+///
+/// ⚠ **`envelope.sourceName` CANNOT DO THIS ON 0.14.5**, which is the whole
+/// reason for a second source of the same fact — see `display_name_of`. A name
+/// that changes flows through `upsert_contact`, so the one it replaces is dated
+/// rather than overwritten.
+async fn refresh_contact_names(ctx: Ctx) {
+    let url = format!("{}/v1/contacts/{}", ctx.http_base, ctx.number);
+    loop {
+        // ⚠ Generous timeout on purpose: this endpoint resolves profiles and is
+        // measurably slower than /v1/groups, and a timeout here reads as "no
+        // contacts" — which would be a silent no-op rather than an error.
+        if let Ok(resp) = ctx
+            .http
+            .get(&url)
+            .timeout(Duration::from_secs(120))
+            .send()
+            .await
+            && let Ok(bytes) = resp.bytes().await
+            && let Ok(Value::Array(contacts)) = serde_json::from_slice::<Value>(&bytes)
+        {
+            let (mut named, mut skipped) = (0usize, 0usize);
+            for c in &contacts {
+                let Some(uuid) = c
+                    .get("uuid")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                else {
+                    skipped += 1;
+                    continue;
+                };
+                let Some(name) = display_name_of(c) else {
+                    // No name from any of the three sources. Deliberately NOT an
+                    // upsert with None: `upsert_contact` treats that as "learned
+                    // nothing", which is right, but counting it is how a silent
+                    // regression here becomes visible in the log.
+                    skipped += 1;
+                    continue;
+                };
+                let phone = c
+                    .get("number")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty());
+                if let Err(e) = ctx.db.upsert_contact(uuid, phone, Some(&name)).await {
+                    tracing::warn!("failed to store contact name for {uuid}: {e}");
+                } else {
+                    named += 1;
+                }
+            }
+            tracing::debug!("refreshed {named} contact name(s), {skipped} with no name to take");
+        }
+        // Hourly. A rename is a rare, human-paced event and this endpoint is the
+        // expensive one; the live path still learns a name from every message.
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+    }
+}
+
 async fn refresh_group_names(ctx: Ctx) {
     let url = format!("{}/v1/groups/{}", ctx.http_base, ctx.number);
     loop {
