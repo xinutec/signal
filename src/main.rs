@@ -249,18 +249,7 @@ async fn dispatch(ctx: &Ctx, frame: &Value) -> Result<()> {
         Action::Message(m) => {
             ctx.db.upsert_conversation(&m.thread_id).await?;
             // `None` = a duplicate INSERT IGNORE dropped; skip its children.
-            if let Some(msg_id) = ctx
-                .db
-                .insert_message(
-                    &m.thread_id,
-                    &m.sender,
-                    m.server_ts,
-                    m.body.as_deref(),
-                    m.quote_target_ts,
-                    m.is_outgoing,
-                )
-                .await?
-            {
+            if let Some(msg_id) = ctx.db.insert_message(&m).await? {
                 for att in &m.attachments {
                     let stored = match &att.id {
                         Some(id) => download_attachment(ctx, id).await,

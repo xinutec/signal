@@ -1117,6 +1117,67 @@ const MIGRATIONS: &[&str] = &[
     // of them. Measured before dropping: 41 rows, all 41 identical across the two
     // columns, so nothing is lost.
     r"ALTER TABLE contacts DROP COLUMN profile_name",
+    // v47: when the SERVER saw it, and whether it was on a timer (#1693).
+    //
+    // ⚠ **`server_ts` IS THE SENDER'S CLOCK, AND IT IS THE ONLY TIME THIS ARCHIVE
+    // HAS HAD.** Signal's `envelope.timestamp` is minted by the sending device
+    // and doubles as the message's identity, so it cannot be corrected — a phone
+    // with a wrong clock files its words under a wrong hour and the archive
+    // agrees. `serverReceivedTimestamp` is Signal's own, assigned when the
+    // message reached them, and is the only timestamp here no sender can set.
+    //
+    // ⚠ **THESE WERE CHOSEN BECAUSE THERE IS DATA FOR THEM**, which is the whole
+    // discipline of this migration. Measured over the frames captured so far:
+    // `serverReceivedTimestamp` on 31 of 31, `expiresInSeconds` on 7 of 7 data
+    // messages — and quotes, mentions, text styles and previews on ZERO. Adding
+    // columns for those would mean testing them against fixtures written from a
+    // source definition with nothing real to contradict them, which is precisely
+    // how `sticker.emoji` — a field signal-cli has never sent — passed its own
+    // test for three months. They wait until a frame carries one.
+    //
+    // ⚠ **`expires_in_seconds` IS CONTEXT THE ARCHIVE WAS DISCARDING ENTIRELY.** A
+    // disappearing-message timer says the conversation was meant not to last;
+    // keeping the words while losing that fact misrepresents what was said.
+    // NULL means the frame carried no timer, 0 means the timer was turned OFF —
+    // two different statements, so the column is nullable rather than defaulted.
+    r"ALTER TABLE messages
+        ADD COLUMN server_received_ts BIGINT NULL,
+        ADD COLUMN server_delivered_ts BIGINT NULL,
+        ADD COLUMN expires_in_seconds INT NULL",
+    // v48: fill the new columns from the frames already kept (#1693).
+    //
+    // ⚠ **THIS IS THE POINT OF `signal_frames`, DEMONSTRATED.** The columns above
+    // did not exist when these messages arrived, and every value below was
+    // nonetheless recorded — because the envelope was stored whole before
+    // anything read it. Without that table this migration could only have been an
+    // `ALTER` and a shrug.
+    //
+    // ⚠ **AND IT REACHES EXACTLY AS FAR BACK AS THE FRAMES DO**, which is
+    // 2026-09-21 and no further. Signal keeps no server-side history, so the
+    // messages before that have no envelope to read and never will. A backfill
+    // that appeared to "work" while touching almost nothing is the expected
+    // outcome here, not a failure — the honest test is whether the rows it CAN
+    // reach get the right values.
+    //
+    // ⚠ **`JSON_VALUE`, NOT `->>`.** The operator is MySQL's and MariaDB rejects
+    // it outright (error 1064). Pinned in `tests/contacts.rs` for the same reason
+    // it is written out here: a backfill is exactly where that is discovered
+    // expensively.
+    //
+    // Joined on `server_ts` — Signal's envelope timestamp IS the message's
+    // identity, which is what makes the frame findable from the row at all.
+    r"UPDATE messages m
+        JOIN signal_frames f ON f.envelope_ts = m.server_ts
+         SET m.server_received_ts = COALESCE(
+                 m.server_received_ts,
+                 JSON_VALUE(f.frame, '$.envelope.serverReceivedTimestamp')),
+             m.server_delivered_ts = COALESCE(
+                 m.server_delivered_ts,
+                 JSON_VALUE(f.frame, '$.envelope.serverDeliveredTimestamp')),
+             m.expires_in_seconds = COALESCE(
+                 m.expires_in_seconds,
+                 JSON_VALUE(f.frame, '$.envelope.dataMessage.expiresInSeconds'),
+                 JSON_VALUE(f.frame, '$.envelope.syncMessage.sentMessage.expiresInSeconds'))",
 ];
 
 #[derive(Clone)]
@@ -1345,26 +1406,26 @@ impl Db {
     /// duplicate that `INSERT IGNORE` dropped. Encoding the duplicate case as
     /// `None` (rather than a `0` sentinel) means a caller can't fetch children
     /// for a row that was never written without the type forcing the check.
-    pub async fn insert_message(
-        &self,
-        thread_id: &ThreadId,
-        sender_uuid: &str,
-        server_ts: i64,
-        body: Option<&str>,
-        quote_target_ts: Option<i64>,
-        is_outgoing: bool,
-    ) -> Result<Option<u64>> {
+    /// ⚠ **TAKES THE PARSED MESSAGE, NOT NINE POSITIONAL ARGUMENTS.** It was six
+    /// and v47 adds three more; at that width a call site is a row of bare values
+    /// where two `Option<i64>` timestamps sit next to each other and swapping them
+    /// compiles. The caller already holds the whole thing.
+    pub async fn insert_message(&self, m: &crate::parse::Message) -> Result<Option<u64>> {
         let res = sqlx::query(
             "INSERT IGNORE INTO messages
-                (thread_id, sender_uuid, server_ts, body, quote_target_ts, is_outgoing)
-             VALUES (?, ?, ?, ?, ?, ?)",
+                (thread_id, sender_uuid, server_ts, body, quote_target_ts, is_outgoing,
+                 server_received_ts, server_delivered_ts, expires_in_seconds)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
-        .bind(thread_id.to_string())
-        .bind(sender_uuid)
-        .bind(server_ts)
-        .bind(body)
-        .bind(quote_target_ts)
-        .bind(is_outgoing)
+        .bind(m.thread_id.to_string())
+        .bind(&m.sender)
+        .bind(m.server_ts)
+        .bind(m.body.as_deref())
+        .bind(m.quote_target_ts)
+        .bind(m.is_outgoing)
+        .bind(m.server_received_ts)
+        .bind(m.server_delivered_ts)
+        .bind(m.expires_in_seconds)
         .execute(&self.pool)
         .await?;
         // INSERT IGNORE skips a duplicate: 0 rows affected, no new id.

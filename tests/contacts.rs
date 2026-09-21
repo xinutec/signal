@@ -365,3 +365,136 @@ async fn two_frames_sharing_a_timestamp_both_survive() {
         .unwrap();
     assert_eq!(rows, 2, "same timestamp, different frames, both kept");
 }
+
+// ---- the backfill the frames exist for --------------------------------------
+
+/// ⚠ **THIS IS WHAT `signal_frames` WAS FOR, EXERCISED.** The columns did not
+/// exist when these envelopes arrived; the values come out anyway because the
+/// frame was stored whole before anything read it. Without that table, v47 could
+/// only ever have been an `ALTER` and a shrug.
+///
+/// The test writes a message the OLD way — no server times, no timer, exactly
+/// what a row from before v47 looks like — then runs the backfill statement and
+/// asserts the row learned from its frame.
+#[tokio::test]
+async fn a_message_learns_its_server_times_from_its_kept_frame() {
+    let Some((db, pool)) = connect().await else {
+        return;
+    };
+    let ts = 1_620_000_000_000i64 + std::process::id() as i64;
+    let thread = format!("dm:backfill-{}", std::process::id());
+
+    // The frame, as it arrived. Distinct numbers throughout so a reader that
+    // returns the wrong one cannot pass.
+    let frame = serde_json::json!({"envelope": {
+        "sourceUuid": "backfill-test", "timestamp": ts,
+        "serverReceivedTimestamp": ts - 3,
+        "serverDeliveredTimestamp": ts - 1,
+        "dataMessage": {"message": "hello", "timestamp": ts, "expiresInSeconds": 86400}
+    }});
+    assert!(db.record_signal_frame(&frame).await.unwrap());
+
+    // The row as it would have been written before v47 existed.
+    sqlx::query(
+        "INSERT INTO messages (thread_id, sender_uuid, server_ts, body, is_outgoing)
+         VALUES (?, 'backfill-test', ?, 'hello', 0)",
+    )
+    .bind(&thread)
+    .bind(ts)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // ⚠ The v48 statement verbatim. Copied rather than invoked because a
+    // migration only ever runs once per database — re-running it here is the only
+    // way to exercise it against a row created after it had already passed.
+    // dev-lint: allow-sqlx — the v48 migration's own statement, under test.
+    sqlx::query(
+        "UPDATE messages m
+          JOIN signal_frames f ON f.envelope_ts = m.server_ts
+           SET m.server_received_ts = COALESCE(
+                   m.server_received_ts,
+                   JSON_VALUE(f.frame, '$.envelope.serverReceivedTimestamp')),
+               m.server_delivered_ts = COALESCE(
+                   m.server_delivered_ts,
+                   JSON_VALUE(f.frame, '$.envelope.serverDeliveredTimestamp')),
+               m.expires_in_seconds = COALESCE(
+                   m.expires_in_seconds,
+                   JSON_VALUE(f.frame, '$.envelope.dataMessage.expiresInSeconds'),
+                   JSON_VALUE(f.frame, '$.envelope.syncMessage.sentMessage.expiresInSeconds'))",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let got: (Option<i64>, Option<i64>, Option<i32>) = sqlx::query_as(
+        "SELECT server_received_ts, server_delivered_ts, expires_in_seconds
+           FROM messages WHERE thread_id = ? AND server_ts = ?",
+    )
+    .bind(&thread)
+    .bind(ts)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(got.0, Some(ts - 3), "Signal's receive time, from the frame");
+    assert_eq!(got.1, Some(ts - 1), "and its delivery time");
+    assert_eq!(
+        got.2,
+        Some(86400),
+        "and the day-long timer it was sent under"
+    );
+}
+
+/// ⚠ **A MESSAGE WITH NO FRAME LEARNS NOTHING, AND THAT IS THE EXPECTED SHAPE OF
+/// THIS BACKFILL.** Frame capture began 2026-09-21; everything before it has no
+/// envelope and never will, because Signal keeps no server-side history. So the
+/// backfill touching almost nothing is correct rather than broken — and the
+/// columns must stay NULL rather than acquiring the sender's clock, which would
+/// make an unmeasured value indistinguishable from a measured one.
+#[tokio::test]
+async fn a_message_with_no_frame_keeps_null_rather_than_guessing() {
+    let Some((_db, pool)) = connect().await else {
+        return;
+    };
+    let ts = 1_630_000_000_000i64 + std::process::id() as i64;
+    let thread = format!("dm:noframe-{}", std::process::id());
+
+    sqlx::query(
+        "INSERT INTO messages (thread_id, sender_uuid, server_ts, body, is_outgoing)
+         VALUES (?, 'noframe-test', ?, 'older than the frames', 0)",
+    )
+    .bind(&thread)
+    .bind(ts)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // dev-lint: allow-sqlx — the v48 migration's own statement, under test.
+    sqlx::query(
+        "UPDATE messages m
+          JOIN signal_frames f ON f.envelope_ts = m.server_ts
+           SET m.server_received_ts = COALESCE(
+                   m.server_received_ts,
+                   JSON_VALUE(f.frame, '$.envelope.serverReceivedTimestamp'))",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let got: (Option<i64>, Option<i64>, Option<i32>) = sqlx::query_as(
+        "SELECT server_received_ts, server_delivered_ts, expires_in_seconds
+           FROM messages WHERE thread_id = ? AND server_ts = ?",
+    )
+    .bind(&thread)
+    .bind(ts)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        got,
+        (None, None, None),
+        "no frame, no values — not the sender's clock standing in"
+    );
+}

@@ -19,6 +19,9 @@ fn incoming_text_dm() {
             thread_id: ThreadId::Dm("u1".into()),
             sender: "u1".into(),
             server_ts: 1000,
+            server_received_ts: None,
+            server_delivered_ts: None,
+            expires_in_seconds: None,
             body: Some("hi there".into()),
             quote_target_ts: None,
             is_outgoing: false,
@@ -49,6 +52,13 @@ fn outgoing_sync_dm_keys_thread_by_destination() {
             thread_id: ThreadId::Dm("u2".into()),
             sender: "me".into(),
             server_ts: 2000,
+            // ⚠ This fixture's envelope carries no server times, so they stay
+            // `None` — asserted rather than elided, because the alternative
+            // (falling back to the sender's clock) would look identical in a
+            // struct literal that simply omitted them.
+            server_received_ts: None,
+            server_delivered_ts: None,
+            expires_in_seconds: None,
             body: Some("yo".into()),
             quote_target_ts: None,
             is_outgoing: true,
@@ -522,4 +532,74 @@ fn a_contact_with_no_name_anywhere_resolves_to_nothing() {
                    "nickname": {"name": "", "given_name": "", "family_name": ""}});
     assert_eq!(display_name_of(&c), None);
     assert_eq!(display_name_of(&json!({"uuid": "u6"})), None);
+}
+
+// ---- the times Signal puts on, and the timer it was sent under --------------
+
+/// ⚠ **THE FIXTURE IS A REAL FRAME, TRIMMED** — taken from `signal_frames` on
+/// 2026-09-21, not written from the record definition. Every field asserted here
+/// was observed on the wire: `serverReceivedTimestamp` on 31 of 31 frames and
+/// `expiresInSeconds` on 7 of 7 data messages. Quotes, mentions, text styles and
+/// previews appeared on ZERO, which is why they have no columns yet and no
+/// fixtures here — inventing one is how `sticker.emoji` passed for three months.
+#[test]
+fn a_message_carries_signals_own_times_and_its_timer() {
+    let f = json!({"envelope": {
+        "source": "+447700900123", "sourceUuid": "u1", "sourceName": "Someone",
+        "timestamp": 1790001402745i64,
+        "serverReceivedTimestamp": 1790001399818i64,
+        "serverDeliveredTimestamp": 1790001400170i64,
+        "dataMessage": {"message": "hello", "timestamp": 1790001402745i64, "expiresInSeconds": 604800}
+    }});
+    match parse_frame(&f).action {
+        Action::Message(m) => {
+            // ⚠ The sender's own clock, and NOT the same number as the server's.
+            // The fixture keeps them distinct on purpose: equal values would let
+            // a reader that returned the wrong one pass.
+            assert_eq!(m.server_ts, 1790001402745);
+            assert_eq!(m.server_received_ts, Some(1790001399818));
+            assert_eq!(m.server_delivered_ts, Some(1790001400170));
+            assert_eq!(m.expires_in_seconds, Some(604800), "a one-week timer");
+        }
+        other => panic!("expected Message, got {other:?}"),
+    }
+}
+
+/// ⚠ **ABSENT IS NOT ZERO.** A frame with no timer says nothing about one; a
+/// timer of 0 says somebody turned it OFF. Collapsing them loses the second, and
+/// the archive would report every old message as "never expiring" with the same
+/// confidence as one where that was actually chosen.
+#[test]
+fn no_timer_and_a_timer_of_zero_are_different_answers() {
+    let absent = json!({"envelope": {
+        "sourceUuid": "u1", "timestamp": 7, "dataMessage": {"message": "hi"}
+    }});
+    let off = json!({"envelope": {
+        "sourceUuid": "u1", "timestamp": 8,
+        "dataMessage": {"message": "hi", "expiresInSeconds": 0}
+    }});
+    let timer = |f: &serde_json::Value| match parse_frame(f).action {
+        Action::Message(m) => m.expires_in_seconds,
+        other => panic!("expected Message, got {other:?}"),
+    };
+    assert_eq!(timer(&absent), None, "no timer mentioned");
+    assert_eq!(timer(&off), Some(0), "the timer was switched off");
+}
+
+/// A frame that carries neither server time — older signal-cli, or a shape that
+/// simply omits them — must leave both `None` rather than borrowing the sender's
+/// clock. A fabricated server time is indistinguishable from a measured one.
+#[test]
+fn missing_server_times_are_not_invented_from_the_senders_clock() {
+    let f = json!({"envelope": {
+        "sourceUuid": "u1", "timestamp": 1234, "dataMessage": {"message": "hi"}
+    }});
+    match parse_frame(&f).action {
+        Action::Message(m) => {
+            assert_eq!(m.server_ts, 1234);
+            assert_eq!(m.server_received_ts, None);
+            assert_eq!(m.server_delivered_ts, None);
+        }
+        other => panic!("expected Message, got {other:?}"),
+    }
 }

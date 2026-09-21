@@ -74,7 +74,22 @@ pub struct Attachment {
 pub struct Message {
     pub thread_id: ThreadId,
     pub sender: String,
+    /// ⚠ **THE SENDER'S CLOCK.** `envelope.timestamp` is minted by the sending
+    /// device and doubles as the message's identity, so a phone with a wrong
+    /// clock files its words under a wrong hour and nothing can correct it.
     pub server_ts: i64,
+    /// When SIGNAL received it — the only timestamp here no sender can set.
+    pub server_received_ts: Option<i64>,
+    /// When Signal handed it to this device. The gap from `server_received_ts`
+    /// is how long it sat queued, which is what a reconnect after downtime looks
+    /// like from the inside.
+    pub server_delivered_ts: Option<i64>,
+    /// The disappearing-message timer in force when this was sent.
+    ///
+    /// ⚠ **`None` AND `Some(0)` ARE DIFFERENT STATEMENTS.** Absent means the
+    /// frame carried no timer at all; zero means the timer was explicitly turned
+    /// OFF, which is a thing somebody did. Collapsing them would lose the second.
+    pub expires_in_seconds: Option<i32>,
     pub body: Option<String>,
     pub quote_target_ts: Option<i64>,
     pub is_outgoing: bool,
@@ -238,9 +253,44 @@ fn thread_of(msg: &Value, dm_peer: &str) -> ThreadId {
     }
 }
 
+/// The two times SIGNAL put on the envelope, which the payload cannot see.
+///
+/// ⚠ **THESE ARE THE ONLY TIMESTAMPS NO SENDER CAN SET.** `envelope.timestamp`
+/// is minted by the sending device and doubles as the message's identity, so a
+/// wrong clock files a message under a wrong hour and nothing downstream can
+/// correct it. These two are the server's own.
+///
+/// Passed as a pair rather than as two more positional parameters: they are one
+/// fact about one envelope, and a bare `Option<i64>, Option<i64>` at a call site
+/// is two chances to swap them silently.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ServerTimes {
+    pub received: Option<i64>,
+    pub delivered: Option<i64>,
+}
+
+impl ServerTimes {
+    /// Read them off an `envelope`. Absent on frames that carry neither, which
+    /// is why both stay `Option` rather than defaulting to the sender's time —
+    /// a guess here would be indistinguishable from a measurement.
+    fn of(env: &Value) -> Self {
+        ServerTimes {
+            received: env.get("serverReceivedTimestamp").and_then(Value::as_i64),
+            delivered: env.get("serverDeliveredTimestamp").and_then(Value::as_i64),
+        }
+    }
+}
+
 /// Turn the message payload (dataMessage or sentMessage — same shape) into an
 /// Action: a delete request, a reaction, or a stored message.
-fn payload_action(msg: &Value, sender: &str, ts: i64, is_outgoing: bool, dm_peer: &str) -> Action {
+fn payload_action(
+    msg: &Value,
+    sender: &str,
+    ts: i64,
+    is_outgoing: bool,
+    dm_peer: &str,
+    times: ServerTimes,
+) -> Action {
     let thread_id = thread_of(msg, dm_peer);
 
     if let Some(rd) = msg.get("remoteDelete") {
@@ -337,6 +387,15 @@ fn payload_action(msg: &Value, sender: &str, ts: i64, is_outgoing: bool, dm_peer
         thread_id,
         sender: sender.to_string(),
         server_ts: ts,
+        server_received_ts: times.received,
+        server_delivered_ts: times.delivered,
+        // ⚠ Read as i64 then narrowed, because `as_i32` does not exist on
+        // `serde_json::Value` — and a value too large for an INT is dropped
+        // rather than wrapped, since a negative timer is not a shorter one.
+        expires_in_seconds: msg
+            .get("expiresInSeconds")
+            .and_then(Value::as_i64)
+            .and_then(|n| i32::try_from(n).ok()),
         body,
         quote_target_ts: quote,
         is_outgoing,
@@ -467,7 +526,7 @@ pub fn parse_frame(frame: &Value) -> Parsed {
                 .map(str::to_string),
             name: name.map(str::to_string),
         });
-        let action = payload_action(dm, &sender, ts, false, &sender);
+        let action = payload_action(dm, &sender, ts, false, &sender, ServerTimes::of(env));
         // Name a DM thread after the other party (not for groups/deletes).
         let dm_name = match (&action, dm.get("groupInfo").is_none(), name) {
             (Action::Message(_) | Action::Reaction(_), true, Some(n)) => {
@@ -597,7 +656,7 @@ pub fn parse_frame(frame: &Value) -> Parsed {
             return Parsed::skip();
         };
         let dest = id_of(sent.get("destinationUuid"), sent.get("destination"));
-        let action = payload_action(sent, &sender, ts, true, &dest);
+        let action = payload_action(sent, &sender, ts, true, &dest, ServerTimes::of(env));
         return Parsed {
             action,
             contact: None,
