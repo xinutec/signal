@@ -6,7 +6,7 @@
 //! unit test of the comparison would pass while the thing that matters (a line
 //! arriving and never being imported) went wrong.
 //!
-//! ⚠ **The failure mode this guards is SILENT DATA LOSS.** Every other bug in
+//! ⚠ The failure mode this guards is SILENT DATA LOSS. Every other bug in
 //! this importer is loud: a parse failure is reported, a duplicate is refused by
 //! the unique key, a connection error stops the run. A file wrongly marked as
 //! already-read produces no error, no warning and no row — the message simply is
@@ -46,7 +46,7 @@ fn db_env() -> Option<Vec<(&'static str, String)>> {
 
 /// A network tag unique to `base` *and* to this run.
 ///
-/// ⚠ **UNIQUE PER TEST IS NOT ENOUGH — IT HAS TO BE UNIQUE PER RUN.** The tags
+/// ⚠ UNIQUE PER TEST IS NOT ENOUGH — IT HAS TO BE UNIQUE PER RUN. The tags
 /// used to be constants, which kept the five tests out of each other's way and
 /// did nothing about the run before. A second `cargo test` against the same
 /// database then failed four of five: the rows are still there, so the dedupe key
@@ -217,7 +217,7 @@ async fn stored_text(tag: &str) -> Vec<String> {
     rows.into_iter().map(|(t,)| t.unwrap_or_default()).collect()
 }
 
-/// ⚠ **THE CORRUPTION THIS PREVENTS IS PERMANENT.** `rsync` copies a log file
+/// ⚠ THE CORRUPTION THIS PREVENTS IS PERMANENT. `rsync` copies a log file
 /// whatever irssi is doing to it, so a snapshot can end halfway through a line.
 /// Imported, that fragment takes the `line_no` the finished line will have — and
 /// the dedupe key then refuses the real one forever. No error, no warning, and

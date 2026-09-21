@@ -1,7 +1,7 @@
 //! The live tier: learn about an IRC line in under a second instead of waiting
 //! for the next import.
 //!
-//! ⚠ **THIS IS NOT A SECOND IMPORTER, AND THE DISTINCTION IS THE DESIGN.** It
+//! ⚠ THIS IS NOT A SECOND IMPORTER, AND THE DISTINCTION IS THE DESIGN. It
 //! holds one long poll open to the irssi plugin, which answers with the lines
 //! irssi has just logged AND WHERE THEY ARE — the `(file_date, line_no)` that,
 //! with the conversation and the source tag, is the archive's dedupe key. Every
@@ -16,7 +16,7 @@
 //! action is not a message — and a second interpretation here would drift from
 //! the importer's within a week.
 //!
-//! **What happens when this fails is the point.** A missed line is not lost; it
+//! What happens when this fails is the point. A missed line is not lost; it
 //! is late, because the reconciler is still running. That is what allows this
 //! tier to be the simple one. ⚠ The failure it must NOT have is the quiet kind:
 //! a wedged poll looks exactly like a quiet channel, so the plugin answers an

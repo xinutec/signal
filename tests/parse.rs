@@ -154,8 +154,8 @@ fn outgoing_remote_delete_marks_self_sender() {
     );
 }
 
-/// ⚠ **THIS TEST INVENTED THE FIELD IT WAS TESTING, AND SO PASSED FOR THREE
-/// MONTHS WHILE THE ARCHIVE LOST EVERY STICKER'S IDENTITY.** The fixture said
+/// ⚠ THIS TEST INVENTED THE FIELD IT WAS TESTING, AND SO PASSED FOR THREE
+/// MONTHS WHILE THE ARCHIVE LOST EVERY STICKER'S IDENTITY. The fixture said
 /// `{"emoji": "🎉"}`; signal-cli's `JsonSticker` is `(String packId, int
 /// stickerId)` and has never carried an emoji. A mock cannot contradict the thing
 /// it stands for — so the only check on the shape was this file agreeing with
@@ -178,7 +178,7 @@ fn sticker_only_message_names_the_pack_and_the_index() {
     }
 }
 
-/// ⚠ **AND A STICKER WITH NEITHER FIELD STILL HAS TO SAY A STICKER WAS SENT.**
+/// ⚠ AND A STICKER WITH NEITHER FIELD STILL HAS TO SAY A STICKER WAS SENT.
 /// The old code reached that wording by accident, through a missing field and an
 /// `unwrap_or("")`; it is a deliberate branch now, so the marker cannot quietly
 /// become the thing it means for an unrecognised shape.
@@ -230,8 +230,8 @@ fn jsonrpc_params_wrapped_envelope_is_accepted() {
     }
 }
 
-/// ⚠ **THIS TEST USED TO SAY RECEIPTS WERE SKIPPED, AND THAT WAS NOT A
-/// DECISION.** The arm had simply never been written, and the name made the
+/// ⚠ THIS TEST USED TO SAY RECEIPTS WERE SKIPPED, AND THAT WAS NOT A
+/// DECISION. The arm had simply never been written, and the name made the
 /// omission read as intent — it went on passing after receipts started being
 /// stored, because its receipt carried no `timestamps` and so skipped for an
 /// entirely different reason. A green test asserting the wrong rule is worse
@@ -353,7 +353,7 @@ fn edit_with_no_target_timestamp_is_skipped() {
     assert_eq!(parse_frame(&f).action, Action::Skip);
 }
 
-/// ⚠ **THE THREE RECEIPT FLAGS ARE NOT EXCLUSIVE.**
+/// ⚠ THE THREE RECEIPT FLAGS ARE NOT EXCLUSIVE.
 ///
 /// A single `receiptMessage` can report delivery AND read at once, so matching
 /// on them in the wrong order stores the weaker fact and loses the stronger —
@@ -466,7 +466,7 @@ fn a_call_arrives_as_the_frames_it_is_made_of() {
 
 // ---- what Signal would call somebody ---------------------------------------
 
-/// ⚠ **THE FIXTURES ARE REAL RECORDS FROM `/v1/contacts`**, shapes observed on the
+/// ⚠ THE FIXTURES ARE REAL RECORDS FROM `/v1/contacts`, shapes observed on the
 /// deployed signal-cli on 2026-09-21 — not invented. The last test in this file
 /// to invent a field (`sticker.emoji`) passed for three months while the archive
 /// lost every sticker's identity, because a mock cannot contradict the thing it
@@ -499,7 +499,7 @@ fn the_address_book_outranks_the_profile_name() {
     assert_eq!(display_name_of(&c).as_deref(), Some("Alice Andersson"));
 }
 
-/// ⚠ **AN EMPTY NICKNAME IS NOT A NICKNAME.** signal-cli sends the object with
+/// ⚠ AN EMPTY NICKNAME IS NOT A NICKNAME. signal-cli sends the object with
 /// blank strings rather than omitting it, so a presence check would make every
 /// contact nameless — the failure would be total and instant, which is the only
 /// reason it is not the likelier bug.
@@ -522,7 +522,7 @@ fn one_half_of_a_name_is_used_without_a_stray_space() {
     assert_eq!(display_name_of(&family).as_deref(), Some("Surname"));
 }
 
-/// ⚠ **`None`, NOT AN EMPTY STRING.** 3 of 45 contacts resolve to no name at all.
+/// ⚠ `None`, NOT AN EMPTY STRING. 3 of 45 contacts resolve to no name at all.
 /// `upsert_contact` reads `None` as "learned nothing" and keeps what it has; an
 /// empty string would pass the non-empty filter nowhere and blank somebody.
 #[test]
@@ -536,7 +536,7 @@ fn a_contact_with_no_name_anywhere_resolves_to_nothing() {
 
 // ---- the times Signal puts on, and the timer it was sent under --------------
 
-/// ⚠ **THE FIXTURE IS A REAL FRAME, TRIMMED** — taken from `signal_frames` on
+/// ⚠ THE FIXTURE IS A REAL FRAME, TRIMMED — taken from `signal_frames` on
 /// 2026-09-21, not written from the record definition. Every field asserted here
 /// was observed on the wire: `serverReceivedTimestamp` on 31 of 31 frames and
 /// `expiresInSeconds` on 7 of 7 data messages. Quotes, mentions, text styles and
@@ -565,7 +565,7 @@ fn a_message_carries_signals_own_times_and_its_timer() {
     }
 }
 
-/// ⚠ **ABSENT IS NOT ZERO.** A frame with no timer says nothing about one; a
+/// ⚠ ABSENT IS NOT ZERO. A frame with no timer says nothing about one; a
 /// timer of 0 says somebody turned it OFF. Collapsing them loses the second, and
 /// the archive would report every old message as "never expiring" with the same
 /// confidence as one where that was actually chosen.

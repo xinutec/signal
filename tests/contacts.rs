@@ -1,14 +1,14 @@
 //! What somebody is called, and what they were called before — against a real
 //! MariaDB, because everything that could be wrong here is the SQL.
 //!
-//! ⚠ **THESE EXIST BECAUSE A RENAME IS COMING IN BULK.** signal-cli resolves
+//! ⚠ THESE EXIST BECAUSE A RENAME IS COMING IN BULK. signal-cli resolves
 //! `envelope.sourceName` with Signal's own precedence, and 0.14.7 adds a branch
 //! above the other two — the first/last name you type in the app. Upgrading past
 //! it renames every contact who has one, on the first message after the pod
 //! restarts. `contacts` held one name per person, so that event would have
 //! silently destroyed what people were called before it.
 //!
-//! ⚠ **THEY ALSO EXIST BECAUSE A WRONG DIAGNOSIS GOT THIS FAR.** The claim was
+//! ⚠ THEY ALSO EXIST BECAUSE A WRONG DIAGNOSIS GOT THIS FAR. The claim was
 //! that `COALESCE(VALUES(x), x)` made the name write-once; it does the opposite,
 //! and the archive had been tracking signal-cli correctly all along. The first
 //! run of `the_old_name_is_kept_and_dated` said so within a minute, which is the
@@ -109,7 +109,7 @@ async fn a_renamed_contact_is_renamed_here_too() {
     );
 }
 
-/// ⚠ **A RENAME MUST NOT ERASE WHAT SHE WAS CALLED WHEN SHE SAID SOMETHING.** An
+/// ⚠ A RENAME MUST NOT ERASE WHAT SHE WAS CALLED WHEN SHE SAID SOMETHING. An
 /// archive that only overwrites answers "what is she called" and loses "what was
 /// she called then", and the second is the one a reader of an old thread has.
 #[tokio::test]
@@ -145,7 +145,7 @@ async fn the_old_name_is_kept_and_dated() {
     assert!(ended.is_some_and(|t| t > 0), "the old name carries its end");
 }
 
-/// ⚠ **LEARNING NOTHING IS NOT LEARNING THAT SHE HAS NO NAME.** A sighting with no
+/// ⚠ LEARNING NOTHING IS NOT LEARNING THAT SHE HAS NO NAME. A sighting with no
 /// name at all — a receipt, a typing frame, a group member we have no profile for
 /// — must not blank a name we hold, and must not open a chapter in the history
 /// either. Splitting the write into two statements is what put this case at risk,
@@ -181,16 +181,8 @@ async fn a_nameless_sighting_does_not_wipe_a_name() {
     assert_eq!(phone.as_deref(), Some("+447700900000"));
 }
 
-/// ⚠ **THE SUPERSEDED COLUMN IS GONE, AND THE ORDER IS WHAT MADE THAT SAFE.**
-/// `signal-ingester` is `RollingUpdate`, so old and new pods overlap: dropping
-/// the column in the same deploy that stopped writing it would have left the old
-/// pod INSERTing into a column that no longer exists — and Signal keeps no
-/// history to re-walk, so those messages would be gone. Writes stopped and
-/// shipped first (846974d); the drop is v46.
-///
-/// This asserts the END STATE rather than the sequence, because that is what a
-/// fresh database gets: v0 creates the column, v41 adds `display_name`, v42
-/// copies across, v46 drops it.
+/// Asserts the end state rather than the sequence, because that is what a fresh
+/// database gets once every migration has run.
 #[tokio::test]
 async fn the_superseded_column_is_gone() {
     let Some((db, pool)) = connect().await else {
@@ -233,7 +225,7 @@ async fn the_superseded_column_is_gone() {
 
 // ---- the frame itself -------------------------------------------------------
 
-/// ⚠ **SIGNAL SAYS EVERYTHING EXACTLY ONCE.** There is no server-side history to
+/// ⚠ SIGNAL SAYS EVERYTHING EXACTLY ONCE. There is no server-side history to
 /// re-walk — Telegram has one, which is why a gap there costs an afternoon and a
 /// gap here costs the message. `JsonDataMessage` carries 23 fields at the
 /// deployed 0.14.5 and `parse_frame` reads four, so keeping the bytes is what
@@ -280,7 +272,7 @@ async fn the_frame_is_kept_whole_and_a_replay_is_free() {
     // ⚠ The assertion that matters: a field with no column survives, and is
     // QUERYABLE. If this ever fails, the table has become a write-only hole and
     // the backfill it exists to enable is not possible.
-    // ⚠ **`JSON_VALUE`, NOT `->>`.** The `->>` operator is MySQL's; MariaDB
+    // ⚠ `JSON_VALUE`, NOT `->>`. The `->>` operator is MySQL's; MariaDB
     // rejects it outright (error 1064). Pinned here rather than discovered
     // halfway through a backfill over the whole table.
     let at = |path: &'static str| {
@@ -301,7 +293,7 @@ async fn the_frame_is_kept_whole_and_a_replay_is_free() {
     // Every one of these is a field the archive has no column for, read back out
     // of the frame. This is the backfill this table exists to make possible.
     //
-    // ⚠ **`1`, NOT `"true"`.** MariaDB's JSON_VALUE renders a JSON boolean as
+    // ⚠ `1`, NOT `"true"`. MariaDB's JSON_VALUE renders a JSON boolean as
     // 1/0. Pinned because a backfill comparing against 'true' would silently
     // classify every view-once message as ordinary — a wrong answer, not an error.
     assert_eq!(
@@ -337,7 +329,7 @@ async fn the_frame_is_kept_whole_and_a_replay_is_free() {
     );
 }
 
-/// ⚠ **TWO FRAMES CAN SHARE A TIMESTAMP AND BE DIFFERENT THINGS** — a message and
+/// ⚠ TWO FRAMES CAN SHARE A TIMESTAMP AND BE DIFFERENT THINGS — a message and
 /// the receipt that acknowledges it, a sync and the original. The key is the
 /// frame's own bytes for that reason: keying on (timestamp, source) would file
 /// the second as a replay of the first and lose it.
@@ -368,7 +360,7 @@ async fn two_frames_sharing_a_timestamp_both_survive() {
 
 // ---- the backfill the frames exist for --------------------------------------
 
-/// ⚠ **THIS IS WHAT `signal_frames` WAS FOR, EXERCISED.** The columns did not
+/// ⚠ THIS IS WHAT `signal_frames` WAS FOR, EXERCISED. The columns did not
 /// exist when these envelopes arrived; the values come out anyway because the
 /// frame was stored whole before anything read it. Without that table, v47 could
 /// only ever have been an `ALTER` and a shrug.
@@ -446,8 +438,8 @@ async fn a_message_learns_its_server_times_from_its_kept_frame() {
     );
 }
 
-/// ⚠ **A MESSAGE WITH NO FRAME LEARNS NOTHING, AND THAT IS THE EXPECTED SHAPE OF
-/// THIS BACKFILL.** Frame capture began 2026-09-21; everything before it has no
+/// ⚠ A MESSAGE WITH NO FRAME LEARNS NOTHING, AND THAT IS THE EXPECTED SHAPE OF
+/// THIS BACKFILL. Frame capture began 2026-09-21; everything before it has no
 /// envelope and never will, because Signal keeps no server-side history. So the
 /// backfill touching almost nothing is correct rather than broken — and the
 /// columns must stay NULL rather than acquiring the sender's clock, which would

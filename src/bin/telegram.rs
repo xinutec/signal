@@ -17,13 +17,13 @@
 //!                             signal MariaDB  (telegram_*)
 //! ```
 //!
-//! ⚠ **A bot could not do this.** A Telegram bot is a separate account and cannot
+//! ⚠ A bot could not do this. A Telegram bot is a separate account and cannot
 //! read the chats of the person who owns it, so an archive of Pippijn's own
 //! conversations has to be a USER client with his own `api_id`. That is also why
 //! the session in `telegram_session` is a credential and not a cache: see
 //! `telegram::session`.
 //!
-//! ⚠ **Secret chats are not here and cannot be.** They are device-local by
+//! ⚠ Secret chats are not here and cannot be. They are device-local by
 //! construction — the server never holds them — so no login reaches them. Nothing
 //! in this archive will say so; this line is the only record.
 //!
@@ -116,7 +116,7 @@ const REQUEST_BATCH: i64 = 1;
 
 /// The largest media this fetches without being asked.
 ///
-/// ⚠ **MEASURED BEFORE IT WAS CHOSEN.** The archive records every file's size from
+/// ⚠ MEASURED BEFORE IT WAS CHOSEN. The archive records every file's size from
 /// the message itself, at no network cost, so the split is arithmetic rather than
 /// instinct: 4,906 photos come to about 0.9GB and the largest is 0.8MB, while 832
 /// videos come to 3.8GB and ONE of them is 1.5GB. A ceiling here rather than a test
@@ -350,8 +350,8 @@ async fn archive(
 /// List every conversation the account has, record what each one IS, and return
 /// the ones whose history is not finished.
 ///
-/// ⚠ **ONE `messages.getDialogs` PER CALL, and that is the whole point of the
-/// shape.** The first version listed the dialogs inside the per-conversation loop
+/// ⚠ ONE `messages.getDialogs` PER CALL, and that is the whole point of the
+/// shape. The first version listed the dialogs inside the per-conversation loop
 /// and took ONE page of 100 messages per pass — so a conversation with five
 /// thousand messages needed fifty passes and fifty full dialog listings. Telegram
 /// answered with `FLOOD_WAIT` on `getDialogs`, sleeping 17-18 seconds at a time:
@@ -380,7 +380,7 @@ fn channel_peer(channel_id: i64) -> i64 {
 
 /// Both read marks a dialog carries, stored if either has moved.
 ///
-/// ⚠ **`getDialogs` HAS ALWAYS CARRIED THESE and the sweep threw them away.** The
+/// ⚠ `getDialogs` HAS ALWAYS CARRIED THESE and the sweep threw them away. The
 /// hourly pass read a dialog's peer, kind, name and username and dropped the rest,
 /// so the one fact in this archive that cannot be re-fetched later was being
 /// discarded on the floor every hour. No extra API call was ever needed for it.
@@ -420,7 +420,7 @@ async fn sweep(client: &Client, db: &Db) -> Result<Vec<(i64, PeerRef)>> {
             peer.username(),
         )
         .await?;
-        // ⚠ **BEFORE the `complete` check below, and that is not a detail.** Every
+        // ⚠ BEFORE the `complete` check below, and that is not a detail. Every
         // conversation in this archive is already backfilled, so anything recorded
         // after that `continue` would be recorded for nothing — the sweep's read
         // marks would silently never be written at all.
@@ -455,7 +455,7 @@ async fn sweep(client: &Client, db: &Db) -> Result<Vec<(i64, PeerRef)>> {
 
 /// Who sent it, for the updates that do not say.
 ///
-/// ⚠ **A LIVE DM UPDATE CARRIES NO USERS AT ALL.** Telegram's compact
+/// ⚠ A LIVE DM UPDATE CARRIES NO USERS AT ALL. Telegram's compact
 /// `updateShortMessage` names the sender by id and nothing else, and
 /// `Message::sender` is an in-packet lookup rather than a fetch — so it answers
 /// `None` for essentially every ordinary line typed in a one-to-one chat. That
@@ -467,7 +467,7 @@ async fn sweep(client: &Client, db: &Db) -> Result<Vec<(i64, PeerRef)>> {
 /// the dialog sweep put every dialog peer there — and `resolve_peer` turns that
 /// reference into a peer that has a name.
 ///
-/// ⚠ **Memoised for the life of the process, deliberately.** `catch_up: true`
+/// ⚠ Memoised for the life of the process, deliberately. `catch_up: true`
 /// can replay hundreds of updates at once after a restart, and one
 /// `users.getUsers` apiece would be a flood wait rather than an archive. The
 /// price is that a rename mid-process is not seen until the pod restarts, which
@@ -475,7 +475,7 @@ async fn sweep(client: &Client, db: &Db) -> Result<Vec<(i64, PeerRef)>> {
 /// name anything reads as CURRENT comes from `telegram_conversations`, which the
 /// hourly sweep refreshes.
 ///
-/// ⚠ **A failed lookup is not remembered.** It is a round trip that can fail for
+/// ⚠ A failed lookup is not remembered. It is a round trip that can fail for
 /// a minute at a time, and caching that minute would cost a process lifetime of
 /// nameless rows.
 #[derive(Default)]
@@ -484,7 +484,7 @@ struct Names(tokio::sync::Mutex<HashMap<PeerId, String>>);
 impl Names {
     /// Learn our own name, once, because `resolve_peer` cannot tell us.
     ///
-    /// ⚠ **THE SELF SENTINEL DOES NOT RESOLVE, AND THE ERROR READS BACKWARDS.**
+    /// ⚠ THE SELF SENTINEL DOES NOT RESOLVE, AND THE ERROR READS BACKWARDS.
     /// `Message::sender_id` answers `PeerId::self_user()` — `2^40`, not a user id —
     /// for an outgoing message in a one-to-one chat. Handing that to `resolve_peer`
     /// fails with `Dropped`, which sounds like a lost request and is not one: the
@@ -558,20 +558,20 @@ const RECAPTURE_PAGE: u32 = 100;
 /// Re-read every message the archive already holds, so columns added after it was
 /// stored get filled.
 ///
-/// ⚠ **THIS IS THE TOOL THAT MAKES A NEW COLUMN FILLABLE AT ALL.** The backfill
+/// ⚠ THIS IS THE TOOL THAT MAKES A NEW COLUMN FILLABLE AT ALL. The backfill
 /// marks a conversation `complete` and never returns, and the live stream only
 /// sees what arrives next — so a column added today would stay NULL on all
 /// 159,956 existing rows forever. `store_telegram_message`'s enrichment is the
 /// other half: it fills a NULL and never overwrites a known value, which is what
 /// makes running this a safe no-op once there is nothing left to learn.
 ///
-/// ⚠ **A HOLE IS NOT A DELETION.** `get_messages_by_id` answers positionally and
+/// ⚠ A HOLE IS NOT A DELETION. `get_messages_by_id` answers positionally and
 /// returns nothing for a message Telegram no longer has. This pass SKIPS those
 /// and marks nothing: a message retracted on Telegram is one this archive
 /// deliberately still holds, and letting a re-read tombstone it would make the
 /// repair destructive — the exact failure v28 records for reactions.
 ///
-/// ⚠ **Expect FLOOD_WAIT, and expect it to be fine.** The 9-call probe on
+/// ⚠ Expect FLOOD_WAIT, and expect it to be fine. The 9-call probe on
 /// 2026-09-18 was rate-limited three times at ~30s. `grammers` sleeps and retries
 /// on its own, so the pass is slow rather than fragile; a full run is hours, which
 /// is why the frontier is written after every batch.
@@ -637,7 +637,7 @@ async fn recapture(client: &Client, db: &Db, self_id: i64) -> Result<()> {
 
 /// Count how often each optional field Telegram CAN send is actually filled in.
 ///
-/// ⚠ **THE SCHEMA SAYS A FIELD EXISTS; IT DOES NOT SAY THE SERVER SENDS IT.**
+/// ⚠ THE SCHEMA SAYS A FIELD EXISTS; IT DOES NOT SAY THE SERVER SENDS IT.
 /// Almost everything interesting on `message#` is behind a flag, so reading
 /// `tl/api.tl` tells you what is possible and nothing about what arrives. This
 /// counts, over a sample of the archive's own messages, how many came back with
@@ -864,7 +864,7 @@ async fn follow(
     // because a replayed update is free: `(conversation_id, msg_id)` already holds
     // it.
     //
-    // ⚠ **AND `catch_up` ALONE WAS QUIETLY THROWING MOST OF IT AWAY.** grammers
+    // ⚠ AND `catch_up` ALONE WAS QUIETLY THROWING MOST OF IT AWAY. grammers
     // defaults `update_queue_limit` to 100 and DROPS the excess — `truncate`, not
     // backpressure — so every restart logged "72 updates were dropped because the
     // update_queue_limit was exceeded" and then carried on. The two settings work
@@ -914,7 +914,7 @@ async fn apply(
 ) -> Result<()> {
     match update {
         Update::NewMessage(m) | Update::MessageEdited(m) => {
-            // ⚠ **`m.raw` IS NOT THE MESSAGE.** `update::Message` has its own
+            // ⚠ `m.raw` IS NOT THE MESSAGE. `update::Message` has its own
             // `raw` field holding the whole `tl::enums::Update`, and it shadows
             // the `raw` of the `message::Message` it derefs to — so the obvious
             // spelling compiles into passing an Update where a Message belongs
@@ -945,7 +945,7 @@ async fn apply(
             tracing::info!("{n} message(s) marked deleted ({scope:?})");
             Ok(())
         }
-        // ⚠ **The read updates arrive as `Raw`**, because grammers gives friendly
+        // ⚠ The read updates arrive as `Raw`, because grammers gives friendly
         // variants only for the events it wraps and these are not among them. That
         // is the documented way to reach one, not a workaround being smuggled in —
         // and a minor version that promotes them to their own variant will make
@@ -1046,12 +1046,12 @@ async fn store(
 /// Fetch this message's media if it is small enough to take without being asked,
 /// and otherwise record that it is there to be asked for.
 ///
-/// ⚠ **NEVER FATAL.** A download that fails must not end the feed or stop the walk:
+/// ⚠ NEVER FATAL. A download that fails must not end the feed or stop the walk:
 /// the archive's job is the messages, and a picture that did not arrive is recorded
 /// as `failed` with its reason so it can be retried deliberately. An error here
 /// returning `Err` would let one unfetchable file stop a decade of history.
 ///
-/// ⚠ **The row is written AFTER the file is closed.** `download_media` streams chunk
+/// ⚠ The row is written AFTER the file is closed. `download_media` streams chunk
 /// by chunk, so a path published before the last chunk is a path to a short file,
 /// and nothing downstream can tell a short file from a small one.
 async fn fetch_media(
@@ -1099,7 +1099,7 @@ async fn fetch_media(
     // archive claims to hold.
     match message.download_media(&path).await {
         Ok(true) => {
-            // ⚠ **NO `stat` HERE, AND THAT IS A FIX RATHER THAN AN OMISSION.** This
+            // ⚠ NO `stat` HERE, AND THAT IS A FIX RATHER THAN AN OMISSION. This
             // recorded `metadata(path).len()` at exactly this point and got 0 for
             // files of 158KB: `tokio::fs::File` does its work on a blocking pool and
             // makes no promise that the inode reflects the write when the call
@@ -1174,7 +1174,7 @@ fn kind_from_space(row: &Row) -> ConvKind {
 
 /// Fetch the media readers have asked for.
 ///
-/// ⚠ **NO SIZE CEILING HERE, and that is the entire point of the queue.** The eager
+/// ⚠ NO SIZE CEILING HERE, and that is the entire point of the queue. The eager
 /// pass skips anything over `EAGER_MAX_BYTES` precisely so that a 1.5GB video is not
 /// pulled speculatively; being asked for is the signal that somebody wants this one.
 async fn serve_requests(
@@ -1295,14 +1295,14 @@ async fn backfill(client: &Client, db: &Db, cfg: &Cfg, self_id: i64) -> Result<(
 
 /// Walk one conversation to the end of its history.
 ///
-/// ⚠ **ONE ITERATOR FOR THE WHOLE CONVERSATION.** `MessageIter` pages internally —
+/// ⚠ ONE ITERATOR FOR THE WHOLE CONVERSATION. `MessageIter` pages internally —
 /// it advances its own offset and knows when it has had the last chunk — so
 /// letting it run is one `getHistory` per hundred messages and NO dialog listing
 /// in between. Setting `.limit(PAGE)` instead, as this did first, turned the outer
 /// loop into the pager and made every page cost a full dialog sweep.
 ///
-/// ⚠ **Progress is checkpointed every `PAGE` messages, which is what keeps it
-/// resumable.** The iterator's own position lives in memory; a pod that dies
+/// ⚠ Progress is checkpointed every `PAGE` messages, which is what keeps it
+/// resumable. The iterator's own position lives in memory; a pod that dies
 /// mid-walk resumes from the last checkpoint rather than from the top. Recording
 /// only at the end would mean a conversation of ten thousand messages either
 /// finished or started over.

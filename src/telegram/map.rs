@@ -1,4 +1,4 @@
-//! Telegram's wire types → archive rows. **Pure**: no client, no network, no
+//! Telegram's wire types → archive rows. Pure: no client, no network, no
 //! clock.
 //!
 //! This is `parse.rs`'s role for the other origin, and it exists for the same
@@ -17,7 +17,7 @@ use grammers_tl_types as tl;
 
 /// Which of Telegram's three id spaces a peer came from.
 ///
-/// ⚠ **This is NOT what a conversation IS**, and conflating the two would put
+/// ⚠ This is NOT what a conversation IS, and conflating the two would put
 /// every supergroup in the archive under "channel". Telegram models a supergroup
 /// and a broadcast channel with the same `channel` id space and tells them apart
 /// by a flag on the peer — so the space says where the number came from, and
@@ -124,8 +124,8 @@ pub struct Reaction {
 
 /// WHO reacted, and when they did it.
 ///
-/// ⚠ **The list this comes from can be TRUNCATED, and [`Reactions::complete`] is
-/// how you know.** Telegram returns `recent_reactions` as a sample when a message
+/// ⚠ The list this comes from can be TRUNCATED, and [`Reactions::complete`] is
+/// how you know. Telegram returns `recent_reactions` as a sample when a message
 /// has many reactors, so a name missing from it is not a name that is gone. See
 /// migration v30.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,7 +147,7 @@ pub struct Reactions {
     pub authors: Vec<ReactionAuthor>,
     /// Whether `authors` names EVERY reactor the counts add up to.
     ///
-    /// ⚠ **Only a complete list may retract anybody.** False here means the store
+    /// ⚠ Only a complete list may retract anybody. False here means the store
     /// must upsert what it has and date nothing, because the people it cannot see
     /// are still reacting.
     pub complete: bool,
@@ -155,7 +155,7 @@ pub struct Reactions {
 
 /// One formatted span: bold, a link, a mention, a spoiler.
 ///
-/// ⚠ **`offset` and `length` are UTF-16 CODE UNITS**, so they cannot index a Rust
+/// ⚠ `offset` and `length` are UTF-16 CODE UNITS, so they cannot index a Rust
 /// string. See migration v31 — this is the field most likely to be used
 /// innocently and wrongly.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,8 +212,8 @@ pub struct Row {
     /// edited. This is Telegram's `edit_date` and is the only ordering there is
     /// for an edit chain — there is no revision number.
     pub edited_at: Option<i64>,
-    /// ⚠ **Telegram's `edit_hide`: "the message should be shown as NOT MODIFIED to
-    /// the user, even if an edit date is present".**
+    /// ⚠ Telegram's `edit_hide`: "the message should be shown as NOT MODIFIED to
+    /// the user, even if an edit date is present".
     ///
     /// An `edit_date` alone does not mean a person edited anything — Telegram sets
     /// one for its own reasons and then asks clients not to surface it, which is
@@ -226,7 +226,7 @@ pub struct Row {
     /// and `sender_id` are, so a forwarder in a group and the DM with that same
     /// person are one id.
     ///
-    /// ⚠ **This is the field a forward USUALLY has, and it was not read.** The
+    /// ⚠ This is the field a forward USUALLY has, and it was not read. The
     /// header carries a peer for an ordinary forward and falls back to
     /// [`Row::fwd_from_name`] only when the original sender has forward-privacy
     /// on. Reading the name alone recorded a forward exactly when its sender had
@@ -294,7 +294,7 @@ const CHANNEL_ID_OFFSET: i64 = -1_000_000_000_000;
 /// rather than a lookup because of the rule below — which is the single most
 /// wrong-able thing in this file.
 ///
-/// ⚠ **A message in a DM usually names no sender.** `from_id` is omitted when
+/// ⚠ A message in a DM usually names no sender. `from_id` is omitted when
 /// Telegram considers it implied, which in a one-to-one chat it always is: the
 /// sender is either you or the person you are talking to, and `out` says which.
 /// Read literally, every incoming DM in this archive would have a NULL sender
@@ -467,7 +467,7 @@ fn reply_peer(header: &tl::enums::MessageReplyHeader) -> Option<i64> {
 
 /// Every formatted span, with the payload the kinds that have one carry.
 ///
-/// ⚠ **`offset` and `length` are UTF-16 code units** and are passed through
+/// ⚠ `offset` and `length` are UTF-16 code units and are passed through
 /// unconverted — see [`Entity`]. Converting here would be the wrong place: the
 /// archive's job is to hold what Telegram said, and a reader that wants Rust
 /// indices has the text to convert against.
@@ -534,7 +534,7 @@ fn entities(list: &[tl::enums::MessageEntity]) -> Vec<Entity> {
 
 /// The TL constructor's name for a service action.
 ///
-/// ⚠ **`describe_action` renders; this IDENTIFIES.** The two exist together on
+/// ⚠ `describe_action` renders; this IDENTIFIES. The two exist together on
 /// purpose: the phrase is for a reader, the name is for the archive, and the
 /// phrase's `_ => "an event"` arm is exactly why storing only the phrase lost
 /// information that cannot be recovered from it.
@@ -650,7 +650,7 @@ fn reactions(r: &tl::enums::MessageReactions) -> Reactions {
         })
         .collect();
 
-    // ⚠ **THE COMPARISON THAT DECIDES WHETHER ANYONE MAY BE RETRACTED.** Telegram
+    // ⚠ THE COMPARISON THAT DECIDES WHETHER ANYONE MAY BE RETRACTED. Telegram
     // samples `recent_reactions` for a message with many reactors, and a sample
     // that named three of twenty would otherwise read as seventeen people having
     // taken their reaction back. The tally in `results` is the honest denominator,
@@ -686,14 +686,14 @@ fn emoji_of(reaction: &tl::enums::Reaction) -> (Option<String>, Option<i64>) {
 
 /// What a message's media IS, how big it is, and what type it holds.
 ///
-/// ⚠ **Through `grammers_client::media::Media` rather than the raw enum, and that
-/// is what makes the finer answers possible.** A sticker, a video, a voice note
+/// ⚠ Through `grammers_client::media::Media` rather than the raw enum, and that
+/// is what makes the finer answers possible. A sticker, a video, a voice note
 /// and a PDF are all `messageMediaDocument` on the wire; which one it is lives in
 /// the document's ATTRIBUTES. `Media::from_raw` reads them, and it needs no client
 /// — so this layer stays pure and gains `sticker` and a mime type it could not
 /// otherwise see.
 ///
-/// ⚠ **`size()` AND `mime` COST NO NETWORK REQUEST.** They come out of the message
+/// ⚠ `size()` AND `mime` COST NO NETWORK REQUEST. They come out of the message
 /// itself, which is what lets the archive record what a download would cost before
 /// anything is downloaded.
 fn media_of(media: &tl::enums::MessageMedia) -> MediaFacts {

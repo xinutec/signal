@@ -5,14 +5,14 @@
 //! update sequence the account has been read. `grammers` asks for them through
 //! the [`Session`] trait and does not care where they live.
 //!
-//! ⚠ **This is a credential, not a cache.** The row holds a logged-in session:
+//! ⚠ This is a credential, not a cache. The row holds a logged-in session:
 //! reading it is reading the account. It lives in the archive's own database
 //! because it is exactly as sensitive as the messages it authorises, it is
 //! covered by their backup, and re-logging-in is rate-limited by Telegram in
 //! hours rather than seconds — so "just delete it and sign in again" is not a
 //! recovery plan. See the v20 migration in `db.rs`.
 //!
-//! ⚠ **Why not the storage `grammers` ships.** `grammers-session`'s default
+//! ⚠ Why not the storage `grammers` ships. `grammers-session`'s default
 //! feature is a local SQLite file via `libsql`, which drags `bindgen`, `clang-sys`
 //! and a C toolchain into an image that has never needed one. The trait is nine
 //! methods; the dependency was the expensive way to get them.
@@ -229,7 +229,7 @@ fn find_self(data: &SessionData) -> Option<&PeerInfo> {
 /// merged would be a bug with no symptom until an update stream skipped
 /// something.
 ///
-/// ⚠ **Two places diverge on purpose, and both are marked below.** `peer` answers
+/// ⚠ Two places diverge on purpose, and both are marked below. `peer` answers
 /// the self-user sentinel, which `MemorySession` does not; and `cache_peer`
 /// decides "changed" by comparing rather than by trusting `extend_info`'s return
 /// value. The first is required of a session that persists (`SqliteSession` does
@@ -266,8 +266,8 @@ impl Session for DbSession {
     fn peer(&self, peer: PeerId) -> BoxFuture<'_, Result<Option<PeerInfo>, SessionError>> {
         Box::pin(async move {
             let data = self.data()?;
-            // ⚠ **`PeerId::self_user()` IS NOT A KEY IN THIS MAP, and answering
-            // it is not optional.** It is a sentinel outside the id ranges, and
+            // ⚠ `PeerId::self_user()` IS NOT A KEY IN THIS MAP, and answering
+            // it is not optional. It is a sentinel outside the id ranges, and
             // `PeerInfo::id()` never produces it — so a storage that only looks
             // the argument up returns `None` for "am I logged in?" no matter how
             // logged in it is. `Client::stream_updates` asks exactly this to
@@ -294,7 +294,7 @@ impl Session for DbSession {
             let mut data = self.data()?;
             match data.peer_infos.get_mut(&peer.id()) {
                 Some(existing) => {
-                    // ⚠ **`extend_info`'s bool is NOT "did anything change".** It
+                    // ⚠ `extend_info`'s bool is NOT "did anything change". It
                     // reports whether the two infos matched in type and id, so it
                     // is `true` for every restatement of a peer already known in
                     // full — and `auto_cache_peers` restates every peer of every

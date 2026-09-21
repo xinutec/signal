@@ -12,7 +12,7 @@ pub mod session;
 
 /// What a conversation IS, as the archive files it.
 ///
-/// ⚠ **Not derivable from the id.** Telegram gives a supergroup and a broadcast
+/// ⚠ Not derivable from the id. Telegram gives a supergroup and a broadcast
 /// channel the same id space, so [`map::PeerSpace`] cannot tell them apart —
 /// which would file every supergroup as a broadcast and put it behind whatever
 /// filter a reader uses to keep announcement feeds out of their conversations.

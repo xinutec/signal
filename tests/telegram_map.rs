@@ -1,6 +1,6 @@
 //! Tests for the Telegram mapping — pure, so no database and no account.
 //!
-//! **These fixtures cannot drift from Telegram's contract**, which is why they
+//! These fixtures cannot drift from Telegram's contract, which is why they
 //! are struct literals rather than captured JSON. `tl::types::Message` is
 //! generated from Telegram's own TL schema, so a field that changes name, type or
 //! optionality stops this file compiling — the opposite of a hand-written mock,
@@ -212,7 +212,7 @@ fn a_message_with_only_media_has_no_text() {
     assert_eq!(row.media_kind, Some(MediaKind::Photo));
 }
 
-/// ⚠ **A sticker, a video and a PDF are all `messageMediaDocument` on the wire**,
+/// ⚠ A sticker, a video and a PDF are all `messageMediaDocument` on the wire,
 /// and this test used to pin the coarse answer `document` — "a finer label this
 /// build does not earn" — with a note that a later pass reading the document's
 /// attributes would have a test to change deliberately. This is that change.
@@ -477,7 +477,7 @@ fn media_reports_its_size_without_a_download() {
     assert_eq!(row.media_kind, Some(MediaKind::Video));
 }
 
-/// ⚠ **AN `edit_date` IS NOT "SOMEBODY EDITED THIS".** Telegram carries `edit_hide`
+/// ⚠ AN `edit_date` IS NOT "SOMEBODY EDITED THIS". Telegram carries `edit_hide`
 /// beside it — "whether the message should be shown as not modified to the user,
 /// even if an edit date is present" — and sets an edit date for its own reasons.
 /// Reading the date without the flag is reading half the contract, and the visible
@@ -563,7 +563,7 @@ fn fwd(
     })
 }
 
-/// ⚠ **A forward is recorded by PEER, which is the case that was being dropped.**
+/// ⚠ A forward is recorded by PEER, which is the case that was being dropped.
 ///
 /// The header carries `from_id` for an ordinary forward and falls back to
 /// `from_name` only when the original sender has forward-privacy on. Reading the
@@ -667,7 +667,7 @@ fn reacted(counts: &[(&str, i32)], names: &[(i64, &str, i32)]) -> tl::enums::Mes
     })
 }
 
-/// ⚠ **The one that decides whether anybody may be retracted.**
+/// ⚠ The one that decides whether anybody may be retracted.
 ///
 /// Telegram samples `recent_reactions` when a message has many reactors. A list
 /// that names three of twenty is not a statement that seventeen people stopped

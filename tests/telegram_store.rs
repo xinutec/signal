@@ -130,7 +130,7 @@ async fn history(pool: &MySqlPool, conversation: i64, msg_id: i32) -> Vec<(Optio
     .collect()
 }
 
-/// ⚠ **The point of the whole edit table.** Telegram's edit keeps the message id,
+/// ⚠ The point of the whole edit table. Telegram's edit keeps the message id,
 /// so storing it is an UPDATE — and the words being replaced exist nowhere else at
 /// that moment. This is the test that says they are not lost, and that a second
 /// delivery of the same edit does not append a duplicate.
@@ -213,7 +213,7 @@ async fn an_edit_keeps_the_text_it_replaces_and_a_replay_adds_nothing() {
     );
 }
 
-/// ⚠ **The reason `mark_telegram_deleted` takes a scope instead of a conversation.**
+/// ⚠ The reason `mark_telegram_deleted` takes a scope instead of a conversation.
 /// `updateDeleteMessages` carries no peer, because private chats and basic groups
 /// share one message-id sequence — but a CHANNEL has its own, so the same number
 /// means a different message there. Applying a peer-less deletion everywhere would
@@ -342,7 +342,7 @@ async fn a_withdrawn_reaction_stops_being_current_without_being_forgotten() {
         "the heart is no longer on the message"
     );
 
-    // ⚠ **BUT THE ARCHIVE STILL HOLDS IT.** It used to be DELETEd, and that made a
+    // ⚠ BUT THE ARCHIVE STILL HOLDS IT. It used to be DELETEd, and that made a
     // re-walk destructive: Telegram returns only the reactions a message has NOW,
     // so re-reading a message whose ❤️ had been taken back erased the archive's
     // record that it ever existed. A deleted message here keeps its words and an
@@ -540,7 +540,7 @@ async fn a_session_survives_a_round_trip_with_its_auth_key() {
     assert_eq!(reloaded.updates_state().await.expect("updates").pts, 4242);
 }
 
-/// ⚠ **A message the archive already holds gains facts a later build can see.**
+/// ⚠ A message the archive already holds gains facts a later build can see.
 /// This is what makes adding a column possible at all: the backfill marks a
 /// conversation `complete` and never returns, and a forced re-walk stores nothing
 /// because the insert is IGNOREd and the edit path only fires when `edit_date`
@@ -646,8 +646,8 @@ async fn sender_name_of(pool: &MySqlPool, conversation: i64, msg_id: i32) -> Opt
     .expect("the row is there")
 }
 
-/// ⚠ **THE ENRICHMENT'S ONE GAP, WHICH IS WHY A RE-WALK WOULD NOT HAVE BEEN
-/// COMPLETE.**
+/// ⚠ THE ENRICHMENT'S ONE GAP, WHICH IS WHY A RE-WALK WOULD NOT HAVE BEEN
+/// COMPLETE.
 ///
 /// `sender_name` is unlike every other column here: it is not derived from the
 /// message, it comes from the caller's peer lookup — and that returns nothing
@@ -705,7 +705,7 @@ async fn a_name_the_first_delivery_could_not_resolve_is_filled_by_a_later_one() 
     );
 }
 
-/// ⚠ **THE ONE FACT IN THIS ARCHIVE THAT CANNOT BE RE-FETCHED.** Telegram keeps
+/// ⚠ THE ONE FACT IN THIS ARCHIVE THAT CANNOT BE RE-FETCHED. Telegram keeps
 /// messages, so anything about them can be recovered by reading again. It keeps
 /// no log of READING — a dialog carries only the current high-water marks — so a
 /// read not recorded as it happens is gone for good.
@@ -750,7 +750,7 @@ async fn a_read_mark_is_kept_per_advance_and_never_re_dated() {
         .expect("a mark");
     assert_eq!(max_id, 100);
 
-    // ⚠ **RE-SEEING A MARK MUST NOT RE-DATE IT.** The sweep re-states every
+    // ⚠ RE-SEEING A MARK MUST NOT RE-DATE IT. The sweep re-states every
     // conversation's marks once an hour, so an upsert here would push the
     // observation time forward on every pass — and the answer to "when was this
     // read?" would always be "in the last hour", for every message, forever.
@@ -845,7 +845,7 @@ fn author(peer_id: i64, emoji: &str, reacted_at: i64) -> ReactionAuthor {
     }
 }
 
-/// ⚠ **A SAMPLE MUST NOT RETRACT THE PEOPLE IT COULD NOT SEE.**
+/// ⚠ A SAMPLE MUST NOT RETRACT THE PEOPLE IT COULD NOT SEE.
 ///
 /// This is v28's lesson one layer down and easier to get wrong, because a short
 /// list looks like data rather than like absence. Telegram truncates
@@ -1070,7 +1070,7 @@ async fn a_call_learns_its_duration_without_losing_it_again() {
     assert_eq!(reason.as_deref(), Some("hangup"));
 }
 
-/// ⚠ **A frontier that can move backwards turns re-done work into progress.**
+/// ⚠ A frontier that can move backwards turns re-done work into progress.
 ///
 /// The re-capture runs for hours, so its only protection against a restart is
 /// this marker — and the batch query has to honour it, or a pass would loop over
@@ -1137,8 +1137,8 @@ async fn the_recapture_frontier_only_moves_forward() {
     );
 }
 
-/// ⚠ **A RECEIPT IS AN EVENT SIGNAL SAYS ONCE, so re-seeing it must not restamp
-/// it.** Telegram restates its read marks on every `getDialogs`, so lateness is
+/// ⚠ A RECEIPT IS AN EVENT SIGNAL SAYS ONCE, so re-seeing it must not restamp
+/// it. Telegram restates its read marks on every `getDialogs`, so lateness is
 /// recoverable there; Signal restates nothing. The first observation is the
 /// answer to "when was this read", and an upsert would walk that answer forward
 /// every time the socket replayed a frame.

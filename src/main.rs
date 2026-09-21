@@ -151,14 +151,14 @@ async fn run_ws(ws_url: &str, ctx: &Ctx) -> Result<()> {
 
 /// Execute the parsed action for one frame against the DB.
 async fn dispatch(ctx: &Ctx, frame: &Value) -> Result<()> {
-    // ⚠ **THE FRAME IS KEPT BEFORE IT IS UNDERSTOOD.** Signal says everything
+    // ⚠ THE FRAME IS KEPT BEFORE IT IS UNDERSTOOD. Signal says everything
     // exactly once — there is no server-side history to re-walk, unlike Telegram
     // — so a field this archive has no column for is lost the moment the socket
     // moves on. `JsonDataMessage` carries 23 at 0.14.5 and `parse_frame` reads
     // four. Storing the bytes first means the other nineteen can be given columns
     // whenever there is a reason, and BACKFILLED, rather than being gone.
     //
-    // ⚠ **ITS FAILURE IS LOGGED, NOT PROPAGATED.** A frame we cannot file is still
+    // ⚠ ITS FAILURE IS LOGGED, NOT PROPAGATED. A frame we cannot file is still
     // a frame we can act on, and the message matters more than the copy of it.
     // Returning the error here would drop a message because its archive copy
     // failed, which inverts the point.
@@ -306,7 +306,7 @@ async fn download_attachment(ctx: &Ctx, id: &str) -> Option<String> {
 /// Periodically pull group titles (the receive payload only carries the id).
 /// Keep contact names in step with what Signal shows.
 ///
-/// ⚠ **`envelope.sourceName` CANNOT DO THIS ON 0.14.5**, which is the whole
+/// ⚠ `envelope.sourceName` CANNOT DO THIS ON 0.14.5, which is the whole
 /// reason for a second source of the same fact — see `display_name_of`. A name
 /// that changes flows through `upsert_contact`, so the one it replaces is dated
 /// rather than overwritten.

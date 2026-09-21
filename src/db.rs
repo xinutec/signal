@@ -120,8 +120,8 @@ const MIGRATIONS: &[&str] = &[
     )",
     // v8: IRC lines, one row per logged line.
     //
-    // ⚠ **`source_tag` is in the dedupe key, and that is what makes merging two
-    // irssi tags into one conversation safe.** irssi invents a second tag
+    // ⚠ `source_tag` is in the dedupe key, and that is what makes merging two
+    // irssi tags into one conversation safe. irssi invents a second tag
     // (`net2`) for a second simultaneous connection, and both write
     // `<tag>/<Y>/<M>/<D>/<target>.log` — so the same conversation on the same
     // day exists as two files, 18 such pairs in the measured tree. Keyed on
@@ -154,7 +154,7 @@ const MIGRATIONS: &[&str] = &[
     // to the five networks Pippijn has tabs open on took the archive from
     // 860,380 rows to 3,683,670, and the list query — `COUNT(*)` and
     // `MAX(sent_at)` per conversation, restricted to `kind IN
-    // ('message','action')` — went to **27 seconds**. That is the app's landing
+    // ('message','action')` — went to 27 seconds. That is the app's landing
     // screen.
     //
     // `idx_irc_conv_ts` cannot serve it: `kind` is not in it, so every candidate
@@ -204,9 +204,9 @@ const MIGRATIONS: &[&str] = &[
     // ⚠ MEASURED, and the obvious rewrite was measured WRONG. The list needs
     // `COUNT(*)` and `MAX(sent_at)` per conversation over `kind IN
     // ('message','action')`. Without that filter MariaDB answers it with a loose
-    // index scan — `Using index for group-by`, **431 rows, 1.4ms**. With it, the
+    // index scan — `Using index for group-by`, 431 rows, 1.4ms. With it, the
     // filter sits on the middle column of `idx_irc_conv_kind_ts` and the plan
-    // becomes a full index scan: **3,614,079 rows, 1.29s**.
+    // becomes a full index scan: 3,614,079 rows, 1.29s.
     //
     // Rewriting `IN ('message','action')` as a UNION of two `kind = …` groups is
     // what the loose-index-scan documentation suggests, and it is slower, not
@@ -234,7 +234,7 @@ const MIGRATIONS: &[&str] = &[
     // maintain it. The trigger is attached to the table, so every writer that
     // exists or ever will is covered by construction.
     //
-    // ⚠ **An `INSERT IGNORE` that ignores fires no trigger** — verified, not
+    // ⚠ An `INSERT IGNORE` that ignores fires no trigger — verified, not
     // assumed. That is what keeps replay free: `irc_tail` re-offers the plugin's
     // whole ring after every restart and the importer re-reads a file whenever
     // its mtime moves, and neither can inflate a count.
@@ -301,8 +301,8 @@ const MIGRATIONS: &[&str] = &[
     // v15: Telegram conversations — the fourth origin, and the first whose
     // history and live feed come from ONE login.
     //
-    // ⚠ **`id` is the Bot-API normalisation, not the raw MTProto id, and that is
-    // deliberate.** MTProto names a peer by a `user_id`, a `chat_id` or a
+    // ⚠ `id` is the Bot-API normalisation, not the raw MTProto id, and that is
+    // deliberate. MTProto names a peer by a `user_id`, a `chat_id` or a
     // `channel_id`, each from its own space, so the raw number identifies a
     // conversation only when you also carry which of the three it was. Every
     // Telegram tool folds them into one signed space instead, and this does too:
@@ -329,7 +329,7 @@ const MIGRATIONS: &[&str] = &[
     )",
     // v16: Telegram messages.
     //
-    // **The dedupe key is honest here in a way the other origins' are not.** A
+    // The dedupe key is honest here in a way the other origins' are not. A
     // Telegram message id is assigned by the server and is stable for the life
     // of the message, so `(conversation_id, msg_id)` IS the message's identity —
     // no guessing that a timestamp is unique per sender (Signal) and no
@@ -390,7 +390,7 @@ const MIGRATIONS: &[&str] = &[
     // `emoji` stays NULL. A reader that cannot draw one at least knows it is
     // there rather than silently counting nothing.
     //
-    // ⚠ **`reaction_key` IS GENERATED, AND THE OBVIOUS KEY DOES NOT WORK.** The
+    // ⚠ `reaction_key` IS GENERATED, AND THE OBVIOUS KEY DOES NOT WORK. The
     // identity of a reaction is "the emoji, or the custom emoji's id" — a sum, one
     // side of which is always NULL. A primary key over `(…, emoji,
     // custom_emoji_id)` is what this entry said while it was being written, and
@@ -438,7 +438,7 @@ const MIGRATIONS: &[&str] = &[
     )",
     // v18: the text a message used to have.
     //
-    // ⚠ **Telegram's edit is a MUTATION, which is why this table exists.** Signal
+    // ⚠ Telegram's edit is a MUTATION, which is why this table exists. Signal
     // sends an edit as a new message pointing at the original (v6 above), so its
     // history is the archive's natural shape — append a row and nothing is lost.
     // Telegram sends the SAME `msg_id` with different text, so an archive that
@@ -489,7 +489,7 @@ const MIGRATIONS: &[&str] = &[
     // v20: the MTProto session — the authorisation key, the datacentre list, the
     // peer cache and the update state — as one row.
     //
-    // ⚠ **IN THE DATABASE RATHER THAN ON A VOLUME, and it is a credential.** A
+    // ⚠ IN THE DATABASE RATHER THAN ON A VOLUME, and it is a credential. A
     // row here is a logged-in Telegram session: whoever reads it reads the
     // account. It lives with the messages because it is exactly as sensitive as
     // they are, it is covered by their backup, and the alternative was a PVC that
@@ -497,7 +497,7 @@ const MIGRATIONS: &[&str] = &[
     // a 0400 file in an emptyDir it could no longer write (see that repo's
     // `IrcSender::prepare`).
     //
-    // ⚠ **Losing this row is NOT free.** Logging in again is rate-limited by
+    // ⚠ Losing this row is NOT free. Logging in again is rate-limited by
     // Telegram with flood waits measured in hours, so this is not a cache to be
     // dropped when convenient. `single_row` is a CHECKed constant so a second
     // session cannot be inserted by accident: two pods with two keys is two
@@ -514,7 +514,7 @@ const MIGRATIONS: &[&str] = &[
     )",
     // v21: what a media download WOULD cost, and what it is.
     //
-    // ⚠ **RECORDED BEFORE ANYTHING IS DOWNLOADED, which is the point.** `grammers`
+    // ⚠ RECORDED BEFORE ANYTHING IS DOWNLOADED, which is the point. `grammers`
     // reports a file's size and mime from the message itself — no network request —
     // so the archive can say exactly what fetching the photos would take before
     // anybody commits a volume to it. The alternative was estimating from a
@@ -534,7 +534,7 @@ const MIGRATIONS: &[&str] = &[
         ADD COLUMN media_mime VARCHAR(128) NULL",
     // v22: whether Telegram asked for the edit NOT to be shown.
     //
-    // ⚠ **`edit_date` IS NOT "SOMEBODY EDITED THIS".** Telegram's `message`
+    // ⚠ `edit_date` IS NOT "SOMEBODY EDITED THIS". Telegram's `message`
     // constructor carries `edit_hide` beside it, documented as "whether the message
     // should be shown as not modified to the user, EVEN IF AN EDIT DATE IS
     // PRESENT". Telegram sets an edit date for its own reasons and then asks
@@ -554,7 +554,7 @@ const MIGRATIONS: &[&str] = &[
     // v23: the relabel that was run by HAND on production, written down so it is
     // part of the schema rather than part of nobody's memory.
     //
-    // ⚠ **ENRICHMENT CAN ADD A FACT AND CANNOT CORRECT ONE.** v21 made
+    // ⚠ ENRICHMENT CAN ADD A FACT AND CANNOT CORRECT ONE. v21 made
     // `media_kind` finer — a `video/mp4` reports `video` rather than `document` —
     // but the enrichment path in `store_telegram_message` fills only what is NULL,
     // deliberately, so it will not rewrite a kind an earlier build already wrote.
@@ -581,8 +581,8 @@ const MIGRATIONS: &[&str] = &[
     // cannot describe; a row there with none here is a file we have not fetched,
     // which is the normal state for everything large.
     //
-    // ⚠ **`state` IS THE WHOLE DESIGN, and it mirrors `link_images` in the
-    // `messages` repo deliberately.** Photos are fetched EAGERLY, because a photo in
+    // ⚠ `state` IS THE WHOLE DESIGN, and it mirrors `link_images` in the
+    // `messages` repo deliberately. Photos are fetched EAGERLY, because a photo in
     // a conversation is the conversation and the backfill is already at that message
     // with the connection open. Everything larger is `offered` and fetched only when
     // a reader asks — 832 videos come to 3.8GB and one of them is 1.5GB, measured
@@ -613,11 +613,11 @@ const MIGRATIONS: &[&str] = &[
     )",
     // v25: the size column comes out again, one day after going in.
     //
-    // ⚠ **IT WAS A SECOND COPY OF A NUMBER, AND THE COPY WAS WRONG.** It recorded
+    // ⚠ IT WAS A SECOND COPY OF A NUMBER, AND THE COPY WAS WRONG. It recorded
     // `metadata(path).len()` taken straight after `download_media` returned, which
     // reads the length before the write is visible: 950 files totalling 218MB on
-    // disk were recorded as 86MB, and **the four smallest rows said 0 bytes for
-    // files of 158KB, 214KB, 288KB and 126KB**. `tokio::fs::File` performs its work
+    // disk were recorded as 86MB, and the four smallest rows said 0 bytes for
+    // files of 158KB, 214KB, 288KB and 126KB. `tokio::fs::File` performs its work
     // on a blocking pool and does not promise the inode reflects it when the write
     // call returns, so stat-after-download is a race and always was.
     //
@@ -627,13 +627,13 @@ const MIGRATIONS: &[&str] = &[
     //
     // So the archive keeps ONE size, in the table whose subject is what Telegram
     // said, and `telegram_media` records only what is on the volume. The
-    // consequence worth stating: **nothing here independently verifies the byte
-    // count.** A stat that can read zero is worse than no stat, and the flush that
+    // consequence worth stating: nothing here independently verifies the byte
+    // count. A stat that can read zero is worse than no stat, and the flush that
     // would make one reliable belongs to a file handle this code does not own.
     r"ALTER TABLE telegram_media DROP COLUMN size_bytes",
     // v26: a reader can ask for what was only offered.
     //
-    // ⚠ **`wanted` IS A QUEUE, AND THE DATABASE IS DELIBERATELY THE WHOLE OF IT.**
+    // ⚠ `wanted` IS A QUEUE, AND THE DATABASE IS DELIBERATELY THE WHOLE OF IT.
     // The thing that must do the fetching is the feed, because it is the only
     // process holding a Telegram session — and the feed listens on no port, which is
     // a property worth keeping: nothing in the cluster can dial the pod that holds a
@@ -650,7 +650,7 @@ const MIGRATIONS: &[&str] = &[
     // v27: WHO a forward came from, when the header names a peer rather than a
     // string.
     //
-    // ⚠ **`fwd_from_name` was the ONLY thing read, and it is the RARE half.**
+    // ⚠ `fwd_from_name` was the ONLY thing read, and it is the RARE half.
     // Telegram's forward header carries `from_id` — the original sender's peer —
     // and fills `from_name` only when that account has forward-privacy on, so it
     // hides behind a bare string instead. Reading the string alone meant a
@@ -675,8 +675,8 @@ const MIGRATIONS: &[&str] = &[
     // v28: a reaction that goes away STOPS BEING CURRENT rather than ceasing to
     // have happened.
     //
-    // ⚠ **`replace_telegram_reactions` used to DELETE, and a re-walk could
-    // therefore lose history.** A message reacted to with 👍 and ❤️ whose ❤️ was
+    // ⚠ `replace_telegram_reactions` used to DELETE, and a re-walk could
+    // therefore lose history. A message reacted to with 👍 and ❤️ whose ❤️ was
     // later taken back came back from Telegram carrying only the 👍 — and the
     // replace threw the ❤️ away, so the archive forgot a thing that had genuinely
     // happened. The whole point of this archive is that it remembers what the
@@ -690,7 +690,7 @@ const MIGRATIONS: &[&str] = &[
         ADD COLUMN removed_at TIMESTAMP NULL",
     // v29: who has read how far.
     //
-    // ⚠ **THIS IS THE ONE THING IN THIS ARCHIVE WITH NO HISTORY TO GO BACK FOR.**
+    // ⚠ THIS IS THE ONE THING IN THIS ARCHIVE WITH NO HISTORY TO GO BACK FOR.
     // Every other column here can be recovered by re-reading Telegram, because
     // Telegram keeps the messages. It keeps NO log of reading — a dialog carries
     // only `read_inbox_max_id` and `read_outbox_max_id`, the CURRENT high-water
@@ -698,19 +698,19 @@ const MIGRATIONS: &[&str] = &[
     // That is why this table exists at all, and why it went in the day it was
     // asked for rather than after the re-walk.
     //
-    // **APPEND-ONLY, which is the point.** A high-water mark is a moving value, and
+    // APPEND-ONLY, which is the point. A high-water mark is a moving value, and
     // storing only the latest would make this a cache of Telegram's current state
     // rather than a record. Each ADVANCE is its own row, so the table answers
     // "when did they read this?" and not merely "how far have they read?".
     //
-    // ⚠ **`observed_at` IS WHEN WE SAW IT, NOT WHEN THEY READ IT**, and the two are
+    // ⚠ `observed_at` IS WHEN WE SAW IT, NOT WHEN THEY READ IT, and the two are
     // not the same. `updateReadHistoryOutbox` carries a peer, a `max_id` and a
     // `pts` — no date — so Telegram never says when the reading happened. A live
     // update lands within seconds; a mark first seen by the hourly sweep may be up
     // to an hour late, and one seen after downtime later still. The column is named
     // for what it can honestly hold.
     //
-    // ⚠ **`direction` uses Telegram's OWN words, which read backwards at first.**
+    // ⚠ `direction` uses Telegram's OWN words, which read backwards at first.
     // `outbox` is the OUT-tray: MY messages, and how far the other side has read
     // them — the blue-tick marker. `inbox` is theirs, and how far I have read. The
     // vendor vocabulary is kept because anyone checking this against Telegram's
@@ -725,8 +725,8 @@ const MIGRATIONS: &[&str] = &[
     ) DEFAULT CHARSET=utf8mb4",
     // v30: WHICH PERSON reacted, and when.
     //
-    // ⚠ **v17 says Telegram hands over a count rather than a list of people. That
-    // was wrong, and it cost 21,696 reactions their authors.** `messageReactions`
+    // ⚠ v17 says Telegram hands over a count rather than a list of people. That
+    // was wrong, and it cost 21,696 reactions their authors. `messageReactions`
     // carries `recent_reactions: Vector<MessagePeerReaction>` in the same struct
     // whose `results` the aggregate was read from — `{peer_id, date, reaction}`,
     // arriving free with every message already being fetched. Measured over 901
@@ -737,7 +737,7 @@ const MIGRATIONS: &[&str] = &[
     // the count is the authoritative one: `results` is a complete tally by
     // construction, while `recent_reactions` is a list Telegram may truncate.
     //
-    // ⚠ **A SHORT LIST IS NOT A RETRACTION.** The rule mirrors v28's, one step
+    // ⚠ A SHORT LIST IS NOT A RETRACTION. The rule mirrors v28's, one step
     // sharper. An absent `recent_reactions` says nothing at all. A present one is a
     // complete statement ONLY when it names at least as many reactors as `results`
     // counts; below that it has been truncated, and dating the unnamed would
@@ -765,13 +765,13 @@ const MIGRATIONS: &[&str] = &[
     ) DEFAULT CHARSET=utf8mb4",
     // v31: the formatting, and the LINKS THAT ARE NOT IN THE TEXT.
     //
-    // ⚠ **THIS IS CONTENT LOSS, NOT DECORATION.** `messageEntityTextUrl` carries a
+    // ⚠ THIS IS CONTENT LOSS, NOT DECORATION. `messageEntityTextUrl` carries a
     // url the visible text does not contain — "see here" linking somewhere is
     // stored as the word "here" and nothing else. Same for `messageEntityMentionName`,
     // whose user id is the only record of who was meant. Measured at 17.8% of
     // messages, which over this archive is on the order of 28,000.
     //
-    // ⚠ **`offset` AND `length` ARE UTF-16 CODE UNITS.** Not bytes, not Rust chars.
+    // ⚠ `offset` AND `length` ARE UTF-16 CODE UNITS. Not bytes, not Rust chars.
     // Every emoji outside the BMP counts as TWO, so slicing a Rust string by these
     // numbers silently misplaces every span after the first emoji — and this is a
     // chat archive, where that is most of them. The columns are named for the unit
@@ -797,8 +797,8 @@ const MIGRATIONS: &[&str] = &[
     ) DEFAULT CHARSET=utf8mb4",
     // v32: WHICH event a service message was.
     //
-    // ⚠ **`telegram_messages.text` for a service message is OUR ENGLISH, not
-    // Telegram's.** `describe_action` maps the action to a phrase, and its final arm
+    // ⚠ `telegram_messages.text` for a service message is OUR ENGLISH, not
+    // Telegram's. `describe_action` maps the action to a phrase, and its final arm
     // is `_ => "an event"` — so an action this archive had never seen was stored as
     // two words that name nothing, unrecoverably. This column holds the TL
     // constructor name, which is the identity rather than a rendering, so an
@@ -807,7 +807,7 @@ const MIGRATIONS: &[&str] = &[
         ADD COLUMN service_action VARCHAR(64) NULL",
     // v33: how long the call was, and how it ended.
     //
-    // ⚠ **65 CALLS WERE STORED AS THE WORDS "a call".** `messageActionPhoneCall`
+    // ⚠ 65 CALLS WERE STORED AS THE WORDS "a call". `messageActionPhoneCall`
     // carries `duration`, `video` and `reason` — busy, hangup, missed, disconnect —
     // and `describe_action` returns `&'static str`, so all of it was discarded at
     // the mapper. In a personal archive the fact that a call happened is the least
@@ -864,22 +864,22 @@ const MIGRATIONS: &[&str] = &[
     // that cost nothing). How far a re-capture has got, so hours of work survive
     // a restart.
     //
-    // ⚠ **NOT `telegram_backfill_state`, and the difference is the direction.**
+    // ⚠ NOT `telegram_backfill_state`, and the difference is the direction.
     // That table walks OLDER, from `oldest_seen` outward, and is finished when it
     // reaches the start of a conversation. This one walks FORWARD through messages
     // the archive already holds, re-reading them so columns added after they were
     // stored get filled by the enrichment. Sharing one table would make
     // `complete` mean two things and a re-capture would end the backfill.
     //
-    // ⚠ **The frontier is `through_msg_id`, and it only moves once a batch is
-    // WRITTEN.** A pass that recorded progress before storing would skip whatever
+    // ⚠ The frontier is `through_msg_id`, and it only moves once a batch is
+    // WRITTEN. A pass that recorded progress before storing would skip whatever
     // was in flight when the pod died — silently, and exactly the way the archive
     // cannot detect afterwards.
     //
     // Re-runnable by deleting a row: the next pass re-reads that conversation from
     // the beginning, which costs time and changes nothing, because every write it
     // makes is an enrichment of a NULL.
-    // v36 (DEAD — SEE v39). ⚠ **THIS ENTRY NEVER RAN AND NEVER WILL.**
+    // v36 (DEAD — SEE v39). ⚠ THIS ENTRY NEVER RAN AND NEVER WILL.
     //
     // It was INSERTED here rather than appended, which renumbered the slot
     // `telegram_recapture_state` had already occupied. `schema_version` had 36
@@ -895,8 +895,8 @@ const MIGRATIONS: &[&str] = &[
     //
     // Signal's delivery and read receipts.
     //
-    // ⚠ **RICHER THAN TELEGRAM'S AND LESS RECOVERABLE, WHICH IS THE WHOLE
-    // POINT.** Telegram gives a high-water mark per conversation and restates it
+    // ⚠ RICHER THAN TELEGRAM'S AND LESS RECOVERABLE, WHICH IS THE WHOLE
+    // POINT. Telegram gives a high-water mark per conversation and restates it
     // on every `getDialogs`, so a missed update costs lateness. Signal gives an
     // EVENT — who, which messages, delivered/read/viewed, and its own `when` —
     // and says it exactly once, on the live socket. Nothing restates it, and the
@@ -908,12 +908,12 @@ const MIGRATIONS: &[&str] = &[
     // was simply not written, and a test named `the_other_origins_report_no_read_state`
     // passing green made the absence look like a property of Signal.
     //
-    // ⚠ **ONE RECEIPT ACKNOWLEDGES MANY MESSAGES**, so it is flattened: a row per
+    // ⚠ ONE RECEIPT ACKNOWLEDGES MANY MESSAGES, so it is flattened: a row per
     // (message, author, kind). Keyed that way rather than on the receipt, because
     // the question is always "when was THIS message read", never "what did that
     // frame say".
     //
-    // ⚠ **`when_ts` IS NEVER UPDATED.** Re-seeing a receipt must not restamp it —
+    // ⚠ `when_ts` IS NEVER UPDATED. Re-seeing a receipt must not restamp it —
     // same rule as `telegram_read_marks.observed_at`, and for the same reason: the
     // first observation is the one that answers the question.
     r"CREATE TABLE IF NOT EXISTS signal_receipts (
@@ -929,7 +929,7 @@ const MIGRATIONS: &[&str] = &[
     // v37 (labelled v38 when written; it landed at 37). Signal calls, as the
     // frames that actually arrive.
     //
-    // ⚠ **NOT A DURATION, BECAUSE SIGNAL DOES NOT SEND ONE.** Telegram reports a
+    // ⚠ NOT A DURATION, BECAUSE SIGNAL DOES NOT SEND ONE. Telegram reports a
     // finished call as one service message with `duration` and `reason` already
     // computed — 65 of them in this archive. Signal sends WebRTC signalling: an
     // offer, maybe an answer, maybe a busy, maybe a hangup, sharing a `call_id`,
@@ -983,45 +983,16 @@ const MIGRATIONS: &[&str] = &[
         UNIQUE KEY uniq_signal_receipt (target_ts, author_uuid, kind),
         INDEX idx_signal_receipt_target (target_ts)
     ) DEFAULT CHARSET=utf8mb4",
-    // v41: the name is a DISPLAY name, and only sometimes the profile name.
-    //
-    // ⚠ **THE COLUMN IS NAMED AFTER THE LAST BRANCH OF A THREE-BRANCH FALLBACK.**
-    // What arrives in `envelope.sourceName` is signal-cli's
-    // `getContactOrProfileName`, whose order is Signal's own. In the version
-    // deployed here (0.14.5) it is:
-    //
-    //     if (contact != null && !isEmpty(contact.getName())) return contact.getName();
-    //     return profile.getDisplayName();
-    //
-    // So for 38 of 52 recipients it holds the ADDRESS-BOOK name and the profile
-    // name is the fallback, not the meaning. Renamed rather than re-documented,
-    // because a column called `profile_name` is what a reader believes.
-    //
-    // ⚠ **0.14.7 ADDS A BRANCH ABOVE BOTH** — `contact.getDisplayNickname()`, the
-    // first/last name you type in Signal's own UI — so the same field starts
-    // carrying a third kind of name on upgrade without anything here changing.
-    // That is the reason the column is not called `contact_name` either: it is
-    // whatever Signal currently thinks this person is called.
-    //
-    // ⚠ **`profile_name` IS DELIBERATELY LEFT IN PLACE**, and as of 2026-09-21 the
-    // reason has CHANGED — the viewer has moved (messages 7098b95, verified: the
-    // serving binary holds 0 references to `profile_name` and 13 to
-    // `display_name`). What keeps the column is the WRITER, and the hazard is the
-    // rollout rather than the reader.
-    //
-    // ⚠ **`signal-ingester` IS `RollingUpdate`, SO OLD AND NEW PODS OVERLAP.** A
-    // single deploy that both stopped writing the column and dropped it would
-    // leave the old pod INSERTing into a column that no longer exists; its writes
-    // fail, and Signal keeps no server-side history to re-walk, so those messages
-    // are gone. Dropping it therefore needs two deploys: stop writing, then drop.
-    // All 41 rows are identical across the two columns, so the drop itself loses
-    // nothing — the sequencing is the whole of the risk.
+    // `envelope.sourceName` is signal-cli's `getContactOrProfileName`: the name
+    // you gave someone, else your address book's, else the name they chose. The
+    // profile name is its last resort, so `profile_name` named the column after
+    // the branch that fires least.
     r"ALTER TABLE contacts ADD COLUMN display_name VARCHAR(255) NULL",
     r"UPDATE contacts SET display_name = profile_name WHERE display_name IS NULL",
     // v43: what somebody was called, and until when.
     //
-    // ⚠ **A NAME HAS ALWAYS BEEN OVERWRITTEN IN PLACE, AND THE NEXT RENAME IS A
-    // BULK ONE.** `contacts` keeps one name per person, so a rename answers "what
+    // ⚠ A NAME HAS ALWAYS BEEN OVERWRITTEN IN PLACE, AND THE NEXT RENAME IS A
+    // BULK ONE. `contacts` keeps one name per person, so a rename answers "what
     // is she called" and destroys "what was she called when she said this" — and
     // the second is the question a reader of an old thread actually has. That has
     // cost nothing so far because the resolved names have not moved; upgrading
@@ -1032,13 +1003,13 @@ const MIGRATIONS: &[&str] = &[
     // So the old name is dated rather than dropped, the same shape as
     // `telegram_reactions.removed_at`: the row stays and gains an end.
     //
-    // ⚠ **THIS IS NOT FIXING A BUG.** It was written while chasing one that turned
+    // ⚠ THIS IS NOT FIXING A BUG. It was written while chasing one that turned
     // out not to exist — the claim was that `COALESCE(VALUES(x), x)` made the name
     // write-once, and it does the opposite: it overwrites whenever a value is
     // supplied. Kept because the archive's rule is that history is dated, never
     // deleted, and a bulk rename is exactly the event that would have broken it.
     //
-    // ⚠ **`seen_from` ON A BACKFILLED ROW IS WHEN THE ARCHIVE LAST TOUCHED IT**, not
+    // ⚠ `seen_from` ON A BACKFILLED ROW IS WHEN THE ARCHIVE LAST TOUCHED IT, not
     // when the person began being called that. Signal sends no such date and never
     // did. The column is named for what it can hold.
     r"CREATE TABLE IF NOT EXISTS contact_names (
@@ -1055,13 +1026,13 @@ const MIGRATIONS: &[&str] = &[
         SELECT uuid, display_name, updated_at FROM contacts WHERE display_name IS NOT NULL",
     // v45: the frame as it arrived, before anything reads it.
     //
-    // ⚠ **SIGNAL SAYS EVERYTHING EXACTLY ONCE, so a field this archive has no
-    // column for is gone the moment the socket moves on.** Telegram can be
+    // ⚠ SIGNAL SAYS EVERYTHING EXACTLY ONCE, so a field this archive has no
+    // column for is gone the moment the socket moves on. Telegram can be
     // re-walked — that is what the 4h36m recapture did, and why a gap there costs
     // an afternoon. Signal keeps no server-side history: `signal-cli` hands over
     // one envelope on the live socket and nothing ever restates it.
     //
-    // ⚠ **`JsonDataMessage` AT 0.14.5 HAS 23 FIELDS AND THIS ARCHIVE READS FOUR.**
+    // ⚠ `JsonDataMessage` AT 0.14.5 HAS 23 FIELDS AND THIS ARCHIVE READS FOUR.
     // Checked against the deployed tag on 2026-09-21, not master. Dropped so far:
     // `expiresInSeconds`, `isExpirationUpdate`, `viewOnce`, everything in `quote`
     // except its id, `mentions`, `previews`, `textStyles`, `sticker.packId` and
@@ -1069,14 +1040,14 @@ const MIGRATIONS: &[&str] = &[
     // `pinMessage`, `unpinMessage`, `adminDelete` — plus the envelope's own
     // `serverReceivedTimestamp` and `serverDeliveredTimestamp`.
     //
-    // ⚠ **SO THE FIX IS NOT FIFTEEN COLUMNS, IT IS KEEPING THE FRAME.** Columns
+    // ⚠ SO THE FIX IS NOT FIFTEEN COLUMNS, IT IS KEEPING THE FRAME. Columns
     // can be added whenever there is a reason and BACKFILLED from here, because
     // the bytes will still be on disk; a field not captured today cannot be
     // recovered by any amount of later work. This inverts which half is urgent.
     // It also costs nothing when signal-cli grows a field: the frame carries it
     // whether or not this code has heard of it.
     //
-    // ⚠ **KEYED BY CONTENT HASH, because a frame has no id of its own.** An
+    // ⚠ KEYED BY CONTENT HASH, because a frame has no id of its own. An
     // envelope is (timestamp, source) and a receipt or a sync can repeat both;
     // signal-cli also re-delivers on reconnect, which happens on every deploy.
     // The digest makes replay free and makes it impossible to store the same
@@ -1093,40 +1064,21 @@ const MIGRATIONS: &[&str] = &[
         INDEX idx_signal_frame_ts (envelope_ts),
         INDEX idx_signal_frame_source (source_uuid, envelope_ts)
     ) DEFAULT CHARSET=utf8mb4",
-    // v46: the superseded name column goes, and this is the SECOND of two
-    // deploys (#1688).
-    //
-    // ⚠ **THE ORDER IS THE WHOLE OF THE RISK.** `signal-ingester` is
-    // `RollingUpdate`, so old and new pods overlap. Dropping the column in the
-    // same deploy that stopped writing it would leave the old pod INSERTing into
-    // a column that no longer exists — its writes fail, and Signal keeps no
-    // server-side history to re-walk, so those messages are gone. The writes
-    // stopped in the previous deploy (846974d) and shipped; this is safe only
-    // because that one is already running.
-    //
-    // ⚠ **VERIFIED BY THE STATEMENT, NOT BY `grep -c profile_name`.** The binary
-    // still contains the string twice — v0's `CREATE TABLE` and v42's backfill —
-    // and always will, so a count can never reach zero and reads as "never safe".
-    // What was checked on the live pod is that the two HOT-PATH writes are gone:
-    // `INSERT INTO contacts (uuid, phone, profile_name` → 0, and
-    // `SET display_name = ?, profile_name` → 0.
-    //
-    // ⚠ **A FRESH DATABASE STILL WORKS**, which is what append-only buys: v0
-    // creates the column, v41 adds `display_name`, v42 copies across, and this
-    // drops it — in that order, every time, on a database that has never seen any
-    // of them. Measured before dropping: 41 rows, all 41 identical across the two
-    // columns, so nothing is lost.
+    // `signal-ingester` is RollingUpdate, so old and new pods overlap: this is
+    // safe only because the deploy that stopped writing the column is already
+    // running. Dropping it alongside the write removal would leave the old pod
+    // inserting into a column that is gone, and Signal has no history to re-walk.
     r"ALTER TABLE contacts DROP COLUMN profile_name",
     // v47: when the SERVER saw it, and whether it was on a timer (#1693).
     //
-    // ⚠ **`server_ts` IS THE SENDER'S CLOCK, AND IT IS THE ONLY TIME THIS ARCHIVE
-    // HAS HAD.** Signal's `envelope.timestamp` is minted by the sending device
+    // ⚠ `server_ts` IS THE SENDER'S CLOCK, AND IT IS THE ONLY TIME THIS ARCHIVE
+    // HAS HAD. Signal's `envelope.timestamp` is minted by the sending device
     // and doubles as the message's identity, so it cannot be corrected — a phone
     // with a wrong clock files its words under a wrong hour and the archive
     // agrees. `serverReceivedTimestamp` is Signal's own, assigned when the
     // message reached them, and is the only timestamp here no sender can set.
     //
-    // ⚠ **THESE WERE CHOSEN BECAUSE THERE IS DATA FOR THEM**, which is the whole
+    // ⚠ THESE WERE CHOSEN BECAUSE THERE IS DATA FOR THEM, which is the whole
     // discipline of this migration. Measured over the frames captured so far:
     // `serverReceivedTimestamp` on 31 of 31, `expiresInSeconds` on 7 of 7 data
     // messages — and quotes, mentions, text styles and previews on ZERO. Adding
@@ -1135,7 +1087,7 @@ const MIGRATIONS: &[&str] = &[
     // how `sticker.emoji` — a field signal-cli has never sent — passed its own
     // test for three months. They wait until a frame carries one.
     //
-    // ⚠ **`expires_in_seconds` IS CONTEXT THE ARCHIVE WAS DISCARDING ENTIRELY.** A
+    // ⚠ `expires_in_seconds` IS CONTEXT THE ARCHIVE WAS DISCARDING ENTIRELY. A
     // disappearing-message timer says the conversation was meant not to last;
     // keeping the words while losing that fact misrepresents what was said.
     // NULL means the frame carried no timer, 0 means the timer was turned OFF —
@@ -1146,20 +1098,20 @@ const MIGRATIONS: &[&str] = &[
         ADD COLUMN expires_in_seconds INT NULL",
     // v48: fill the new columns from the frames already kept (#1693).
     //
-    // ⚠ **THIS IS THE POINT OF `signal_frames`, DEMONSTRATED.** The columns above
+    // ⚠ THIS IS THE POINT OF `signal_frames`, DEMONSTRATED. The columns above
     // did not exist when these messages arrived, and every value below was
     // nonetheless recorded — because the envelope was stored whole before
     // anything read it. Without that table this migration could only have been an
     // `ALTER` and a shrug.
     //
-    // ⚠ **AND IT REACHES EXACTLY AS FAR BACK AS THE FRAMES DO**, which is
+    // ⚠ AND IT REACHES EXACTLY AS FAR BACK AS THE FRAMES DO, which is
     // 2026-09-21 and no further. Signal keeps no server-side history, so the
     // messages before that have no envelope to read and never will. A backfill
     // that appeared to "work" while touching almost nothing is the expected
     // outcome here, not a failure — the honest test is whether the rows it CAN
     // reach get the right values.
     //
-    // ⚠ **`JSON_VALUE`, NOT `->>`.** The operator is MySQL's and MariaDB rejects
+    // ⚠ `JSON_VALUE`, NOT `->>`. The operator is MySQL's and MariaDB rejects
     // it outright (error 1064). Pinned in `tests/contacts.rs` for the same reason
     // it is written out here: a backfill is exactly where that is discovered
     // expensively.
@@ -1257,31 +1209,26 @@ impl Db {
 
     /// Record a contact, keeping the name it is wearing and dating the one it wore.
     ///
-    /// ⚠ **`COALESCE(VALUES(x), x)` OVERWRITES — it is not fill-only, and reading
-    /// it as fill-only cost an afternoon.** `VALUES(x)` is the value from the
+    /// ⚠ `COALESCE(VALUES(x), x)` OVERWRITES — it is not fill-only, and reading
+    /// it as fill-only cost an afternoon. `VALUES(x)` is the value from the
     /// INSERT list, so the COALESCE returns the NEW value whenever one was
     /// supplied and the stored one only when it was NULL. That is the right
     /// behaviour for `phone` and it is why the name has always tracked signal-cli
     /// correctly. What it cannot do is notice that it changed something.
     ///
-    /// ⚠ **SO THE NAME IS WRITTEN BY A SECOND STATEMENT, WHOSE `rows_affected` IS
-    /// THE RENAME.** A name arrives with EVERY message, and almost always the same
+    /// ⚠ SO THE NAME IS WRITTEN BY A SECOND STATEMENT, WHOSE `rows_affected` IS
+    /// THE RENAME. A name arrives with EVERY message, and almost always the same
     /// one; the `<>` makes that an indexed no-op that writes no history, and makes
     /// the rare change announce itself without a SELECT to compare against.
     ///
-    /// ⚠ **A SIGHTING WITH NO NAME MUST NOT BLANK ONE WE HOLD.** Receipts, typing
+    /// ⚠ A SIGHTING WITH NO NAME MUST NOT BLANK ONE WE HOLD. Receipts, typing
     /// frames and group members we have no profile for all arrive nameless. They
     /// skip the second statement entirely rather than passing NULL through it.
     ///
-    /// ⚠ **`envelope.sourceName` IS A DISPLAY NAME, NOT A PROFILE NAME.** signal-cli
+    /// ⚠ `envelope.sourceName` IS A DISPLAY NAME, NOT A PROFILE NAME. signal-cli
     /// resolves it with Signal's own precedence, which in 0.14.5 is the system
     /// contact name and then the profile name, and from 0.14.7 the nickname above
     /// both.
-    ///
-    /// ⚠ **`profile_name` IS NO LONGER WRITTEN**, which is the first of the two
-    /// deploys its removal needs: the column still EXISTS, so an old pod mid-
-    /// rollout keeps working, and the DROP is safe only once no running pod
-    /// writes it. See the v41 migration for why the order is not optional.
     pub async fn upsert_contact(
         &self,
         uuid: &str,
@@ -1330,11 +1277,11 @@ impl Db {
 
     /// Keep the frame exactly as it arrived, before anything has read it.
     ///
-    /// ⚠ **THIS RUNS BEFORE PARSING AND ITS FAILURE MUST NOT BE FATAL** — see the
+    /// ⚠ THIS RUNS BEFORE PARSING AND ITS FAILURE MUST NOT BE FATAL — see the
     /// caller. A frame this archive cannot store is still a frame it can act on,
     /// and losing the row is better than losing the message.
     ///
-    /// ⚠ **`INSERT IGNORE` ON THE DIGEST, because replay is routine.** signal-cli
+    /// ⚠ `INSERT IGNORE` ON THE DIGEST, because replay is routine. signal-cli
     /// re-delivers on reconnect, and this archive reconnects on every deploy. The
     /// hash is over the frame's own bytes, so a re-delivery is recognised and two
     /// genuinely different frames sharing a timestamp both survive.
@@ -1372,8 +1319,8 @@ impl Db {
 
     /// Close whatever they were called before, and open the name they wear now.
     ///
-    /// ⚠ **TWO STATEMENTS RATHER THAN ONE, because the one would reference the
-    /// table it writes.** `INSERT ... WHERE NOT EXISTS (SELECT FROM contact_names)`
+    /// ⚠ TWO STATEMENTS RATHER THAN ONE, because the one would reference the
+    /// table it writes. `INSERT ... WHERE NOT EXISTS (SELECT FROM contact_names)`
     /// is the obvious spelling and MySQL/MariaDB refuses it — the target table
     /// cannot appear in the statement's own subquery. Read then write, which is
     /// also the only version a reader can check by hand.
@@ -1406,7 +1353,7 @@ impl Db {
     /// duplicate that `INSERT IGNORE` dropped. Encoding the duplicate case as
     /// `None` (rather than a `0` sentinel) means a caller can't fetch children
     /// for a row that was never written without the type forcing the check.
-    /// ⚠ **TAKES THE PARSED MESSAGE, NOT NINE POSITIONAL ARGUMENTS.** It was six
+    /// ⚠ TAKES THE PARSED MESSAGE, NOT NINE POSITIONAL ARGUMENTS. It was six
     /// and v47 adds three more; at that width a call site is a row of bare values
     /// where two `Option<i64>` timestamps sit next to each other and swapping them
     /// compiles. The caller already holds the whole thing.
@@ -1564,7 +1511,7 @@ impl Db {
     /// duplicates `INSERT IGNORE` dropped, which is the normal result of
     /// re-running an import over logs already read.
     ///
-    /// ⚠ **Batched because the unit of this import is 860,359 lines.** One
+    /// ⚠ Batched because the unit of this import is 860,359 lines. One
     /// statement per line is one network round trip per line: tolerable
     /// in-cluster, hours over a port-forward from a laptop, which is where a
     /// history import is actually run. A log file averages ~72 lines, so a
@@ -1629,7 +1576,7 @@ impl Db {
     /// dry run, converts the next run's skip into data loss that nothing
     /// reports.
     ///
-    /// ⚠ **BATCHED, and the unbatched version was measured being wrong.** One
+    /// ⚠ BATCHED, and the unbatched version was measured being wrong. One
     /// statement per file is one network round trip per file — exactly what the
     /// note on [`Self::insert_irc_lines`] says about lines, recreated one level
     /// up. A full pass went from ~7ms to ~30ms a file, so the audit mode that
@@ -1691,8 +1638,8 @@ impl Db {
 
     /// Store a mapped message, keeping any text it is replacing.
     ///
-    /// ⚠ **This is the one write in the archive that can destroy something, and
-    /// the transaction is what stops it.** Telegram's edit is a mutation of a
+    /// ⚠ This is the one write in the archive that can destroy something, and
+    /// the transaction is what stops it. Telegram's edit is a mutation of a
     /// message that keeps its id, so the row has to be updated in place — and the
     /// words being replaced exist nowhere else the moment that update lands. So
     /// the old text is appended to `telegram_message_edits` and the row is updated
@@ -1704,8 +1651,8 @@ impl Db {
     /// what makes it safe for the backfill and the live stream to cover the same
     /// ground.
     ///
-    /// ⚠ **THERE IS NO `SELECT … FOR UPDATE` HERE, AND THAT IS THE FIX FOR A
-    /// DEADLOCK, not a weakening.** The first version opened with a locking read
+    /// ⚠ THERE IS NO `SELECT … FOR UPDATE` HERE, AND THAT IS THE FIX FOR A
+    /// DEADLOCK, not a weakening. The first version opened with a locking read
     /// of a row that usually does not exist yet, which in InnoDB takes a GAP lock
     /// — and two transactions inserting different messages into the same gap
     /// deadlock each other. This archive has exactly the two concurrent writers
@@ -1765,7 +1712,7 @@ impl Db {
             return Ok(TelegramStored::Inserted);
         }
 
-        // ⚠ **WHAT MAKES A NEW COLUMN FILLABLE FOR ROWS ALREADY STORED.** Without
+        // ⚠ WHAT MAKES A NEW COLUMN FILLABLE FOR ROWS ALREADY STORED. Without
         // this, adding `media_size` would have left it NULL forever on everything
         // ingested before it existed: the backfill marks a conversation `complete`
         // and never returns, and even a forced re-walk stores nothing because the
@@ -1783,8 +1730,8 @@ impl Db {
         // change, so a disagreement means one of the two readings is wrong, and
         // silently taking the newer one would hide that.
         //
-        // ⚠ **`sender_name` BELONGS HERE AND WAS LEFT OUT, WHICH IS WHY A RE-WALK
-        // WOULD NOT HAVE BEEN COMPLETE.** It is not derived from the row — it comes
+        // ⚠ `sender_name` BELONGS HERE AND WAS LEFT OUT, WHICH IS WHY A RE-WALK
+        // WOULD NOT HAVE BEEN COMPLETE. It is not derived from the row — it comes
         // from the caller's peer lookup, which returns nothing when the peer is not
         // in the session cache — so 652 stored messages have a `sender_id` and no
         // name, and the viewer draws them with a BLANK sender. 527 of them are one
@@ -1793,10 +1740,10 @@ impl Db {
         // was never revisited, so the gap was silent in exactly the way a missing
         // enrichment always is: nothing fails, the column simply stays NULL.
         //
-        // The lesson generalises past this row — **a column that can be NULL for a
-        // reason OTHER than "the message does not have one" needs to be here.**
+        // The lesson generalises past this row — a column that can be NULL for a
+        // reason OTHER than "the message does not have one" needs to be here.
         //
-        // ⚠ **v30–v35 ARE ALL HERE, AND THAT IS NOT OPTIONAL.** Every one of those
+        // ⚠ v30–v35 ARE ALL HERE, AND THAT IS NOT OPTIONAL. Every one of those
         // columns is NULL on all 159,956 rows stored before it existed, which is
         // precisely the "NULL for a reason other than the message not having one"
         // case above. Leaving any of them out would mean a column the re-capture
@@ -1957,7 +1904,7 @@ impl Db {
         msg_id: i32,
         reactions: &[crate::telegram::map::Reaction],
     ) -> Result<()> {
-        // ⚠ **AN EMPTY SET IS NOT EVIDENCE OF REMOVAL, so it marks nothing.**
+        // ⚠ AN EMPTY SET IS NOT EVIDENCE OF REMOVAL, so it marks nothing.
         // `None` reactions on the wire and "every reaction was taken back" arrive
         // here identically, and treating the pair as removal would retract a
         // message's reactions every time a delivery simply did not carry them.
@@ -2023,8 +1970,8 @@ impl Db {
 
     /// Record WHO reacted, without letting a truncated list retract anybody.
     ///
-    /// ⚠ **The rule is [`crate::telegram::map::Reactions::complete`], and it is NOT
-    /// the aggregate's rule.** `replace_telegram_reactions` may retract whenever it
+    /// ⚠ The rule is [`crate::telegram::map::Reactions::complete`], and it is NOT
+    /// the aggregate's rule. `replace_telegram_reactions` may retract whenever it
     /// is given a non-empty set, because `results` is a complete tally by
     /// construction.
     /// `recent_reactions` is a SAMPLE: Telegram truncates it for a message with
@@ -2109,13 +2056,13 @@ impl Db {
 
     /// Record the formatting and the links the text does not carry.
     ///
-    /// ⚠ **An empty list is not evidence of removal**, the same asymmetry as
+    /// ⚠ An empty list is not evidence of removal, the same asymmetry as
     /// everywhere else here: a message with no formatting and a delivery that did
     /// not mention entities arrive identically, as `None` flattened to nothing.
     /// So an empty list marks nothing, and only a non-empty one — which is a
     /// complete statement of the current text's spans — may date what is missing.
     ///
-    /// ⚠ **Identity is the SPAN, not a position.** An edit that inserts a bold run
+    /// ⚠ Identity is the SPAN, not a position. An edit that inserts a bold run
     /// at the start renumbers every entity after it, so keying on an index would
     /// date spans that merely moved. See migration v31.
     pub async fn replace_telegram_entities(
@@ -2174,7 +2121,7 @@ impl Db {
 
     /// Record how long a call was and how it ended.
     ///
-    /// ⚠ **`duration_s` is enriched, never overwritten with NULL.** A call's
+    /// ⚠ `duration_s` is enriched, never overwritten with NULL. A call's
     /// service message can be delivered before the call ends — it is created when
     /// the call starts — so a later read is the one that knows how long it took.
     /// A plain upsert would let an early re-delivery erase a duration already
@@ -2323,12 +2270,12 @@ impl Db {
     /// nothing, which is what keeps the hourly sweep from adding 21 rows an hour
     /// to a quiet archive.
     ///
-    /// ⚠ **`INSERT IGNORE` on `(conversation, direction, max_id)`, NOT an upsert.**
+    /// ⚠ `INSERT IGNORE` on `(conversation, direction, max_id)`, NOT an upsert.
     /// Each distinct mark keeps its own first-observation time forever; re-seeing
     /// one must not move that time, or the record would drift forward every hour
     /// and the answer to "when was this read?" would always be "recently".
     ///
-    /// ⚠ **A `max_id` of 0 is NOT a mark**, it is Telegram's way of saying nothing
+    /// ⚠ A `max_id` of 0 is NOT a mark, it is Telegram's way of saying nothing
     /// has been read in that direction. Storing it would put a row at the bottom of
     /// every conversation claiming a read that never happened.
     pub async fn record_telegram_read_mark(
@@ -2392,7 +2339,7 @@ impl Db {
     /// half-written file, and the reader has no way to tell a short file from a
     /// small one. Same ordering, and the same reason, as the Signal attachment path.
     ///
-    /// ⚠ **It records no SIZE, deliberately — see the v25 migration.** The size lives
+    /// ⚠ It records no SIZE, deliberately — see the v25 migration. The size lives
     /// in `telegram_messages.media_size`, where it came from the message rather than
     /// from a `stat` that races the write's visibility.
     pub async fn record_telegram_media_stored(
@@ -2544,8 +2491,8 @@ impl Db {
     /// Flag messages a `updateDeleteMessages` named, and report how many rows it
     /// reached.
     ///
-    /// ⚠ **`updateDeleteMessages` CARRIES NO PEER, and that is why this takes a
-    /// kind rather than a conversation.** Telegram can leave the peer out because
+    /// ⚠ `updateDeleteMessages` CARRIES NO PEER, and that is why this takes a
+    /// kind rather than a conversation. Telegram can leave the peer out because
     /// private chats and basic groups share ONE message-id sequence per account —
     /// an id is enough to identify the message among them. Channels each have
     /// their own sequence and get `updateDeleteChannelMessages`, which does name

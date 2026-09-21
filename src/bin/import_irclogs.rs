@@ -11,7 +11,7 @@
 //!     --self-nick mynick --self-nick mynick_ [--apply] [--all]
 //! ```
 //!
-//! **A run costs what ARRIVED, not what exists.** Under `--apply` the importer
+//! A run costs what ARRIVED, not what exists. Under `--apply` the importer
 //! remembers each file's `(mtime, size)` in `irc_import_state` and skips the
 //! ones that have not moved. ⚠ MEASURED before this existed: a run took 5–7
 //! minutes to write 3 rows, because it re-read all 36,201 files and re-issued
@@ -23,12 +23,12 @@
 //! changing the parser: see the flag's own note on why the end-of-run report
 //! stops describing the corpus once files are skipped.
 //!
-//! **Why `--self-nick` is an argument and not a constant.** It is the only way
+//! Why `--self-nick` is an argument and not a constant. It is the only way
 //! to know which lines are yours — irssi logs your own messages under your nick
 //! like anybody else's — and this repository is public, so a real nick does not
 //! belong in it.
 //!
-//! **Why `--map` exists.** irssi invents a second tag (`mynet2`) when it opens a
+//! Why `--map` exists. irssi invents a second tag (`mynet2`) when it opens a
 //! second simultaneous connection to a network whose tag is taken. Those logs
 //! are the same conversations, so the tag is rewritten on the way in rather than
 //! by moving 1,265 files around on a live archive going back to 2013. The
@@ -55,7 +55,7 @@ struct Args {
     apply: bool,
     /// Read every file, whatever `irc_import_state` says was already read.
     ///
-    /// ⚠ **This is not just a slow mode, it is the audit.** The end-of-run
+    /// ⚠ This is not just a slow mode, it is the audit. The end-of-run
     /// report — the line count by kind, the unrecognised classes, the files that
     /// were not valid UTF-8 — describes the files this run READ. Skipping the
     /// unchanged ones makes it a report about today rather than about the
@@ -136,8 +136,8 @@ fn file_state(path: &Path) -> Result<(i64, i64)> {
 /// The part of a snapshot that is safe to parse: up to and including the last
 /// newline.
 ///
-/// ⚠ **A LINE WITHOUT ITS NEWLINE IS A LINE STILL BEING WRITTEN, and importing
-/// one corrupts the archive permanently.** `rsync` copies whatever the file
+/// ⚠ A LINE WITHOUT ITS NEWLINE IS A LINE STILL BEING WRITTEN, and importing
+/// one corrupts the archive permanently. `rsync` copies whatever the file
 /// holds at that instant, and irssi may be halfway through appending. Rust's
 /// `lines()` yields that fragment like any other line, so it would be parsed and
 /// inserted — and when the complete line arrives it carries the SAME `line_no`,

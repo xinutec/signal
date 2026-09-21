@@ -74,7 +74,7 @@ pub struct Attachment {
 pub struct Message {
     pub thread_id: ThreadId,
     pub sender: String,
-    /// ⚠ **THE SENDER'S CLOCK.** `envelope.timestamp` is minted by the sending
+    /// ⚠ THE SENDER'S CLOCK. `envelope.timestamp` is minted by the sending
     /// device and doubles as the message's identity, so a phone with a wrong
     /// clock files its words under a wrong hour and nothing can correct it.
     pub server_ts: i64,
@@ -86,7 +86,7 @@ pub struct Message {
     pub server_delivered_ts: Option<i64>,
     /// The disappearing-message timer in force when this was sent.
     ///
-    /// ⚠ **`None` AND `Some(0)` ARE DIFFERENT STATEMENTS.** Absent means the
+    /// ⚠ `None` AND `Some(0)` ARE DIFFERENT STATEMENTS. Absent means the
     /// frame carried no timer at all; zero means the timer was explicitly turned
     /// OFF, which is a thing somebody did. Collapsing them would lose the second.
     pub expires_in_seconds: Option<i32>,
@@ -125,7 +125,7 @@ pub enum Action {
         sender: String,
         target_ts: i64,
     },
-    /// ⚠ **THE ONLY THING SIGNAL SAYS ONCE.** A receipt is an EVENT with its own
+    /// ⚠ THE ONLY THING SIGNAL SAYS ONCE. A receipt is an EVENT with its own
     /// clock — who, which messages, delivered/read/viewed, and when — not a
     /// high-water mark like Telegram's `read_outbox_max_id`. Nothing restates it,
     /// so a receipt that is not stored as it arrives is gone. See migration v37.
@@ -170,7 +170,7 @@ impl ReceiptKind {
 
 /// One frame of a call's signalling.
 ///
-/// ⚠ **RAW EVENTS, NOT A DURATION, AND THAT IS DELIBERATE.** Telegram hands over
+/// ⚠ RAW EVENTS, NOT A DURATION, AND THAT IS DELIBERATE. Telegram hands over
 /// a finished call as one service message with `duration` and `reason` already
 /// computed. Signal hands over WebRTC signalling: an offer, maybe an answer,
 /// maybe a busy, maybe a hangup, all sharing a `call_id`, each arriving as its
@@ -255,7 +255,7 @@ fn thread_of(msg: &Value, dm_peer: &str) -> ThreadId {
 
 /// The two times SIGNAL put on the envelope, which the payload cannot see.
 ///
-/// ⚠ **THESE ARE THE ONLY TIMESTAMPS NO SENDER CAN SET.** `envelope.timestamp`
+/// ⚠ THESE ARE THE ONLY TIMESTAMPS NO SENDER CAN SET. `envelope.timestamp`
 /// is minted by the sending device and doubles as the message's identity, so a
 /// wrong clock files a message under a wrong hour and nothing downstream can
 /// correct it. These two are the server's own.
@@ -329,7 +329,7 @@ fn payload_action(
 
     let body = match msg.get("message").and_then(Value::as_str) {
         Some(t) => Some(t.to_string()),
-        // ⚠ **THIS READ `sticker.emoji`, WHICH SIGNAL-CLI HAS NEVER SENT.**
+        // ⚠ THIS READ `sticker.emoji`, WHICH SIGNAL-CLI HAS NEVER SENT.
         // `JsonSticker` is `(String packId, int stickerId)` — checked against the
         // deployed tag, v0.14.5 — so the lookup always missed, `unwrap_or("")`
         // turned the miss into a blank, and every sticker in the archive reads
@@ -541,10 +541,10 @@ pub fn parse_frame(frame: &Value) -> Parsed {
         };
     }
 
-    // ⚠ **BEFORE the syncMessage arm below, because a read receipt synced from
+    // ⚠ BEFORE the syncMessage arm below, because a read receipt synced from
     // another device arrives INSIDE `syncMessage` and the `sentMessage` arm would
     // not match it — it would simply fall through to `Skip`, which is how every
-    // receipt since this feed started was lost.**
+    // receipt since this feed started was lost.
     if let Some(reads) = env
         .get("syncMessage")
         .and_then(|s| s.get("readMessages"))
@@ -669,7 +669,7 @@ pub fn parse_frame(frame: &Value) -> Parsed {
 
 /// The display name Signal itself would show for a contact.
 ///
-/// ⚠ **THIS IS SIGNAL-CLI'S OWN PRECEDENCE, NOT A CHOICE MADE HERE.** Copied from
+/// ⚠ THIS IS SIGNAL-CLI'S OWN PRECEDENCE, NOT A CHOICE MADE HERE. Copied from
 /// `ManagerImpl.getContactOrProfileName` at v0.14.7:
 ///
 /// ```text
@@ -682,7 +682,7 @@ pub fn parse_frame(frame: &Value) -> Parsed {
 /// — and `getDisplayNickname` / `getName` are each `given + " " + family`, falling
 /// back to whichever half is non-empty.
 ///
-/// ⚠ **THE DEPLOYED 0.14.5 HAS NO NICKNAME BRANCH, WHICH IS WHY THIS EXISTS.** Its
+/// ⚠ THE DEPLOYED 0.14.5 HAS NO NICKNAME BRANCH, WHICH IS WHY THIS EXISTS. Its
 /// `getContactOrProfileName` goes straight from the system contact name to the
 /// profile name, and that function is what fills `envelope.sourceName` — so a
 /// contact renamed in Signal's own UI arrived here under whatever they call

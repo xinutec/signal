@@ -30,7 +30,7 @@ fn a_fresh_session_is_not_dirty() {
     assert!(!fresh().is_dirty());
 }
 
-/// ⚠ **The short-circuit that keeps the flush honest.** `auto_cache_peers` hands
+/// ⚠ The short-circuit that keeps the flush honest. `auto_cache_peers` hands
 /// over every peer in every response, so during a backfill the SAME peers arrive
 /// thousands of times. Marking the session dirty for a peer already known in full
 /// would mean the flag is always set and "flush when something changed" quietly

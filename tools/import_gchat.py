@@ -187,14 +187,14 @@ def main():
                             (gid, msg_id))
                 message_id = cur.fetchone()[0]
 
-            # ⚠ **THE PICTURES, WHICH THIS ARCHIVE HAD NEVER RECORDED AT ALL.**
+            # ⚠ THE PICTURES, WHICH THIS ARCHIVE HAD NEVER RECORDED AT ALL.
             # A Google Chat message is a 39-element array and the capture read six
             # indices; attachments are at 10. 326 of 7,042 messages carry one —
             # and only 20 of those are wordless, so the other 306 rendered as
             # ordinary text messages with a caption and no picture. Nothing said a
             # picture had been there.
             #
-            # ⚠ **THE BYTES ARE NOT HERE AND THIS ROW CANNOT FETCH THEM.** The
+            # ⚠ THE BYTES ARE NOT HERE AND THIS ROW CANNOT FETCH THEM. The
             # client mints a `lh3.googleusercontent.com/chat_attachment/AP1Ws4…`
             # URL at render time from `token`; that URL appears nowhere in the
             # capture, and it answers 403 without Pippijn's session. So this table
@@ -219,7 +219,7 @@ def main():
                 # photo on the wrong message.
                 held = stored.get(f"{gid}\t{msg_id}\t{a.get('uuid')}")
                 if held:
-                    # ⚠ **`<=>`, NOT `=`.** 58 of this archive's 326 attachments
+                    # ⚠ `<=>`, NOT `=`. 58 of this archive's 326 attachments
                     # have NO uuid, and `uuid = NULL` is never true — so a plain
                     # `=` silently updated nothing for every one of them and the
                     # pictures stayed unreachable while the import reported
@@ -240,12 +240,12 @@ def main():
                     "ON DUPLICATE KEY UPDATE cnt=VALUES(cnt)",
                     (message_id, emoji, int(r.get("count") or 0)))
 
-                # ⚠ **WHO reacted, which `list_topics` does NOT give.** A reaction
+                # ⚠ WHO reacted, which `list_topics` does NOT give. A reaction
                 # arrives as [emoji, count]; the names come from a second rpc that
                 # gchat-archive's sync.py replays per reacted message and merges
                 # into this same export as `reactors: [{id, name}]`.
                 #
-                # ⚠ **AN ABSENT `reactors` IS NOT "NOBODY REACTED".** That replay
+                # ⚠ AN ABSENT `reactors` IS NOT "NOBODY REACTED". That replay
                 # is budget-capped per run and carries an unfinished backlog on
                 # purpose, so most reaction groups have no names yet and running
                 # the sync again resolves more. Rows are therefore only ever

@@ -11,17 +11,17 @@
 //! autolog_path = "~/irclogs/$tag/%Y/%m/%d/$0.log"
 //! ```
 //!
-//! So the **network** (`$tag`) and the **target** (`$0` — a channel or a nick)
+//! So the network (`$tag`) and the target (`$0` — a channel or a nick)
 //! are recoverable only from the path, and so is the date: a logged line
 //! carries irssi's default `timestamp_format` of `%H:%M` and nothing more.
 //!
-//! ⚠ **The line classes were measured, not assumed** — one network's whole
+//! ⚠ The line classes were measured, not assumed — one network's whole
 //! tree, 966,039 lines, 2026-08-14:
 //!
 //! | class | form | count |
 //! |---|---|---|
 //! | message | `HH:MM <nick> text` | 425,748 |
-//! | notice, server | `HH:MM !server [*** ]text` | 385,012 |
+//! | notice, server | `HH:MM !server [* ]text` | 385,012 |
 //! | *log opened* | `--- Log opened <date>` | 52,894 |
 //! | *log closed* | `--- Log closed <date>` | 52,812 |
 //! | event | `HH:MM -!- text` | 45,600 |
@@ -33,10 +33,10 @@
 //!
 //! Server notices very nearly outnumber conversation, and three of the classes
 //! were not in the format as anybody had written it down: the bare notice with
-//! no `***`, the notice from a person, and the OTR plugin's status lines. Each
+//! no `*`, the notice from a person, and the OTR plugin's status lines. Each
 //! was found by counting the corpus rather than by reading about it.
 //!
-//! Which is why **nothing here drops a line silently**. Anything unrecognised
+//! Which is why nothing here drops a line silently. Anything unrecognised
 //! comes back in [`Parsed::unparsed`] by line number for the caller to report,
 //! and the classes are matched narrowly on purpose — a rule general enough to
 //! absorb the next surprise would also hide it.
@@ -138,9 +138,9 @@ impl LogPath {
     }
 }
 
-/// Split a path **relative to the irclogs root** into network, target and date.
+/// Split a path relative to the irclogs root into network, target and date.
 ///
-/// ⚠ **Exactly five components, and that is load-bearing.** 57 of 89,474 files
+/// ⚠ Exactly five components, and that is load-bearing. 57 of 89,474 files
 /// sit at `<YYYY>/<MM>/<DD>/<target>.log` with no network at all — they predate
 /// the `$tag` in `autolog_path`. Matching on the *last* five components instead
 /// would read `irclogs/2014/03/09/x.log` as the network `irclogs`, filing
@@ -270,7 +270,7 @@ fn parse_entry(date: Date, line_no: u32, line: &str) -> Option<Entry> {
         return entry(Kind::Event, None, rest);
     }
     // `!server text`, where the text of a status notice conventionally opens
-    // with `***`. 32,712 measured carry it and 79 do not, so it is decoration
+    // with `*`. 32,712 measured carry it and 79 do not, so it is decoration
     // and stripping it is what keeps those 79 from being reported as a mystery.
     if let Some(rest) = rest.strip_prefix('!') {
         let (server, text) = rest.split_once(' ')?;

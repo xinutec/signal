@@ -91,7 +91,7 @@ fn a_message_carries_its_nick_and_text() {
 /// the channel, not part of anybody's name — keeping it would file the same
 /// person under two names the day they are opped.
 ///
-/// ⚠ **A space is one of those modes: it is the column with no mode in it.**
+/// ⚠ A space is one of those modes: it is the column with no mode in it.
 /// 323,570 of the 425,748 measured messages are `< nick>` — every ordinary
 /// person speaking in a channel — against 102,178 unpadded. Treating the space
 /// as part of the name split every unopped participant into two people, and put
@@ -163,7 +163,7 @@ fn an_event_has_no_nick_and_keeps_its_whole_text() {
     assert_eq!(e.text, "alice [alice@example.invalid] has joined #chan");
 }
 
-/// `HH:MM !server *** text` — 32,712 measured, **the largest class of all**,
+/// `HH:MM !server * text` — 32,712 measured, the largest class of all,
 /// larger than actual messages. A parser that dropped what it did not recognise
 /// would silently discard half the corpus and look like it worked.
 #[test]
@@ -174,7 +174,7 @@ fn a_server_notice_is_recognised_and_attributed_to_the_server() {
     assert_eq!(e.text, "You are now logged in");
 }
 
-/// The `***` is decoration, not structure: 79 notices across the measured tree
+/// The `*` is decoration, not structure: 79 notices across the measured tree
 /// carry none. Requiring it cost those 79 lines, which is how it was found —
 /// by counting the real corpus, not by reading the format.
 #[test]
@@ -370,7 +370,7 @@ fn a_timestamp_renders_as_a_mariadb_datetime() {
 
 /// A line read on its own means exactly what it means read in its file.
 ///
-/// ⚠ **THIS IS THE CONTRACT BETWEEN THE TWO TIERS.** `import_irclogs` parses
+/// ⚠ THIS IS THE CONTRACT BETWEEN THE TWO TIERS. `import_irclogs` parses
 /// whole files; `irc_tail` is handed one line at a time by the irssi plugin and
 /// parses it alone, then writes the row on the archive's dedupe key. If the two
 /// readings differed by so much as a nick, the live row and the row the next
