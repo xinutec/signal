@@ -181,13 +181,15 @@ async fn a_nameless_sighting_does_not_wipe_a_name() {
     assert_eq!(phone.as_deref(), Some("+447700900000"));
 }
 
-/// ⚠ **`profile_name` IS STILL WRITTEN, and that is a deployment fact rather than
-/// a design one.** The viewer reads that column from a pod running right now, so
-/// the rename is an expand/contract: both columns move together until the reader
-/// has, and the drop is its own migration. If this ever fails, the archive and the
-/// viewer have started disagreeing about somebody's name.
+/// ⚠ **`profile_name` IS NO LONGER WRITTEN, AND THAT IS HALF A MIGRATION.** The
+/// viewer moved to `display_name` (messages 7098b95), so the column has no
+/// reader; this test pins that it has no WRITER either, which is the precondition
+/// for dropping it. `signal-ingester` is `RollingUpdate`, so a deploy that
+/// stopped the writes and dropped the column together would leave the old pod
+/// INSERTing into a column that is gone — and Signal keeps no history to re-walk,
+/// so those messages would be lost. Stop writing, ship, then drop.
 #[tokio::test]
-async fn the_old_column_moves_with_the_new_one() {
+async fn the_old_column_is_left_behind() {
     let Some((db, pool)) = connect().await else {
         return;
     };
@@ -204,8 +206,12 @@ async fn the_old_column_moves_with_the_new_one() {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(both.0.as_deref(), Some("Tania Boiko"));
-    assert_eq!(both.1.as_deref(), Some("Tania Boiko"));
+    assert_eq!(
+        both.0.as_deref(),
+        Some("Tania Boiko"),
+        "the live column moves"
+    );
+    assert_eq!(both.1, None, "and the superseded one is not touched at all");
 }
 
 // ---- the frame itself -------------------------------------------------------

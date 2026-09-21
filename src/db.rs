@@ -1003,11 +1003,19 @@ const MIGRATIONS: &[&str] = &[
     // That is the reason the column is not called `contact_name` either: it is
     // whatever Signal currently thinks this person is called.
     //
-    // ⚠ **`profile_name` IS DELIBERATELY LEFT IN PLACE.** The viewer still reads it
-    // from a pod that is running right now, so this is the expand half of an
-    // expand/contract: both are written until that reader has moved, and the drop
-    // is its own later migration. Removing it here would 500 the archive between
-    // two deploys.
+    // ⚠ **`profile_name` IS DELIBERATELY LEFT IN PLACE**, and as of 2026-09-21 the
+    // reason has CHANGED — the viewer has moved (messages 7098b95, verified: the
+    // serving binary holds 0 references to `profile_name` and 13 to
+    // `display_name`). What keeps the column is the WRITER, and the hazard is the
+    // rollout rather than the reader.
+    //
+    // ⚠ **`signal-ingester` IS `RollingUpdate`, SO OLD AND NEW PODS OVERLAP.** A
+    // single deploy that both stopped writing the column and dropped it would
+    // leave the old pod INSERTing into a column that no longer exists; its writes
+    // fail, and Signal keeps no server-side history to re-walk, so those messages
+    // are gone. Dropping it therefore needs two deploys: stop writing, then drop.
+    // All 41 rows are identical across the two columns, so the drop itself loses
+    // nothing — the sequencing is the whole of the risk.
     r"ALTER TABLE contacts ADD COLUMN display_name VARCHAR(255) NULL",
     r"UPDATE contacts SET display_name = profile_name WHERE display_name IS NULL",
     // v43: what somebody was called, and until when.
@@ -1183,8 +1191,12 @@ impl Db {
     /// ⚠ **`envelope.sourceName` IS A DISPLAY NAME, NOT A PROFILE NAME.** signal-cli
     /// resolves it with Signal's own precedence, which in 0.14.5 is the system
     /// contact name and then the profile name, and from 0.14.7 the nickname above
-    /// both. `profile_name` is written beside `display_name` only while the
-    /// viewer's deployed pod still reads that column; see the v41 migration.
+    /// both.
+    ///
+    /// ⚠ **`profile_name` IS NO LONGER WRITTEN**, which is the first of the two
+    /// deploys its removal needs: the column still EXISTS, so an old pod mid-
+    /// rollout keeps working, and the DROP is safe only once no running pod
+    /// writes it. See the v41 migration for why the order is not optional.
     pub async fn upsert_contact(
         &self,
         uuid: &str,
@@ -1198,12 +1210,11 @@ impl Db {
         // place a rename can happen and exactly one place it can be noticed.
         // `rows_affected` is MySQL's — 1 means this INSERT really inserted.
         let inserted = sqlx::query(
-            "INSERT INTO contacts (uuid, phone, profile_name, display_name) VALUES (?, ?, ?, ?)
+            "INSERT INTO contacts (uuid, phone, display_name) VALUES (?, ?, ?)
              ON DUPLICATE KEY UPDATE phone = COALESCE(VALUES(phone), phone)",
         )
         .bind(uuid)
         .bind(phone)
-        .bind(name)
         .bind(name)
         .execute(&self.pool)
         .await?
@@ -1216,10 +1227,9 @@ impl Db {
         // here: a contact first seen without a name gets its first one this way,
         // and that opening chapter has to be recorded like any other.
         let moved = sqlx::query(
-            "UPDATE contacts SET display_name = ?, profile_name = ?
+            "UPDATE contacts SET display_name = ?
               WHERE uuid = ? AND (display_name IS NULL OR display_name <> ?)",
         )
-        .bind(name)
         .bind(name)
         .bind(uuid)
         .bind(name)
