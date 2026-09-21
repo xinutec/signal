@@ -117,6 +117,13 @@ def main():
         for stmt in DDL:
             cur.execute(stmt)
 
+    # What the fetcher managed to pull, by the same key it wrote.
+    stored = {}
+    by_msg = os.path.join(os.path.dirname(conv_dir), "attachments", "by_message.json")
+    if os.path.exists(by_msg):
+        with open(by_msg) as fh:
+            stored = json.load(fh)
+
     stats = {"conversations": 0, "messages": 0, "dups": 0, "reactions": 0,
              "reactors": 0, "attachments": 0, "skipped": 0}
     for path in files:
@@ -197,6 +204,17 @@ def main():
                     (message_id, a.get("name"), a.get("mime"), a.get("width"),
                      a.get("height"), a.get("uuid"), a.get("token"),
                      a.get("hash1"), a.get("hash2")))
+                # ⚠ The bytes, if `fetch_attachments.py` has them. Keyed on
+                # (group, message, uuid) — the attachment's identity in the
+                # archive — because a file that cannot name its message is a file
+                # the viewer can only guess about, and guessing hangs the wrong
+                # photo on the wrong message.
+                held = stored.get(f"{gid}\t{msg_id}\t{a.get('uuid')}")
+                if held:
+                    cur.execute(
+                        "UPDATE gchat_attachments SET stored_path=%s "
+                        "WHERE message_id=%s AND uuid=%s",
+                        (held["file"], message_id, a.get("uuid")))
 
             for r in m.get("reactions") or []:
                 emoji = r.get("emoji")

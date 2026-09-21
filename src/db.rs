@@ -978,6 +978,68 @@ const MIGRATIONS: &[&str] = &[
         UNIQUE KEY uniq_signal_receipt (target_ts, author_uuid, kind),
         INDEX idx_signal_receipt_target (target_ts)
     ) DEFAULT CHARSET=utf8mb4",
+    // v40: the name is a DISPLAY name, and only sometimes the profile name.
+    //
+    // ⚠ **THE COLUMN IS NAMED AFTER THE LAST BRANCH OF A THREE-BRANCH FALLBACK.**
+    // What arrives in `envelope.sourceName` is signal-cli's
+    // `getContactOrProfileName`, whose order is Signal's own. In the version
+    // deployed here (0.14.5) it is:
+    //
+    //     if (contact != null && !isEmpty(contact.getName())) return contact.getName();
+    //     return profile.getDisplayName();
+    //
+    // So for 38 of 52 recipients it holds the ADDRESS-BOOK name and the profile
+    // name is the fallback, not the meaning. Renamed rather than re-documented,
+    // because a column called `profile_name` is what a reader believes.
+    //
+    // ⚠ **0.14.7 ADDS A BRANCH ABOVE BOTH** — `contact.getDisplayNickname()`, the
+    // first/last name you type in Signal's own UI — so the same field starts
+    // carrying a third kind of name on upgrade without anything here changing.
+    // That is the reason the column is not called `contact_name` either: it is
+    // whatever Signal currently thinks this person is called.
+    //
+    // ⚠ **`profile_name` IS DELIBERATELY LEFT IN PLACE.** The viewer still reads it
+    // from a pod that is running right now, so this is the expand half of an
+    // expand/contract: both are written until that reader has moved, and the drop
+    // is its own later migration. Removing it here would 500 the archive between
+    // two deploys.
+    r"ALTER TABLE contacts ADD COLUMN display_name VARCHAR(255) NULL",
+    r"UPDATE contacts SET display_name = profile_name WHERE display_name IS NULL",
+    // v42: what somebody was called, and until when.
+    //
+    // ⚠ **A NAME HAS ALWAYS BEEN OVERWRITTEN IN PLACE, AND THE NEXT RENAME IS A
+    // BULK ONE.** `contacts` keeps one name per person, so a rename answers "what
+    // is she called" and destroys "what was she called when she said this" — and
+    // the second is the question a reader of an old thread actually has. That has
+    // cost nothing so far because the resolved names have not moved; upgrading
+    // signal-cli past 0.14.7 adds the nickname branch above the other two and
+    // renames everybody who has one, all at once, on the first message after the
+    // pod restarts.
+    //
+    // So the old name is dated rather than dropped, the same shape as
+    // `telegram_reactions.removed_at`: the row stays and gains an end.
+    //
+    // ⚠ **THIS IS NOT FIXING A BUG.** It was written while chasing one that turned
+    // out not to exist — the claim was that `COALESCE(VALUES(x), x)` made the name
+    // write-once, and it does the opposite: it overwrites whenever a value is
+    // supplied. Kept because the archive's rule is that history is dated, never
+    // deleted, and a bulk rename is exactly the event that would have broken it.
+    //
+    // ⚠ **`seen_from` ON A BACKFILLED ROW IS WHEN THE ARCHIVE LAST TOUCHED IT**, not
+    // when the person began being called that. Signal sends no such date and never
+    // did. The column is named for what it can hold.
+    r"CREATE TABLE IF NOT EXISTS contact_names (
+        id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        uuid VARCHAR(64) NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        seen_from TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        seen_until TIMESTAMP NULL,
+        INDEX idx_contact_names_current (uuid, seen_until)
+    ) DEFAULT CHARSET=utf8mb4",
+    // The name each contact is wearing now, so the history starts complete rather
+    // than from the next time somebody is renamed.
+    r"INSERT INTO contact_names (uuid, name, seen_from)
+        SELECT uuid, display_name, updated_at FROM contacts WHERE display_name IS NOT NULL",
 ];
 
 #[derive(Clone)]
@@ -1055,8 +1117,29 @@ impl Db {
         Ok(())
     }
 
-    /// Record/refresh a contact. Only overwrites phone/name when a non-NULL
-    /// value is supplied, so a later sighting without a name won't wipe one.
+    /// Record a contact, keeping the name it is wearing and dating the one it wore.
+    ///
+    /// ⚠ **`COALESCE(VALUES(x), x)` OVERWRITES — it is not fill-only, and reading
+    /// it as fill-only cost an afternoon.** `VALUES(x)` is the value from the
+    /// INSERT list, so the COALESCE returns the NEW value whenever one was
+    /// supplied and the stored one only when it was NULL. That is the right
+    /// behaviour for `phone` and it is why the name has always tracked signal-cli
+    /// correctly. What it cannot do is notice that it changed something.
+    ///
+    /// ⚠ **SO THE NAME IS WRITTEN BY A SECOND STATEMENT, WHOSE `rows_affected` IS
+    /// THE RENAME.** A name arrives with EVERY message, and almost always the same
+    /// one; the `<>` makes that an indexed no-op that writes no history, and makes
+    /// the rare change announce itself without a SELECT to compare against.
+    ///
+    /// ⚠ **A SIGHTING WITH NO NAME MUST NOT BLANK ONE WE HOLD.** Receipts, typing
+    /// frames and group members we have no profile for all arrive nameless. They
+    /// skip the second statement entirely rather than passing NULL through it.
+    ///
+    /// ⚠ **`envelope.sourceName` IS A DISPLAY NAME, NOT A PROFILE NAME.** signal-cli
+    /// resolves it with Signal's own precedence, which in 0.14.5 is the system
+    /// contact name and then the profile name, and from 0.14.7 the nickname above
+    /// both. `profile_name` is written beside `display_name` only while the
+    /// viewer's deployed pod still reads that column; see the v40 migration.
     pub async fn upsert_contact(
         &self,
         uuid: &str,
@@ -1065,17 +1148,75 @@ impl Db {
     ) -> Result<()> {
         let phone = phone.filter(|s| !s.is_empty());
         let name = name.filter(|s| !s.is_empty());
-        sqlx::query(
-            "INSERT INTO contacts (uuid, phone, profile_name) VALUES (?, ?, ?)
-             ON DUPLICATE KEY UPDATE
-                phone = COALESCE(VALUES(phone), phone),
-                profile_name = COALESCE(VALUES(profile_name), profile_name)",
+        // ⚠ The duplicate branch deliberately leaves BOTH name columns alone: every
+        // later change goes through the statement below, so there is exactly one
+        // place a rename can happen and exactly one place it can be noticed.
+        // `rows_affected` is MySQL's — 1 means this INSERT really inserted.
+        let inserted = sqlx::query(
+            "INSERT INTO contacts (uuid, phone, profile_name, display_name) VALUES (?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE phone = COALESCE(VALUES(phone), phone)",
         )
         .bind(uuid)
         .bind(phone)
         .bind(name)
+        .bind(name)
+        .execute(&self.pool)
+        .await?
+        .rows_affected()
+            == 1;
+
+        let Some(name) = name else { return Ok(()) };
+
+        // `display_name IS NULL` is not the same as a rename and still belongs
+        // here: a contact first seen without a name gets its first one this way,
+        // and that opening chapter has to be recorded like any other.
+        let moved = sqlx::query(
+            "UPDATE contacts SET display_name = ?, profile_name = ?
+              WHERE uuid = ? AND (display_name IS NULL OR display_name <> ?)",
+        )
+        .bind(name)
+        .bind(name)
+        .bind(uuid)
+        .bind(name)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+
+        if !inserted && moved == 0 {
+            return Ok(());
+        }
+        self.record_contact_name(uuid, name).await
+    }
+
+    /// Close whatever they were called before, and open the name they wear now.
+    ///
+    /// ⚠ **TWO STATEMENTS RATHER THAN ONE, because the one would reference the
+    /// table it writes.** `INSERT ... WHERE NOT EXISTS (SELECT FROM contact_names)`
+    /// is the obvious spelling and MySQL/MariaDB refuses it — the target table
+    /// cannot appear in the statement's own subquery. Read then write, which is
+    /// also the only version a reader can check by hand.
+    async fn record_contact_name(&self, uuid: &str, name: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE contact_names SET seen_until = CURRENT_TIMESTAMP
+              WHERE uuid = ? AND seen_until IS NULL AND name <> ?",
+        )
+        .bind(uuid)
+        .bind(name)
         .execute(&self.pool)
         .await?;
+        let open: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM contact_names WHERE uuid = ? AND seen_until IS NULL",
+        )
+        .bind(uuid)
+        .fetch_one(&self.pool)
+        .await?;
+        if open == 0 {
+            sqlx::query("INSERT INTO contact_names (uuid, name) VALUES (?, ?)")
+                .bind(uuid)
+                .bind(name)
+                .execute(&self.pool)
+                .await?;
+        }
         Ok(())
     }
 
