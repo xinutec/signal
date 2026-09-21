@@ -64,3 +64,4 @@ grammers-mtsender = "0.10.0"
 # no client attached — which is what lets the whole mapping be unit-tested with
 # no network and no login, exactly as `parse.rs` is for Signal.
 grammers-tl-types = "0.10.0"
+sha2 = "0.10"

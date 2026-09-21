@@ -962,7 +962,12 @@ const MIGRATIONS: &[&str] = &[
         through_msg_id INT NOT NULL,
         updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
     ) DEFAULT CHARSET=utf8mb4",
-    // v39: Signal's receipts, APPENDED this time.
+    // v40: Signal's receipts, APPENDED this time.
+    //
+    // ⚠ The label said v39 and the entry is the 41st, index 40. A version number
+    // in a comment is what the next person counts from when deciding where to put
+    // theirs, so a label that is off by one is the same hazard as the dead v36
+    // below — checked against the array on 2026-09-21 and corrected.
     //
     // The same statement as the dead v36 above. It is here because appending is
     // the only way to add one: every index below 39 is already in
@@ -978,7 +983,7 @@ const MIGRATIONS: &[&str] = &[
         UNIQUE KEY uniq_signal_receipt (target_ts, author_uuid, kind),
         INDEX idx_signal_receipt_target (target_ts)
     ) DEFAULT CHARSET=utf8mb4",
-    // v40: the name is a DISPLAY name, and only sometimes the profile name.
+    // v41: the name is a DISPLAY name, and only sometimes the profile name.
     //
     // ⚠ **THE COLUMN IS NAMED AFTER THE LAST BRANCH OF A THREE-BRANCH FALLBACK.**
     // What arrives in `envelope.sourceName` is signal-cli's
@@ -1005,7 +1010,7 @@ const MIGRATIONS: &[&str] = &[
     // two deploys.
     r"ALTER TABLE contacts ADD COLUMN display_name VARCHAR(255) NULL",
     r"UPDATE contacts SET display_name = profile_name WHERE display_name IS NULL",
-    // v42: what somebody was called, and until when.
+    // v43: what somebody was called, and until when.
     //
     // ⚠ **A NAME HAS ALWAYS BEEN OVERWRITTEN IN PLACE, AND THE NEXT RENAME IS A
     // BULK ONE.** `contacts` keeps one name per person, so a rename answers "what
@@ -1040,6 +1045,46 @@ const MIGRATIONS: &[&str] = &[
     // than from the next time somebody is renamed.
     r"INSERT INTO contact_names (uuid, name, seen_from)
         SELECT uuid, display_name, updated_at FROM contacts WHERE display_name IS NOT NULL",
+    // v45: the frame as it arrived, before anything reads it.
+    //
+    // ⚠ **SIGNAL SAYS EVERYTHING EXACTLY ONCE, so a field this archive has no
+    // column for is gone the moment the socket moves on.** Telegram can be
+    // re-walked — that is what the 4h36m recapture did, and why a gap there costs
+    // an afternoon. Signal keeps no server-side history: `signal-cli` hands over
+    // one envelope on the live socket and nothing ever restates it.
+    //
+    // ⚠ **`JsonDataMessage` AT 0.14.5 HAS 23 FIELDS AND THIS ARCHIVE READS FOUR.**
+    // Checked against the deployed tag on 2026-09-21, not master. Dropped so far:
+    // `expiresInSeconds`, `isExpirationUpdate`, `viewOnce`, everything in `quote`
+    // except its id, `mentions`, `previews`, `textStyles`, `sticker.packId` and
+    // `.stickerId`, `payment`, `contacts`, the three poll kinds, `storyContext`,
+    // `pinMessage`, `unpinMessage`, `adminDelete` — plus the envelope's own
+    // `serverReceivedTimestamp` and `serverDeliveredTimestamp`.
+    //
+    // ⚠ **SO THE FIX IS NOT FIFTEEN COLUMNS, IT IS KEEPING THE FRAME.** Columns
+    // can be added whenever there is a reason and BACKFILLED from here, because
+    // the bytes will still be on disk; a field not captured today cannot be
+    // recovered by any amount of later work. This inverts which half is urgent.
+    // It also costs nothing when signal-cli grows a field: the frame carries it
+    // whether or not this code has heard of it.
+    //
+    // ⚠ **KEYED BY CONTENT HASH, because a frame has no id of its own.** An
+    // envelope is (timestamp, source) and a receipt or a sync can repeat both;
+    // signal-cli also re-delivers on reconnect, which happens on every deploy.
+    // The digest makes replay free and makes it impossible to store the same
+    // frame twice while still storing two genuinely different frames that share
+    // a timestamp.
+    r"CREATE TABLE IF NOT EXISTS signal_frames (
+        id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        digest BINARY(32) NOT NULL,
+        envelope_ts BIGINT NULL,
+        source_uuid VARCHAR(64) NULL,
+        frame JSON NOT NULL,
+        received_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE KEY uniq_signal_frame (digest),
+        INDEX idx_signal_frame_ts (envelope_ts),
+        INDEX idx_signal_frame_source (source_uuid, envelope_ts)
+    ) DEFAULT CHARSET=utf8mb4",
 ];
 
 #[derive(Clone)]
@@ -1139,7 +1184,7 @@ impl Db {
     /// resolves it with Signal's own precedence, which in 0.14.5 is the system
     /// contact name and then the profile name, and from 0.14.7 the nickname above
     /// both. `profile_name` is written beside `display_name` only while the
-    /// viewer's deployed pod still reads that column; see the v40 migration.
+    /// viewer's deployed pod still reads that column; see the v41 migration.
     pub async fn upsert_contact(
         &self,
         uuid: &str,
@@ -1186,6 +1231,48 @@ impl Db {
             return Ok(());
         }
         self.record_contact_name(uuid, name).await
+    }
+
+    /// Keep the frame exactly as it arrived, before anything has read it.
+    ///
+    /// ⚠ **THIS RUNS BEFORE PARSING AND ITS FAILURE MUST NOT BE FATAL** — see the
+    /// caller. A frame this archive cannot store is still a frame it can act on,
+    /// and losing the row is better than losing the message.
+    ///
+    /// ⚠ **`INSERT IGNORE` ON THE DIGEST, because replay is routine.** signal-cli
+    /// re-delivers on reconnect, and this archive reconnects on every deploy. The
+    /// hash is over the frame's own bytes, so a re-delivery is recognised and two
+    /// genuinely different frames sharing a timestamp both survive.
+    ///
+    /// Returns whether the frame was new, which is the only way to tell a first
+    /// sighting from a replay — `rows_affected` on an IGNOREd duplicate is 0.
+    pub async fn record_signal_frame(&self, frame: &serde_json::Value) -> Result<bool> {
+        use sha2::{Digest, Sha256};
+        // Serialised once, and the SAME bytes are both hashed and stored — hashing
+        // a re-serialisation would let a formatting difference read as a new frame.
+        let bytes = serde_json::to_vec(frame)?;
+        let digest = Sha256::digest(&bytes);
+        let env = frame
+            .get("envelope")
+            .or_else(|| frame.get("params").and_then(|p| p.get("envelope")));
+        let envelope_ts = env
+            .and_then(|e| e.get("timestamp"))
+            .and_then(|t| t.as_i64());
+        let source_uuid = env
+            .and_then(|e| e.get("sourceUuid"))
+            .and_then(|s| s.as_str());
+        let n = sqlx::query(
+            "INSERT IGNORE INTO signal_frames (digest, envelope_ts, source_uuid, frame)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(&digest[..])
+        .bind(envelope_ts)
+        .bind(source_uuid)
+        .bind(&bytes)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(n > 0)
     }
 
     /// Close whatever they were called before, and open the name they wear now.

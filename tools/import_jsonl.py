@@ -150,7 +150,7 @@ def main():
             return
         # ⚠ `display_name` is the column the archive reads; `profile_name` is its
         # old name, still written while the viewer's deployed pod expects it (see
-        # the v40 migration). A historical import deliberately does NOT open a
+        # the v41 migration). A historical import deliberately does NOT open a
         # `contact_names` chapter: it carries no date for when the name began, and
         # inventing "now" for a 2021 export would put today's timestamp on a name
         # somebody wore five years ago.

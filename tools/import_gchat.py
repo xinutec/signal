@@ -64,7 +64,15 @@ DDL = [
         mime       VARCHAR(128) NULL,
         width      INT NULL,
         height     INT NULL,
-        uuid       VARCHAR(64) NULL,
+        -- ⚠ **NOT A UUID, AND 64 WAS TOO NARROW.** Google Chat synthesises this
+        -- id and it can be FILENAME-DERIVED: one attachment in the archive
+        -- carries 138 characters of Windows path ending in `.pdf972130`. At
+        -- VARCHAR(64) it was silently truncated on insert — the importer's
+        -- session had no strict mode, so no error — and the row could then no
+        -- longer be found by its own id. Worse, `UNIQUE (message_id, uuid)`
+        -- means two long ids on one message would collide at 64 characters and
+        -- the second INSERT would be dropped rather than refused.
+        uuid       VARCHAR(255) NULL,
         token      TEXT NULL,
         hash1      VARCHAR(128) NULL,
         hash2      VARCHAR(128) NULL,
@@ -211,9 +219,15 @@ def main():
                 # photo on the wrong message.
                 held = stored.get(f"{gid}\t{msg_id}\t{a.get('uuid')}")
                 if held:
+                    # ⚠ **`<=>`, NOT `=`.** 58 of this archive's 326 attachments
+                    # have NO uuid, and `uuid = NULL` is never true — so a plain
+                    # `=` silently updated nothing for every one of them and the
+                    # pictures stayed unreachable while the import reported
+                    # success. `<=>` is the NULL-safe comparison and matches the
+                    # row the manifest is talking about.
                     cur.execute(
                         "UPDATE gchat_attachments SET stored_path=%s "
-                        "WHERE message_id=%s AND uuid=%s",
+                        "WHERE message_id=%s AND uuid <=> %s",
                         (held["file"], message_id, a.get("uuid")))
 
             for r in m.get("reactions") or []:

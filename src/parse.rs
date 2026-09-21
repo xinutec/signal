@@ -279,13 +279,32 @@ fn payload_action(msg: &Value, sender: &str, ts: i64, is_outgoing: bool, dm_peer
 
     let body = match msg.get("message").and_then(Value::as_str) {
         Some(t) => Some(t.to_string()),
+        // ⚠ **THIS READ `sticker.emoji`, WHICH SIGNAL-CLI HAS NEVER SENT.**
+        // `JsonSticker` is `(String packId, int stickerId)` — checked against the
+        // deployed tag, v0.14.5 — so the lookup always missed, `unwrap_or("")`
+        // turned the miss into a blank, and every sticker in the archive reads
+        // `[sticker]` with a space where the picture should be identified. Three
+        // rows, and nothing in the pipeline could have said so: a field that does
+        // not exist and a field that is empty are the same `None` here.
+        //
+        // The two fields that DO identify it are what Signal uses itself: a pack
+        // and an index within it. They are recorded rather than resolved — naming
+        // the sticker needs the pack manifest, which is a separate fetch, and the
+        // ids keep that possible instead of leaving the body to stand for it.
         None if msg.get("sticker").is_some() => {
-            let emoji = msg
-                .get("sticker")
-                .and_then(|s| s.get("emoji"))
+            let sticker = msg.get("sticker");
+            let pack = sticker
+                .and_then(|s| s.get("packId"))
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            Some(format!("[sticker {emoji}]"))
+            let id = sticker
+                .and_then(|s| s.get("stickerId"))
+                .and_then(Value::as_i64);
+            Some(match (pack, id) {
+                ("", None) => "[sticker]".to_string(),
+                (p, Some(i)) => format!("[sticker {p}#{i}]"),
+                (p, None) => format!("[sticker {p}]"),
+            })
         }
         None => None,
     };

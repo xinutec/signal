@@ -150,6 +150,23 @@ async fn run_ws(ws_url: &str, ctx: &Ctx) -> Result<()> {
 
 /// Execute the parsed action for one frame against the DB.
 async fn dispatch(ctx: &Ctx, frame: &Value) -> Result<()> {
+    // ⚠ **THE FRAME IS KEPT BEFORE IT IS UNDERSTOOD.** Signal says everything
+    // exactly once — there is no server-side history to re-walk, unlike Telegram
+    // — so a field this archive has no column for is lost the moment the socket
+    // moves on. `JsonDataMessage` carries 23 at 0.14.5 and `parse_frame` reads
+    // four. Storing the bytes first means the other nineteen can be given columns
+    // whenever there is a reason, and BACKFILLED, rather than being gone.
+    //
+    // ⚠ **ITS FAILURE IS LOGGED, NOT PROPAGATED.** A frame we cannot file is still
+    // a frame we can act on, and the message matters more than the copy of it.
+    // Returning the error here would drop a message because its archive copy
+    // failed, which inverts the point.
+    match ctx.db.record_signal_frame(frame).await {
+        Ok(true) => tracing::debug!("frame kept"),
+        Ok(false) => {}
+        Err(e) => tracing::error!("could not keep the raw frame: {e:#}"),
+    }
+
     let parsed = parse_frame(frame);
 
     if let Some(c) = &parsed.contact {

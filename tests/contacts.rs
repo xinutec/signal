@@ -21,6 +21,7 @@
 //! Skips when `SIGNAL_TEST_DATABASE_URL` is unset, and refuses to skip in CI.
 
 use signal_archiver::db::Db;
+use sqlx::AssertSqlSafe;
 use sqlx::Row as _;
 use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
 
@@ -205,4 +206,139 @@ async fn the_old_column_moves_with_the_new_one() {
             .unwrap();
     assert_eq!(both.0.as_deref(), Some("Tania Boiko"));
     assert_eq!(both.1.as_deref(), Some("Tania Boiko"));
+}
+
+// ---- the frame itself -------------------------------------------------------
+
+/// ⚠ **SIGNAL SAYS EVERYTHING EXACTLY ONCE.** There is no server-side history to
+/// re-walk — Telegram has one, which is why a gap there costs an afternoon and a
+/// gap here costs the message. `JsonDataMessage` carries 23 fields at the
+/// deployed 0.14.5 and `parse_frame` reads four, so keeping the bytes is what
+/// makes the other nineteen recoverable at all: a column can be added and
+/// backfilled later, a field never captured cannot.
+#[tokio::test]
+async fn the_frame_is_kept_whole_and_a_replay_is_free() {
+    let Some((db, pool)) = connect().await else {
+        return;
+    };
+    // A ts nothing else uses, and a field this archive has NO column for — which
+    // is the whole point: it has to survive anyway.
+    let ts = 1_600_000_000_000i64 + std::process::id() as i64;
+    let frame = serde_json::json!({"envelope": {
+        "sourceUuid": "frame-test", "timestamp": ts,
+        "serverReceivedTimestamp": ts + 1,
+        "dataMessage": {
+            "message": "hello",
+            "expiresInSeconds": 604800,
+            "viewOnce": true,
+            "mentions": [{"uuid": "someone", "start": 0, "length": 5}],
+            "textStyles": [{"style": "BOLD", "start": 0, "length": 5}]
+        }
+    }});
+
+    assert!(
+        db.record_signal_frame(&frame).await.unwrap(),
+        "first sighting"
+    );
+    // ⚠ signal-cli re-delivers on reconnect, and this archive reconnects on every
+    // deploy. A replay must cost nothing and must not double the row.
+    assert!(
+        !db.record_signal_frame(&frame).await.unwrap(),
+        "a replayed frame is recognised, not stored twice"
+    );
+
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM signal_frames WHERE envelope_ts = ?")
+        .bind(ts)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 1);
+
+    // ⚠ The assertion that matters: a field with no column survives, and is
+    // QUERYABLE. If this ever fails, the table has become a write-only hole and
+    // the backfill it exists to enable is not possible.
+    // ⚠ **`JSON_VALUE`, NOT `->>`.** The `->>` operator is MySQL's; MariaDB
+    // rejects it outright (error 1064). Pinned here rather than discovered
+    // halfway through a backfill over the whole table.
+    let at = |path: &'static str| {
+        let pool = pool.clone();
+        async move {
+            // `path` is a `&'static str` written at each call site below; nothing
+            // from the database or the frame reaches this string. Safe to assert.
+            sqlx::query_scalar::<_, Option<String>>(AssertSqlSafe(format!(
+                "SELECT JSON_VALUE(frame, '{path}') FROM signal_frames WHERE envelope_ts = ?"
+            )))
+            .bind(ts)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+
+    // Every one of these is a field the archive has no column for, read back out
+    // of the frame. This is the backfill this table exists to make possible.
+    //
+    // ⚠ **`1`, NOT `"true"`.** MariaDB's JSON_VALUE renders a JSON boolean as
+    // 1/0. Pinned because a backfill comparing against 'true' would silently
+    // classify every view-once message as ordinary — a wrong answer, not an error.
+    assert_eq!(
+        at("$.envelope.dataMessage.viewOnce").await.as_deref(),
+        Some("1"),
+        "viewOnce survives"
+    );
+    assert_eq!(
+        at("$.envelope.dataMessage.textStyles[0].style")
+            .await
+            .as_deref(),
+        Some("BOLD"),
+        "and a text style"
+    );
+    assert_eq!(
+        at("$.envelope.dataMessage.mentions[0].uuid")
+            .await
+            .as_deref(),
+        Some("someone"),
+        "and who was mentioned"
+    );
+    assert_eq!(
+        at("$.envelope.dataMessage.expiresInSeconds")
+            .await
+            .as_deref(),
+        Some("604800"),
+        "and the disappearing timer"
+    );
+    assert_eq!(
+        at("$.envelope.serverReceivedTimestamp").await.as_deref(),
+        Some((ts + 1).to_string().as_str()),
+        "and the envelope's own server timestamp"
+    );
+}
+
+/// ⚠ **TWO FRAMES CAN SHARE A TIMESTAMP AND BE DIFFERENT THINGS** — a message and
+/// the receipt that acknowledges it, a sync and the original. The key is the
+/// frame's own bytes for that reason: keying on (timestamp, source) would file
+/// the second as a replay of the first and lose it.
+#[tokio::test]
+async fn two_frames_sharing_a_timestamp_both_survive() {
+    let Some((db, pool)) = connect().await else {
+        return;
+    };
+    let ts = 1_610_000_000_000i64 + std::process::id() as i64;
+    let msg = serde_json::json!({"envelope": {
+        "sourceUuid": "frame-test-2", "timestamp": ts, "dataMessage": {"message": "hi"}
+    }});
+    let receipt = serde_json::json!({"envelope": {
+        "sourceUuid": "frame-test-2", "timestamp": ts,
+        "receiptMessage": {"when": ts, "isDelivery": true, "timestamps": [ts]}
+    }});
+
+    assert!(db.record_signal_frame(&msg).await.unwrap());
+    assert!(db.record_signal_frame(&receipt).await.unwrap());
+
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM signal_frames WHERE envelope_ts = ?")
+        .bind(ts)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 2, "same timestamp, different frames, both kept");
 }

@@ -144,13 +144,41 @@ fn outgoing_remote_delete_marks_self_sender() {
     );
 }
 
+/// ⚠ **THIS TEST INVENTED THE FIELD IT WAS TESTING, AND SO PASSED FOR THREE
+/// MONTHS WHILE THE ARCHIVE LOST EVERY STICKER'S IDENTITY.** The fixture said
+/// `{"emoji": "🎉"}`; signal-cli's `JsonSticker` is `(String packId, int
+/// stickerId)` and has never carried an emoji. A mock cannot contradict the thing
+/// it stands for — so the only check on the shape was this file agreeing with
+/// itself, and the live rows read `[sticker]` with a blank where the emoji went.
+///
+/// The fixture is now the record signal-cli actually sends, copied from the
+/// deployed tag (v0.14.5) rather than from memory.
 #[test]
-fn sticker_only_message_gets_marker_body() {
+fn sticker_only_message_names_the_pack_and_the_index() {
     let f = json!({"envelope": {
-        "sourceUuid": "u1", "timestamp": 7, "dataMessage": {"sticker": {"emoji": "🎉"}}
+        "sourceUuid": "u1", "timestamp": 7,
+        "dataMessage": {"sticker": {"packId": "9acc9e8aba563d26a4994e69263e3b25", "stickerId": 4}}
     }});
     match parse_frame(&f).action {
-        Action::Message(m) => assert_eq!(m.body, Some("[sticker 🎉]".into())),
+        Action::Message(m) => assert_eq!(
+            m.body,
+            Some("[sticker 9acc9e8aba563d26a4994e69263e3b25#4]".into())
+        ),
+        other => panic!("expected Message, got {other:?}"),
+    }
+}
+
+/// ⚠ **AND A STICKER WITH NEITHER FIELD STILL HAS TO SAY A STICKER WAS SENT.**
+/// The old code reached that wording by accident, through a missing field and an
+/// `unwrap_or("")`; it is a deliberate branch now, so the marker cannot quietly
+/// become the thing it means for an unrecognised shape.
+#[test]
+fn a_sticker_with_no_ids_is_still_marked() {
+    let f = json!({"envelope": {
+        "sourceUuid": "u1", "timestamp": 8, "dataMessage": {"sticker": {}}
+    }});
+    match parse_frame(&f).action {
+        Action::Message(m) => assert_eq!(m.body, Some("[sticker]".into())),
         other => panic!("expected Message, got {other:?}"),
     }
 }
