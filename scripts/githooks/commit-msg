@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Personal data in a commit MESSAGE — the half of the leak surface no scan of
+# the tree can see. git runs `pre-commit` first, so a failure here has already
+# cost a full gate; that is why the rule behind it has no false positives.
+set -euo pipefail
+exec nix run "git+file:../dev-lint?ref=HEAD#dev-lint" -- --commit-msg "$1"
