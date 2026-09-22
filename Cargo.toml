@@ -65,3 +65,13 @@ grammers-mtsender = "0.10.0"
 # no network and no login, exactly as `parse.rs` is for Signal.
 grammers-tl-types = "0.10.0"
 sha2 = "0.10"
+
+# The fleet's `[lints]` baseline (dev-lint docs/standards.md §7), so clippy is
+# no weaker here than anywhere else. Extensions are argued here, per crate.
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
