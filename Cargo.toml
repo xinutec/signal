@@ -32,6 +32,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # other side bumps a layer, and the part whose bugs are unobservable from here.
 # What is OURS is the binary that turns its types into archive rows.
 grammers-client = "0.10.0"
+# Held, not used directly: grammers-crypto 0.10 asks for `^2.0.0-rc0`, which
+# admits rc1, and rc1 moved to num-bigint 0.5 and made `safe_prime::check`
+# return a Result — grammers-crypto 0.10.0 does not compile against it. A
+# direct `=` pin is the one thing cargo unifies a transitive range with, so
+# `cargo update` stays on rc0 until grammers releases against rc1.
+glass_pumpkin = "=2.0.0-rc0"
 # ⚠ `default-features = false` is load-bearing, and the default is what this
 # repository is built to avoid. `grammers-session`'s default feature is
 # `sqlite-storage`, which is `libsql` → `libsql-ffi` → `bindgen` → `clang-sys`:
@@ -64,7 +70,7 @@ grammers-mtsender = "0.10.0"
 # no client attached — which is what lets the whole mapping be unit-tested with
 # no network and no login, exactly as `parse.rs` is for Signal.
 grammers-tl-types = "0.10.0"
-sha2 = "0.10"
+sha2 = "0.11"
 
 # The fleet's `[lints]` baseline (dev-lint docs/standards.md §7), so clippy is
 # no weaker here than anywhere else. Extensions are argued here, per crate.
