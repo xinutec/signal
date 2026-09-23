@@ -2,10 +2,9 @@
 //! receive websocket into MariaDB, with enrichment (contact/group names,
 //! stickers, attachment bytes) and delete-tracking.
 //!
-//! Frame PARSING lives in the `parse` module (pure, unit-tested); this binary
-//! connects to the per-account receive websocket and EXECUTES the parsed
-//! actions against the DB. Linking + the Signal protocol are handled by
-//! signal-cli-rest-api (MODE=json-rpc).
+//! `parse` turns frames into actions; this binary holds the receive websocket
+//! and executes them. signal-cli-rest-api (MODE=json-rpc) handles linking and
+//! the Signal protocol.
 //!
 //! Config via env: DB_HOST, DB_PORT (3306), DB_NAME, DB_USER, DB_PASSWORD,
 //! SIGNAL_NUMBER (E.164), SIGNAL_API_WS (ws://signal-cli-rest-api:8080),
@@ -21,10 +20,8 @@ use tokio::time::timeout;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-/// If no frame at all (not even a server ping) arrives within this window, the
-/// connection is probably a silently-dead socket (NAT/idle drop with no close).
-/// We send a keepalive ping to probe; if `MAX_IDLE_PROBES` consecutive windows
-/// pass with no traffic, we give up and force a reconnect.
+/// A window with no frame at all sends a probe ping; `MAX_IDLE_PROBES` silent
+/// windows in a row mean a dead socket, and force a reconnect.
 const READ_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_IDLE_PROBES: u32 = 3;
 
@@ -90,8 +87,7 @@ async fn main() -> Result<()> {
 async fn run_ws(ws_url: &str, ctx: &Ctx) -> Result<()> {
     let (mut ws, _) = connect_async(ws_url).await.context("ws connect")?;
     tracing::info!("websocket connected");
-    // Count consecutive idle windows; any received frame (incl. pings/pongs)
-    // proves the link is alive and resets it.
+    // Any frame, pings and pongs included, resets the count.
     let mut idle_probes = 0u32;
     loop {
         let next = match timeout(READ_TIMEOUT, ws.next()).await {
@@ -108,8 +104,7 @@ async fn run_ws(ws_url: &str, ctx: &Ctx) -> Result<()> {
                     "no ws traffic for {}s; sending keepalive ping (probe {idle_probes}/{MAX_IDLE_PROBES})",
                     READ_TIMEOUT.as_secs()
                 );
-                // A broken pipe surfaces here on write even before a read would.
-                // tungstenite 0.29 payloads are `Bytes`; empty ping body.
+                // A broken pipe surfaces on write before a read would see it.
                 ws.send(WsMessage::Ping(Default::default()))
                     .await
                     .context("keepalive ping")?;
@@ -124,8 +119,7 @@ async fn run_ws(ws_url: &str, ctx: &Ctx) -> Result<()> {
             break;
         }
         if msg.is_ping() {
-            // A failed pong means the socket is gone; surface it so the caller
-            // reconnects instead of looping blind on a dead connection.
+            // A failed pong means the socket is gone; the caller reconnects.
             ws.send(WsMessage::Pong(msg.into_data()))
                 .await
                 .context("sending websocket pong")?;
@@ -151,17 +145,8 @@ async fn run_ws(ws_url: &str, ctx: &Ctx) -> Result<()> {
 
 /// Execute the parsed action for one frame against the DB.
 async fn dispatch(ctx: &Ctx, frame: &Value) -> Result<()> {
-    // ⚠ THE FRAME IS KEPT BEFORE IT IS UNDERSTOOD. Signal says everything
-    // exactly once — there is no server-side history to re-walk, unlike Telegram
-    // — so a field this archive has no column for is lost the moment the socket
-    // moves on. `JsonDataMessage` carries 23 at 0.14.5 and `parse_frame` reads
-    // four. Storing the bytes first means the other nineteen can be given columns
-    // whenever there is a reason, and BACKFILLED, rather than being gone.
-    //
-    // ⚠ ITS FAILURE IS LOGGED, NOT PROPAGATED. A frame we cannot file is still
-    // a frame we can act on, and the message matters more than the copy of it.
-    // Returning the error here would drop a message because its archive copy
-    // failed, which inverts the point.
+    // Keep the raw frame first (migration v45). A failure is logged, not
+    // propagated: the message matters more than its copy.
     match ctx.db.record_signal_frame(frame).await {
         Ok(true) => tracing::debug!("frame kept"),
         Ok(false) => {}
@@ -183,8 +168,7 @@ async fn dispatch(ctx: &Ctx, frame: &Value) -> Result<()> {
         Action::Skip => {}
         Action::Receipt(r) => {
             let n = ctx.db.record_signal_receipt(&r).await?;
-            // Quiet when it taught us nothing: receipts are re-delivered often
-            // and a line per replay would drown the log that matters.
+            // Receipts are re-delivered often; log only new ones.
             if n > 0 {
                 tracing::info!(
                     "{} {n} message(s) for {} at {}",
@@ -271,11 +255,7 @@ async fn dispatch(ctx: &Ctx, frame: &Value) -> Result<()> {
     Ok(())
 }
 
-/// Best-effort: fetch the attachment blob from the rest-api and store it.
-///
-/// ⚠ The body is STREAMED, not buffered — see `attach::write_stream` for why
-/// that is the difference between a memory limit that is a ceiling and one that
-/// is a bet on how big somebody else's video is.
+/// Best-effort: stream the attachment blob from the rest-api to disk.
 async fn download_attachment(ctx: &Ctx, id: &str) -> Option<String> {
     let url = format!("{}/v1/attachments/{}", ctx.http_base, id);
     let resp = ctx
@@ -303,19 +283,12 @@ async fn download_attachment(ctx: &Ctx, id: &str) -> Option<String> {
     }
 }
 
-/// Periodically pull group titles (the receive payload only carries the id).
-/// Keep contact names in step with what Signal shows.
-///
-/// ⚠ `envelope.sourceName` CANNOT DO THIS ON 0.14.5, which is the whole
-/// reason for a second source of the same fact — see `display_name_of`. A name
-/// that changes flows through `upsert_contact`, so the one it replaces is dated
-/// rather than overwritten.
+/// Keep contact names in step with what Signal shows, from `/v1/contacts`,
+/// which has the nickname `envelope.sourceName` lacks on 0.14.5.
 async fn refresh_contact_names(ctx: Ctx) {
     let url = format!("{}/v1/contacts/{}", ctx.http_base, ctx.number);
     loop {
-        // ⚠ Generous timeout on purpose: this endpoint resolves profiles and is
-        // measurably slower than /v1/groups, and a timeout here reads as "no
-        // contacts" — which would be a silent no-op rather than an error.
+        // This endpoint resolves profiles and is slow.
         if let Ok(resp) = ctx
             .http
             .get(&url)
@@ -336,10 +309,6 @@ async fn refresh_contact_names(ctx: Ctx) {
                     continue;
                 };
                 let Some(name) = display_name_of(c) else {
-                    // No name from any of the three sources. Deliberately NOT an
-                    // upsert with None: `upsert_contact` treats that as "learned
-                    // nothing", which is right, but counting it is how a silent
-                    // regression here becomes visible in the log.
                     skipped += 1;
                     continue;
                 };
@@ -355,12 +324,11 @@ async fn refresh_contact_names(ctx: Ctx) {
             }
             tracing::debug!("refreshed {named} contact name(s), {skipped} with no name to take");
         }
-        // Hourly. A rename is a rare, human-paced event and this endpoint is the
-        // expensive one; the live path still learns a name from every message.
         tokio::time::sleep(Duration::from_secs(3600)).await;
     }
 }
 
+/// Periodically pull group titles; the receive payload carries only the id.
 async fn refresh_group_names(ctx: Ctx) {
     let url = format!("{}/v1/groups/{}", ctx.http_base, ctx.number);
     loop {

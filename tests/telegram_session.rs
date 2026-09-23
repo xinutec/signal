@@ -1,9 +1,7 @@
 //! Unit tests for the session store's bookkeeping.
 //!
-//! What is here needs no database: the dirty flag, and the two questions a
-//! restart asks before it dials Telegram. The load/flush round trip through
-//! MariaDB is `tests/telegram_session.rs`, because a store that serialises
-//! correctly into nothing is not a store.
+//! No database: the dirty flag and the login checks. The MariaDB round trip is
+//! in `tests/telegram_store.rs`.
 
 use grammers_session::Session;
 use grammers_session::types::{PeerId, PeerInfo, UpdateState};
@@ -22,19 +20,13 @@ fn a_user(id: i64, is_self: bool) -> PeerInfo {
     }
 }
 
-/// A session nobody has touched has nothing to write. Pinned because the flush is
-/// on a timer: a session that reports itself dirty from birth writes a row every
-/// interval forever, for the lifetime of the pod.
+/// The flush runs on a timer, so an untouched session must not be dirty.
 #[test]
 fn a_fresh_session_is_not_dirty() {
     assert!(!fresh().is_dirty());
 }
 
-/// ⚠ The short-circuit that keeps the flush honest. `auto_cache_peers` hands
-/// over every peer in every response, so during a backfill the SAME peers arrive
-/// thousands of times. Marking the session dirty for a peer already known in full
-/// would mean the flag is always set and "flush when something changed" quietly
-/// becomes "flush on every tick".
+/// `auto_cache_peers` restates known peers constantly; that is not a change.
 #[tokio::test]
 async fn recaching_a_known_peer_changes_nothing() {
     let session = fresh();
@@ -46,9 +38,7 @@ async fn recaching_a_known_peer_changes_nothing() {
     );
 }
 
-/// A peer that arrives knowing MORE than the cached copy is a change, even though
-/// its id is already there. The pair with the test above is the point: the
-/// question is whether anything was learned, not whether the id is new.
+/// A peer that adds to the cached copy is a change.
 #[tokio::test]
 async fn a_peer_that_learns_something_is_a_change() {
     let session = fresh();
@@ -67,17 +57,14 @@ async fn a_peer_that_learns_something_is_a_change() {
     assert!(session.is_dirty());
 }
 
-/// The two questions a restart asks before it touches the network: am I logged
-/// in, and who am I. Answering them from the stored session is what lets a pod
-/// tell "never logged in" from "logged in, Telegram unreachable" — and `self_id`
-/// is what `map::map_message` needs to attribute a DM at all.
+/// Login state and self id come from the stored session, without the network.
 #[tokio::test]
 async fn a_session_knows_whether_and_who_it_is_logged_in_as() {
     let session = fresh();
     assert!(!session.is_authorized().unwrap());
     assert_eq!(session.self_id().unwrap(), None);
 
-    // A peer that is not us proves nothing about being logged in.
+    // A peer that is not us proves nothing.
     session.cache_peer(&a_user(4242, false)).await.unwrap();
     assert!(!session.is_authorized().unwrap());
     assert_eq!(session.self_id().unwrap(), None);
@@ -87,8 +74,7 @@ async fn a_session_knows_whether_and_who_it_is_logged_in_as() {
     assert_eq!(session.self_id().unwrap(), Some(777));
 }
 
-/// Channel update state is MERGED per channel rather than appended, or the list
-/// grows without bound and the reader of it takes whichever copy it finds first.
+/// Channel update state is merged per channel, not appended.
 #[tokio::test]
 async fn channel_state_is_updated_in_place() {
     let session = fresh();
@@ -111,11 +97,8 @@ async fn channel_state_is_updated_in_place() {
     assert_eq!(channels, vec![(5, 101), (6, 7)]);
 }
 
-/// ⚠ The divergence from `MemorySession`, tested through the trait method
-/// `grammers` actually calls. `Client::stream_updates` asks
-/// `peer(PeerId::self_user())` to decide whether it must fetch a pristine update
-/// state; a storage that answers `None` there makes a signed-in account start
-/// from scratch every time the stream opens, which is a gap nothing reports.
+/// `stream_updates` asks `peer(PeerId::self_user())` to decide whether the
+/// account is logged in.
 #[tokio::test]
 async fn the_self_user_sentinel_resolves_to_the_logged_in_account() {
     let session = fresh();

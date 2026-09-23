@@ -1,12 +1,7 @@
 //! Tests for the Telegram mapping — pure, so no database and no account.
 //!
-//! These fixtures cannot drift from Telegram's contract, which is why they
-//! are struct literals rather than captured JSON. `tl::types::Message` is
-//! generated from Telegram's own TL schema, so a field that changes name, type or
-//! optionality stops this file compiling — the opposite of a hand-written mock,
-//! which goes on describing a shape the real thing has left behind. Every one of
-//! the forty-nine fields has to be written down once, in [`dm`], and that is the
-//! whole cost.
+//! Fixtures are struct literals of the TL-generated types, so a schema change
+//! stops this file compiling rather than leaving a stale mock.
 
 use grammers_tl_types as tl;
 use signal_archiver::telegram::map::{
@@ -22,9 +17,7 @@ fn user(id: i64) -> tl::enums::Peer {
     tl::enums::Peer::User(tl::types::PeerUser { user_id: id })
 }
 
-/// An ordinary incoming text message in a one-to-one chat, with `from_id` absent
-/// — which is how Telegram actually sends a DM. Tests override what they are
-/// about and nothing else.
+/// An ordinary incoming DM, with `from_id` absent as Telegram sends it.
 fn dm() -> tl::types::Message {
     tl::types::Message {
         out: false,
@@ -83,14 +76,7 @@ fn mapped(m: tl::types::Message) -> Row {
     map_message(&tl::enums::Message::Message(m), SELF_ID).expect("a text message is storable")
 }
 
-/// The property the normalisation exists for: the three peer spaces become one
-/// space with no overlap.
-///
-/// Asserting the three formulas separately would only restate the code. What
-/// matters is that the SAME raw number in each space lands on three different
-/// conversations, and that each is still labelled with the space it came from —
-/// because an id that can mean two conversations is an archive that merges two
-/// people's messages.
+/// The same raw number in each space lands on three different conversations.
 #[test]
 fn one_raw_id_in_three_spaces_is_three_conversations() {
     let raw = 1234;
@@ -119,9 +105,7 @@ fn one_raw_id_in_three_spaces_is_three_conversations() {
     );
 }
 
-/// ⚠ The channel offset has to sit below every basic-group id, or a group and a
-/// channel collide. Checked against a group id far larger than any real one
-/// rather than against a plausible value, because "plausible" is what changes.
+/// The channel offset sits below every basic-group id, however large.
 #[test]
 fn no_channel_can_collide_with_a_basic_group() {
     let biggest_imaginable_group = 999_999_999_999;
@@ -137,10 +121,6 @@ fn no_channel_can_collide_with_a_basic_group() {
     );
 }
 
-/// ⚠ The rule from [`map_message`]'s warning, both ways round. A DM names no
-/// sender, so `out` is the only thing that says who spoke — and swapping the two
-/// arms is a mistake that reads correctly and files every message under the wrong
-/// person.
 #[test]
 fn a_dm_that_names_no_sender_is_attributed_by_direction() {
     let incoming = mapped(dm());
@@ -152,9 +132,7 @@ fn a_dm_that_names_no_sender_is_attributed_by_direction() {
     assert!(outgoing.is_outgoing);
 }
 
-/// ⚠ And the inference must not leak out of DMs. A group message with no author
-/// genuinely has none — an anonymous admin post — so guessing would invent a
-/// speaker rather than admit to not knowing one.
+/// A group message with no author (an anonymous admin post) has no sender.
 #[test]
 fn a_group_message_with_no_author_keeps_none() {
     let anonymous = tl::types::Message {
@@ -165,8 +143,6 @@ fn a_group_message_with_no_author_keeps_none() {
     assert_eq!(mapped(anonymous).sender_id, None);
 }
 
-/// An explicit sender always wins, in either kind of conversation. The inference
-/// is a fallback, and a fallback that overrides what it was told is not one.
 #[test]
 fn a_named_sender_beats_the_inference() {
     let in_a_dm = tl::types::Message {
@@ -189,9 +165,6 @@ fn a_named_sender_beats_the_inference() {
     assert_eq!(mapped(in_a_group).sender_id, Some(THEM));
 }
 
-/// A message whose content is a photo said nothing, and the archive has to be
-/// able to tell that from a message whose text is the empty string. The viewer
-/// leans on it: an empty body produces no line in a copied log.
 #[test]
 fn a_message_with_only_media_has_no_text() {
     let photo = tl::types::Message {
@@ -212,14 +185,8 @@ fn a_message_with_only_media_has_no_text() {
     assert_eq!(row.media_kind, Some(MediaKind::Photo));
 }
 
-/// ⚠ A sticker, a video and a PDF are all `messageMediaDocument` on the wire,
-/// and this test used to pin the coarse answer `document` — "a finer label this
-/// build does not earn" — with a note that a later pass reading the document's
-/// attributes would have a test to change deliberately. This is that change.
-///
-/// The finer label now comes from `Media::from_raw`, which reads the attributes and
-/// needs no client. A document with NO mime is still `document`: the taxonomy is
-/// the mime type's, not ours, so an absent mime leaves nothing to be finer about.
+/// The finer label comes from the document's mime. Without a mime it stays
+/// `document`.
 #[test]
 fn a_document_with_no_mime_type_is_still_just_a_document() {
     let doc = tl::types::Message {
@@ -242,9 +209,6 @@ fn a_document_with_no_mime_type_is_still_just_a_document() {
     assert_eq!(mapped(doc).media_kind, Some(MediaKind::Document));
 }
 
-/// A hole in the id sequence is not a message. Telegram answers a fetch of a
-/// deleted id with `messageEmpty`, and storing that would put an empty bubble in
-/// the conversation where something used to be.
 #[test]
 fn an_empty_message_is_not_a_row() {
     let hole = tl::enums::Message::Empty(tl::types::MessageEmpty {
@@ -254,9 +218,6 @@ fn an_empty_message_is_not_a_row() {
     assert!(map_message(&hole, SELF_ID).is_none());
 }
 
-/// A service message is recorded as an event, with a label that is ours. Both
-/// halves matter: the `kind` is what lets a reader ask for what was SAID, and the
-/// text being present is what stops the conversation having a silent hole.
 #[test]
 fn a_service_message_is_an_event_with_a_label() {
     let joined = tl::enums::Message::Service(tl::types::MessageService {
@@ -284,9 +245,6 @@ fn a_service_message_is_an_event_with_a_label() {
     assert_eq!(row.text.as_deref(), Some("added a member"));
 }
 
-/// An action this build has never heard of is still an event. A new Telegram
-/// feature must not make messages vanish from the archive, so the fallback is
-/// asserted rather than left to be discovered.
 #[test]
 fn an_unknown_action_is_still_recorded() {
     let odd = tl::enums::Message::Service(tl::types::MessageService {
@@ -312,9 +270,7 @@ fn an_unknown_action_is_still_recorded() {
     assert_eq!(row.text.as_deref(), Some("an event"));
 }
 
-/// Reactions: a unicode emoticon and a custom emoji are stored in DIFFERENT
-/// columns and never both, because a reader that draws `emoji` would otherwise
-/// draw a blank for a custom one and silently count it as nothing.
+/// A unicode emoticon and a custom emoji use different columns, never both.
 #[test]
 fn a_custom_reaction_keeps_its_id_instead_of_an_emoji() {
     let reacted = tl::types::Message {
@@ -363,16 +319,12 @@ fn a_custom_reaction_keeps_its_id_instead_of_an_emoji() {
             },
         ]
     );
-    // ⚠ `recent_reactions: None` — Telegram named nobody, so the archive knows
-    // nobody, and four counted reactions with zero names is the clearest possible
-    // case of a list that must not retract anyone.
+    // Telegram named nobody, so the list cannot be complete.
     assert_eq!(got.authors, vec![]);
     assert!(!got.complete);
 }
 
-/// `edit_date` is the only ordering an edit chain has, so it has to reach the row
-/// — `telegram_message_edits` keys on it. A message never edited must report
-/// `None` rather than its send time, or every message looks edited.
+/// A message never edited reports `None`, not its send time.
 #[test]
 fn an_edit_date_reaches_the_row_and_an_unedited_message_has_none() {
     assert_eq!(mapped(dm()).edited_at, None);
@@ -383,17 +335,13 @@ fn an_edit_date_reaches_the_row_and_an_unedited_message_has_none() {
     assert_eq!(mapped(edited).edited_at, Some(1_700_000_500));
 }
 
-/// Timestamps are carried through in Telegram's own unit, unconverted. Pinned
-/// because the temptation to "helpfully" turn seconds into the milliseconds the
-/// viewer shows is exactly how a unit gets applied twice.
+/// Timestamps stay in Telegram's seconds; the viewer converts.
 #[test]
 fn the_timestamp_stays_in_seconds() {
     assert_eq!(mapped(dm()).sent_at, 1_700_000_000);
 }
 
-/// A reply to a story points at nothing this archive holds, so it must not be
-/// filed as a reply to a message id — least of all to a DIFFERENT message that
-/// happens to have that id.
+/// A reply to a story is not filed as a reply to a message id.
 #[test]
 fn a_story_reply_is_not_a_message_reply() {
     let to_a_message = tl::types::Message {
@@ -431,12 +379,8 @@ fn a_story_reply_is_not_a_message_reply() {
     assert_eq!(mapped(to_a_story).reply_to_msg_id, None);
 }
 
-/// The size and the mime come out of the MESSAGE, with no request — which is the
-/// whole reason the archive can say what a download would cost before deciding to
-/// make one.
-///
-/// ⚠ A poll has no size and that is not a failure: `None` means "not a file",
-/// where 0 would mean "an empty file". The column is NULLable for that reason.
+/// Size and mime come from the message itself. A poll's size is `None`: not a
+/// file, as opposed to an empty one.
 #[test]
 fn media_reports_its_size_without_a_download() {
     let doc = tl::types::Document {
@@ -471,21 +415,10 @@ fn media_reports_its_size_without_a_download() {
     let row = mapped(with_video);
     assert_eq!(row.media_size, Some(3_145_728));
     assert_eq!(row.media_mime.as_deref(), Some("video/mp4"));
-    // ⚠ And the mime is what makes it a VIDEO rather than a document — the finer
-    // label is the mime's judgement, not a second taxonomy of ours that could
-    // disagree with it.
     assert_eq!(row.media_kind, Some(MediaKind::Video));
 }
 
-/// ⚠ AN `edit_date` IS NOT "SOMEBODY EDITED THIS". Telegram carries `edit_hide`
-/// beside it — "whether the message should be shown as not modified to the user,
-/// even if an edit date is present" — and sets an edit date for its own reasons.
-/// Reading the date without the flag is reading half the contract, and the visible
-/// consequence was this archive printing "Edited" on a message Telegram itself
-/// shows as untouched.
-///
-/// Both halves are asserted: the date is still RECORDED (an archive keeps what it
-/// saw), and the flag travels with it so the reader can honour it.
+/// `edit_hide` travels with the recorded `edit_date`, so the reader can honour it.
 #[test]
 fn an_edit_telegram_asks_us_to_hide_is_recorded_but_marked_hidden() {
     let ordinary = tl::types::Message {
@@ -513,13 +446,10 @@ fn an_edit_telegram_asks_us_to_hide_is_recorded_but_marked_hidden() {
     );
 }
 
-/// A forward header, with only the fields any one case needs set.
-/// The date every [`fwd`] header carries, named so a test can say that the
-/// forward's clock and the forwarder's are different numbers.
+/// The date every [`fwd`] header carries, distinct from the forwarder's clock.
 const FWD_DATE: i64 = 1_699_000_000;
 
-/// A service message carrying one action, for the tests that are about the
-/// action rather than about the envelope.
+/// A service message carrying one action.
 fn service(action: tl::enums::MessageAction) -> tl::enums::Message {
     tl::enums::Message::Service(tl::types::MessageService {
         out: false,
@@ -541,6 +471,7 @@ fn service(action: tl::enums::MessageAction) -> tl::enums::Message {
     })
 }
 
+/// A forward header, with only the fields a case needs set.
 fn fwd(
     from_id: Option<tl::enums::Peer>,
     from_name: Option<String>,
@@ -563,28 +494,18 @@ fn fwd(
     })
 }
 
-/// ⚠ A forward is recorded by PEER, which is the case that was being dropped.
-///
-/// The header carries `from_id` for an ordinary forward and falls back to
-/// `from_name` only when the original sender has forward-privacy on. Reading the
-/// name alone meant the archive recorded a forward exactly when its sender had
-/// asked not to be identified, and recorded nothing at all otherwise — so a
-/// forwarded message was indistinguishable from something the sender had
-/// written. Zero rows out of 159,946 when that was noticed, which is what a
-/// silently-never-true condition looks like from the outside.
+/// An ordinary forward names its sender by peer.
 #[test]
 fn an_ordinary_forward_is_recorded_by_its_peer() {
     let mut m = dm();
     m.fwd_from = Some(fwd(Some(user(555)), None, None));
     let row = mapped(m);
 
-    // Normalised like every other peer here, so a forwarder in a group and the
-    // DM with that same person are one id.
     assert_eq!(row.fwd_from_id, Some(normalise_peer(&user(555)).0));
     assert_eq!(row.fwd_from_name, None, "a peer is not a name");
 }
 
-/// The rarer half, which was the ONLY half being read.
+/// A sender with forward privacy on is named in words.
 #[test]
 fn a_forward_from_a_hidden_account_keeps_the_name_it_offered() {
     let mut m = dm();
@@ -595,10 +516,8 @@ fn a_forward_from_a_hidden_account_keeps_the_name_it_offered() {
     assert_eq!(row.fwd_from_id, None, "privacy on → there is no peer");
 }
 
-/// ⚠ A CHANNEL POST'S AUTHOR IS NOT ITS PEER. `from_id` for a forwarded channel
-/// post names the CHANNEL, so the person who signed it is only in `post_author`
-/// — and reading `from_id` alone would credit the channel for what a named human
-/// wrote. Both are kept, because they answer different questions.
+/// A forwarded channel post's `from_id` is the channel; the person who signed
+/// it is in `post_author`.
 #[test]
 fn a_forwarded_channel_post_keeps_the_channel_and_the_author() {
     let mut m = dm();
@@ -610,10 +529,7 @@ fn a_forwarded_channel_post_keeps_the_channel_and_the_author() {
     assert_eq!(row.fwd_from_name.as_deref(), Some("Ada"));
 }
 
-/// An empty string is not a name. Telegram sends `Some("")` rather than `None`
-/// in places, and storing that gives a row that claims to know who forwarded it
-/// and then shows nothing — the distinction the rest of this mapping keeps with
-/// `non_empty`.
+/// Telegram sends `Some("")` in places; that is not a name.
 #[test]
 fn an_empty_forward_name_is_no_name() {
     let mut m = dm();
@@ -621,7 +537,6 @@ fn an_empty_forward_name_is_no_name() {
     assert_eq!(mapped(m).fwd_from_name, None);
 }
 
-/// A message nobody forwarded says so in both fields, rather than in one.
 #[test]
 fn a_message_that_was_not_forwarded_carries_neither_half() {
     let row = mapped(dm());
@@ -667,16 +582,7 @@ fn reacted(counts: &[(&str, i32)], names: &[(i64, &str, i32)]) -> tl::enums::Mes
     })
 }
 
-/// ⚠ The one that decides whether anybody may be retracted.
-///
-/// Telegram samples `recent_reactions` when a message has many reactors. A list
-/// that names three of twenty is not a statement that seventeen people stopped
-/// reacting, and the archive may only date what a COMPLETE list omits.
-///
-/// Both directions are asserted, because only the pair pins the rule: a list
-/// that covers the tally is complete, and the same list against a larger tally
-/// is not. Asserting the complete case alone would pass just as well if
-/// `complete` were hardcoded `true`.
+/// Both directions, or a hardcoded `complete: true` would pass.
 #[test]
 fn a_truncated_list_of_reactors_is_not_a_complete_one() {
     let full = tl::types::Message {
@@ -687,8 +593,7 @@ fn a_truncated_list_of_reactors_is_not_a_complete_one() {
     assert_eq!(got.authors.len(), 2);
     assert!(got.complete, "two names for a tally of two names everybody");
 
-    // Same two names, but Telegram counted twenty. The eighteen it did not list
-    // are still there.
+    // The same two names against a tally of twenty.
     let sampled = tl::types::Message {
         reactions: Some(reacted(&[("👍", 20)], &[(1, "👍", 111), (2, "👍", 222)])),
         ..dm()
@@ -701,7 +606,6 @@ fn a_truncated_list_of_reactors_is_not_a_complete_one() {
     );
 }
 
-/// A reactor is a person and a moment, and the moment is Telegram's own.
 #[test]
 fn a_reaction_carries_who_and_when() {
     let m = tl::types::Message {
@@ -721,8 +625,7 @@ fn a_reaction_carries_who_and_when() {
     assert!(got.complete);
 }
 
-/// ⚠ The url a `textUrl` carries is NOT in the text, which is the whole reason
-/// entities are stored: dropping them loses where a link went.
+/// A `textUrl`'s url is not in the text.
 #[test]
 fn a_link_keeps_the_address_the_words_do_not_say() {
     let m = tl::types::Message {
@@ -753,9 +656,6 @@ fn a_link_keeps_the_address_the_words_do_not_say() {
     );
 }
 
-/// ⚠ A call that nobody answered has NO duration, and that absence is the record
-/// of it not being answered — storing a zero would claim a call of no length
-/// actually took place.
 #[test]
 fn an_unanswered_call_is_a_reason_without_a_duration() {
     let missed = service(tl::enums::MessageAction::PhoneCall(
@@ -790,8 +690,6 @@ fn an_unanswered_call_is_a_reason_without_a_duration() {
     assert!(call.video);
 }
 
-/// ⚠ `messageFwdHeader.date` is when the ORIGINAL was written. A forward kept
-/// with only `sent_at` says a thing was said today that was said years ago.
 #[test]
 fn a_forward_remembers_when_the_original_was_written() {
     let m = tl::types::Message {

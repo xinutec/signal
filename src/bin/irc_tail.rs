@@ -1,28 +1,14 @@
-//! The live tier: learn about an IRC line in under a second instead of waiting
-//! for the next import.
+//! The live tier: an IRC line in the archive within a second, rather than at
+//! the next import.
 //!
-//! ⚠ THIS IS NOT A SECOND IMPORTER, AND THE DISTINCTION IS THE DESIGN. It
-//! holds one long poll open to the irssi plugin, which answers with the lines
-//! irssi has just logged AND WHERE THEY ARE — the `(file_date, line_no)` that,
-//! with the conversation and the source tag, is the archive's dedupe key. Every
-//! row it writes is therefore the row `import_irclogs` would have written, on
-//! the same key, so the periodic import later finds it already present. The two
-//! tiers cannot disagree about a line's identity because they compute it the
-//! same way.
+//! A long poll to the irssi plugin returns each new line with its place in the
+//! log, `(file_date, line_no)`. Parsed with `irclog::parse_log`, every row is the
+//! one `import_irclogs` would write on the same dedupe key, so the import, which
+//! still runs, finds it present and fills anything this missed.
 //!
-//! It is also why the *line* is parsed rather than the plugin's convenience
-//! fields: `irclog::parse_log` is the one thing that decides what a logged line
-//! means — that `< nick>` carries a channel mode in a fixed column, that an
-//! action is not a message — and a second interpretation here would drift from
-//! the importer's within a week.
-//!
-//! What happens when this fails is the point. A missed line is not lost; it
-//! is late, because the reconciler is still running. That is what allows this
-//! tier to be the simple one. ⚠ The failure it must NOT have is the quiet kind:
-//! a wedged poll looks exactly like a quiet channel, so the plugin answers an
-//! empty list on its own deadline and every cycle touches `--heartbeat`, which
-//! the pod's liveness probe reads. Silence restarts the pod rather than passing
-//! for calm.
+//! A wedged poll must not pass for a quiet channel: the plugin answers an empty
+//! list on its own deadline, and every cycle touches `--heartbeat` for the
+//! liveness probe.
 //!
 //! ```text
 //! irc_tail --host 10.100.0.1 --port 2230 --key /ssh/id_ed25519 \
@@ -31,9 +17,8 @@
 //! ```
 //!
 //! Config via env, as the ingester: `DB_HOST`, `DB_PORT` (3306), `DB_NAME`,
-//! `DB_USER`, `DB_PASSWORD` — and `IRC_SELF_NICK` (+ `IRC_SELF_NICK_ALT`),
-//! which decide whose lines are Pippijn's own and are REQUIRED for the reason
-//! `parse_args` gives.
+//! `DB_USER`, `DB_PASSWORD`, and the required `IRC_SELF_NICK` (+
+//! `IRC_SELF_NICK_ALT`), which decide whose lines are Pippijn's own.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -47,19 +32,14 @@ use signal_archiver::irclog::{Date, parse_log};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-/// How long the plugin may hold a request before answering "nothing yet".
-///
-/// Bounded well under the forced command's own alarm so that the PLUGIN is what
-/// ends a quiet exchange. If ssh timed out first, a quiet channel and a wedged
-/// irssi would arrive here as the same event.
+/// How long the plugin may hold a request before answering "nothing yet". Under
+/// the forced command's alarm, so a quiet channel and a wedged irssi differ.
 const WAIT_MS: u64 = 120_000;
 
 /// Ceiling on one round trip, above `WAIT_MS` plus the ssh handshake.
 const ROUND_TRIP: Duration = Duration::from_secs(170);
 
-/// How long to wait before reconnecting after a failed cycle. Long enough not to
-/// hammer a restarting irssi, short enough that a blip costs one message's
-/// latency rather than a conversation's.
+/// How long to wait before reconnecting after a failed cycle.
 const RECONNECT: Duration = Duration::from_secs(5);
 
 struct Args {
@@ -91,8 +71,8 @@ struct Reply {
 struct Event {
     tag: String,
     target: String,
-    /// Whether the plugin found the line in irssi's log. False means the line
-    /// exists but its place is not yet known — the reconciler's job, not ours.
+    /// Whether the plugin found the line's place in irssi's log; if not, the
+    /// import places it.
     #[serde(default)]
     logged: bool,
     #[serde(default)]
@@ -136,22 +116,8 @@ fn parse_args() -> Result<Args> {
         bail!("--host is required");
     }
 
-    // ⚠ FROM THE ENVIRONMENT, AND REQUIRED, and both halves of that are
-    // corrections to how this shipped.
-    //
-    // From the environment because the alternative is a `/bin/sh -c` wrapper in
-    // the pod spec purely to expand a variable — the importer needs a shell
-    // anyway (rsync then import), this does not, and adding one to pass an
-    // argument is machinery for its own sake.
-    //
-    // REQUIRED because without it every line is attributed to somebody else,
-    // and that is what happened: the first message pushed after this went live
-    // was Pippijn's own and the app drew it as another person's, because the
-    // Deployment passed no nicks at all. The importer only PRINTS a warning in
-    // that case, which is defensible for a command somebody is watching and
-    // useless for a daemon nobody is. Refusing to start turns a silent
-    // mislabelling into a CrashLoopBackOff, which is the loudest thing a pod
-    // can do.
+    // Required: without it every line is filed as somebody else's, and a daemon's
+    // warning goes unread. From the environment, so the pod needs no shell.
     args.self_nicks = std::env::var("IRC_SELF_NICK")
         .ok()
         .into_iter()
@@ -169,10 +135,8 @@ fn parse_args() -> Result<Args> {
 
 /// One long poll: ask what has happened since `after`, and wait for the answer.
 ///
-/// ⚠ The key is copied to a writable path at startup rather than used in place:
-/// a Kubernetes secret volume is root-owned and mounted read-only, so `ssh`
-/// refuses its permissions — see the note in `messages`' `irc_send.rs`, which
-/// learned this the same way.
+/// The key is a copy made at startup: `ssh` refuses the permissions of a
+/// root-owned, read-only secret volume.
 async fn poll(args: &Args, key: &Path, after: u64) -> Result<Reply> {
     let request = serde_json::json!({ "after": after, "timeout_ms": WAIT_MS }).to_string();
 
@@ -186,9 +150,7 @@ async fn poll(args: &Args, key: &Path, after: u64) -> Result<Reply> {
         .arg("-o")
         .arg(format!("UserKnownHostsFile={}", args.known_hosts.display()))
         .args(["-o", "ConnectTimeout=10"])
-        // The plugin parks for two minutes, so the connection is idle for two
-        // minutes; without keepalives a NAT or a firewall in between is free to
-        // forget it and the poll hangs until the round-trip ceiling.
+        // The poll idles for minutes; keepalives stop a NAT forgetting it.
         .args(["-o", "ServerAliveInterval=30"])
         .args(["-o", "ServerAliveCountMax=3"])
         .arg("-i")
@@ -231,17 +193,15 @@ async fn poll(args: &Args, key: &Path, after: u64) -> Result<Reply> {
 
 /// Write one event as the row the importer would have written.
 ///
-/// Returns whether a row was actually inserted, which is usually false for a
-/// line the reconciler happened to reach first — the dedupe key doing its job,
-/// not an error.
+/// Returns whether a row was inserted; false when the import or the send echo
+/// got there first.
 async fn store(
     db: &Db,
     args: &Args,
     conversations: &mut BTreeMap<(String, String), u64>,
     ev: &Event,
 ) -> Result<bool> {
-    // Without a place in the log there is no dedupe key, and a row invented
-    // without one would be the duplicate this design exists to avoid.
+    // Without a place in the log there is no dedupe key.
     if !ev.logged {
         return Ok(false);
     }
@@ -252,10 +212,7 @@ async fn store(
     };
 
     let date = parse_file_date(file_date)?;
-    // ⚠ THE IMPORTER'S PARSER, on the importer's input. Everything about what a
-    // logged line means — the channel mode in `<@nick>`, an action against a
-    // message — is decided in one place, so this row and the one the next import
-    // would write are the same row.
+    // The importer's parser, so this row is the one the import would write.
     let parsed = parse_log(date, &format!("{line}\n"));
     let Some(entry) = parsed.entries.into_iter().next() else {
         return Ok(false);
@@ -286,9 +243,7 @@ async fn store(
     };
 
     let irc_line = IrcLine {
-        // ⚠ THE PLUGIN'S NUMBER, not the parser's. `parse_log` numbered this
-        // line 1 because it was handed one line; its real position in the file
-        // is what irssi's log says, and that is half the dedupe key.
+        // The plugin's line number; `parse_log` saw only this one line.
         line_no,
         sent_at: entry.at.to_string(),
         nick: entry.nick.clone(),
@@ -300,8 +255,7 @@ async fn store(
         text: entry.text.clone(),
     };
 
-    // The RAW tag, before `--map`: two connections to one network write the same
-    // path under different tags, and this is what keeps their lines apart.
+    // The raw tag, before `--map`, as in the dedupe key (migration v8).
     let written = db
         .insert_irc_lines(conversation_id, &ev.tag, file_date, &[irc_line])
         .await?;
@@ -325,9 +279,7 @@ fn parse_file_date(s: &str) -> Result<Date> {
 
 /// Touch the file the liveness probe reads.
 ///
-/// ⚠ Every cycle, including the ones that found nothing. A heartbeat that only
-/// beat when something happened would call a quiet evening a failure — and,
-/// worse, would let a poll that has stopped asking pass as quiet.
+/// Every successful cycle, including empty ones.
 fn beat(args: &Args) {
     let Some(path) = &args.heartbeat else { return };
     if let Some(dir) = path.parent() {
@@ -354,9 +306,8 @@ async fn main() -> Result<()> {
     std::fs::set_permissions(&key, perms)?;
 
     let mut conversations: BTreeMap<(String, String), u64> = BTreeMap::new();
-    // ⚠ Starts at 0, so the first poll is handed the plugin's whole ring. That is
-    // deliberate and safe: every one of those lines is written on the dedupe key,
-    // so a line the reconciler already has is refused rather than duplicated.
+    // From 0: the first poll replays the plugin's whole ring, which the dedupe
+    // key makes harmless.
     let mut after: u64 = 0;
 
     println!(
@@ -369,8 +320,6 @@ async fn main() -> Result<()> {
         match poll(&args, &key, after).await {
             Ok(reply) => {
                 if reply.gap {
-                    // Stated rather than inferred: the fast path is knowingly
-                    // incomplete here and the import is what will close it.
                     eprintln!(
                         "irc_tail: the plugin's ring overran our cursor — \
                          some lines will arrive with the next import, not here"
@@ -382,8 +331,7 @@ async fn main() -> Result<()> {
                     match store(&db, &args, &mut conversations, ev).await {
                         Ok(true) => wrote += 1,
                         Ok(false) => {}
-                        // One bad event must not end the loop: the reconciler
-                        // will place that line, and the next one may be fine.
+                        // The import will place it.
                         Err(e) => {
                             lost += 1;
                             eprintln!("irc_tail: could not store a line: {e:#}");
@@ -391,15 +339,12 @@ async fn main() -> Result<()> {
                     }
                 }
                 if !reply.events.is_empty() {
-                    // ⚠ Three outcomes, and only the third is a fault. Saying
-                    // just "N offered, W written" reports the healthy race as a
-                    // shortfall: sending from the app archives the echo first,
-                    // so the tail is SUPPOSED to lose and write nothing. An
-                    // alert that fires on correct behaviour is one you learn to
-                    // ignore, which is how the real case below gets missed.
+                    // "Already archived" is the normal outcome for a line sent
+                    // from the app, whose echo is written first; only "lost" is
+                    // a fault.
                     let held = reply.events.len() - wrote - lost;
                     let alarm = if lost > 0 {
-                        format!(", {lost} LOST to errors above")
+                        format!(", {lost} lost to errors above")
                     } else {
                         String::new()
                     };
@@ -414,9 +359,7 @@ async fn main() -> Result<()> {
                 beat(&args);
             }
             Err(e) => {
-                // ⚠ NOT a heartbeat. A poll that cannot reach irssi is exactly
-                // the state the liveness probe exists to notice; beating here
-                // would report health on the strength of having tried.
+                // No heartbeat: this is what the liveness probe is for.
                 eprintln!("irc_tail: poll failed, retrying in {RECONNECT:?}: {e:#}");
                 tokio::time::sleep(RECONNECT).await;
             }

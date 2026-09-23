@@ -1,9 +1,7 @@
 //! Unit tests for the irssi autolog parser. Run with `cargo test`.
 //!
-//! Every fixture here is synthetic. The real logs are private conversation with
-//! named people and this repository is public, so the fixtures reproduce the
-//! *shapes* measured against the live tree (2026-08-14, 64,038 timestamped
-//! lines in one network's 2026 logs) and none of its content.
+//! Fixtures are synthetic: the real logs are private and this repository is
+//! public. They reproduce the shapes of the live tree, not its content.
 
 use signal_archiver::irclog::{Date, Entry, Kind, parse_log, parse_path};
 
@@ -11,8 +9,7 @@ fn d(year: i32, month: u32, day: u32) -> Date {
     Date { year, month, day }
 }
 
-/// The parser is handed the date from the path, because a log line carries
-/// `%H:%M` and nothing more.
+/// The date comes from the path; a line carries only `%H:%M`.
 const DAY: Date = Date {
     year: 2026,
     month: 8,
@@ -32,8 +29,8 @@ fn only(text: &str) -> Entry {
 
 // ---------------------------------------------------------------- the path
 
-/// `autolog_path = "~/irclogs/$tag/%Y/%m/%d/$0.log"` — the network and the
-/// target are *only* recoverable from the path, so this is not a convenience.
+/// `autolog_path = "~/irclogs/$tag/%Y/%m/%d/$0.log"`: network and target come
+/// only from the path.
 #[test]
 fn a_path_yields_network_target_and_date() {
     let p = parse_path("xinutec/2026/08/14/#chan.log").expect("parses");
@@ -58,10 +55,7 @@ fn a_channel_target_is_marked_by_its_own_name() {
     );
 }
 
-/// 57 of 89,474 log files sit at `<YYYY>/<MM>/<DD>/<target>.log` with no
-/// network component — they predate the `$tag` in `autolog_path`. Returning
-/// None lets the caller count them; guessing a network would file somebody's
-/// conversation under the wrong server.
+/// Old files have no network component. `None` lets the caller count them.
 #[test]
 fn a_path_without_a_network_is_refused_rather_than_guessed() {
     assert!(parse_path("2014/03/09/somebody.log").is_none());
@@ -75,7 +69,7 @@ fn a_leading_directory_prefix_does_not_confuse_the_path() {
 
 // ------------------------------------------------------------- the classes
 
-/// `HH:MM <nick> text` — 30,074 of 64,038 measured lines.
+/// `HH:MM <nick> text`.
 #[test]
 fn a_message_carries_its_nick_and_text() {
     let e = only("21:05 <alice> hello there");
@@ -87,15 +81,8 @@ fn a_message_carries_its_nick_and_text() {
     assert_eq!(e.at.date, DAY);
 }
 
-/// Channel ops are logged `<@nick>`, voice `<+nick>`. The prefix is a mode on
-/// the channel, not part of anybody's name — keeping it would file the same
-/// person under two names the day they are opped.
-///
-/// ⚠ A space is one of those modes: it is the column with no mode in it.
-/// 323,570 of the 425,748 measured messages are `< nick>` — every ordinary
-/// person speaking in a channel — against 102,178 unpadded. Treating the space
-/// as part of the name split every unopped participant into two people, and put
-/// 13,465 of the archive's owner's own messages under somebody else.
+/// `<@nick>` and `<+nick>` carry a channel mode, not part of the name. So does
+/// the padding space in `< nick>`, the form of every unmoded speaker.
 #[test]
 fn a_mode_prefix_is_not_part_of_the_nick() {
     for (line, nick) in [
@@ -111,7 +98,6 @@ fn a_mode_prefix_is_not_part_of_the_nick() {
     }
 }
 
-/// The same person, opped and not, is one person.
 #[test]
 fn the_padded_and_opped_forms_of_one_nick_agree() {
     assert_eq!(
@@ -120,8 +106,7 @@ fn the_padded_and_opped_forms_of_one_nick_agree() {
     );
 }
 
-/// The text is taken whole after the first `> `, so a message *about* IRC
-/// syntax is not re-parsed as one.
+/// Split on the first `> `, so a message about IRC syntax is not re-parsed.
 #[test]
 fn angle_brackets_inside_a_message_stay_in_the_message() {
     let e = only("21:05 <alice> try <@bob> or -!- for the event form");
@@ -142,8 +127,7 @@ fn utf8_survives_intact() {
     assert_eq!(e.text, "größer — 日本語 🎉");
 }
 
-/// `HH:MM  * nick text` — note the *two* spaces, which is what distinguishes an
-/// action from everything else. 157 measured.
+/// `HH:MM  * nick text`; the two spaces mark an action.
 #[test]
 fn an_action_is_the_two_space_star_form() {
     let e = only("21:05  * alice waves");
@@ -152,9 +136,7 @@ fn an_action_is_the_two_space_star_form() {
     assert_eq!(e.text, "waves");
 }
 
-/// `HH:MM -!- …` — joins, parts, quits, nick changes, modes. 1,092 measured.
-/// Kept whole: the app shows them as one grey line if it shows them at all, and
-/// splitting join from part here would be inventing structure nothing consumes.
+/// `HH:MM -!- …`: joins, parts, quits, nick changes, modes. Kept whole.
 #[test]
 fn an_event_has_no_nick_and_keeps_its_whole_text() {
     let e = only("21:05 -!- alice [alice@example.invalid] has joined #chan");
@@ -163,9 +145,7 @@ fn an_event_has_no_nick_and_keeps_its_whole_text() {
     assert_eq!(e.text, "alice [alice@example.invalid] has joined #chan");
 }
 
-/// `HH:MM !server * text` — 32,712 measured, the largest class of all,
-/// larger than actual messages. A parser that dropped what it did not recognise
-/// would silently discard half the corpus and look like it worked.
+/// `HH:MM !server * text`, the largest class in real logs.
 #[test]
 fn a_server_notice_is_recognised_and_attributed_to_the_server() {
     let e = only("21:05 !irc.example.invalid *** You are now logged in");
@@ -174,9 +154,7 @@ fn a_server_notice_is_recognised_and_attributed_to_the_server() {
     assert_eq!(e.text, "You are now logged in");
 }
 
-/// The `*` is decoration, not structure: 79 notices across the measured tree
-/// carry none. Requiring it cost those 79 lines, which is how it was found —
-/// by counting the real corpus, not by reading the format.
+/// The `*` is decoration; some notices have none.
 #[test]
 fn a_server_notice_without_the_stars_is_still_a_notice() {
     let e = only("21:05 !irc.example.invalid Closing link");
@@ -185,9 +163,7 @@ fn a_server_notice_without_the_stars_is_still_a_notice() {
     assert_eq!(e.text, "Closing link");
 }
 
-/// A notice from a *person* rather than a server: `-nick(user@host)- text`.
-/// 21 measured. The hostmask is dropped — it identifies a connection, not a
-/// correspondent, and the archive keys people by nick.
+/// A notice from a person, `-nick(user@host)- text`; the hostmask is dropped.
 #[test]
 fn a_user_notice_keeps_the_nick_and_drops_the_hostmask() {
     let e = only("21:05 -alice(alice@example.invalid)- ping");
@@ -196,9 +172,7 @@ fn a_user_notice_keeps_the_nick_and_drops_the_hostmask() {
     assert_eq!(e.text, "ping");
 }
 
-/// An older irssi theme wrote a person's notice as `[notice(nick)] text`. Three
-/// lines in the measured tree, all from 2013, and they are the entire remainder
-/// — with this the corpus classifies completely.
+/// An older irssi theme's person notice, `[notice(nick)] text`.
 #[test]
 fn the_older_bracketed_notice_form_is_also_a_notice() {
     let e = only("21:05 [notice(alice)] ping");
@@ -207,9 +181,7 @@ fn the_older_bracketed_notice_form_is_also_a_notice() {
     assert_eq!(e.text, "ping");
 }
 
-/// The OTR plugin logs its status into the conversation it protects: 288 lines,
-/// all in private logs. Grey lines about the conversation rather than in it, so
-/// they are events — the same thing a join is, from the reader's side.
+/// OTR plugin status lines are events.
 #[test]
 fn otr_plugin_status_is_an_event_and_keeps_its_prefix() {
     let e = only("21:05 OTR: Private conversation started");
@@ -218,10 +190,8 @@ fn otr_plugin_status_is_an_event_and_keeps_its_prefix() {
     assert_eq!(e.text, "OTR: Private conversation started");
 }
 
-/// ⚠ The OTR prefix is matched *literally*, and that is the point. Generalising
-/// to `word: text` would swallow the next plugin's output as a known class
-/// instead of reporting it, which is exactly how the 288 OTR lines and the 79
-/// bare notices stayed invisible until somebody counted.
+/// The OTR prefix is literal, so another plugin's `word: text` is reported,
+/// not absorbed.
 #[test]
 fn another_plugins_prefix_is_reported_rather_than_swallowed() {
     let parsed = parse_log(DAY, "21:05 SOMEPLUGIN: went secure");
@@ -243,10 +213,8 @@ fn log_open_and_close_markers_are_not_entries() {
     assert_eq!(parsed.entries.len(), 1);
 }
 
-/// The one that matters. irssi holds a log file open across midnight — 12 such
-/// markers in one network's 2026 logs — so lines after it belong to the *next*
-/// day even though the path still says the old one. Without this they are
-/// timestamped a day early and sort into the wrong place forever.
+/// irssi keeps a file open across midnight, so lines after the marker belong to
+/// the next day although the path names the old one.
 #[test]
 fn a_day_changed_marker_moves_the_date_on() {
     let parsed = parse_log(
@@ -283,9 +251,7 @@ fn every_month_name_is_understood() {
     }
 }
 
-/// A marker we cannot read must not silently leave the date as it was — that
-/// would file a day of conversation under yesterday with nothing to show for
-/// it. It is reported instead.
+/// An unreadable marker is reported rather than leaving the date unchanged.
 #[test]
 fn an_unreadable_day_changed_marker_is_reported_not_ignored() {
     let parsed = parse_log(DAY, "--- Day changed Sometime In Marchtember\n");
@@ -295,10 +261,8 @@ fn an_unreadable_day_changed_marker_is_reported_not_ignored() {
 
 // ---------------------------------------------------------------- the shape
 
-/// Line numbers are the dedupe key: the ingester keys on
-/// `(conversation, file date, line number)` because irssi's autolog only ever
-/// appends, so a line's number is stable and re-running imports nothing twice.
-/// They must therefore count *physical* lines, including the ones skipped.
+/// Line numbers are part of the dedupe key, so they count physical lines,
+/// skipped ones included.
 #[test]
 fn line_numbers_count_physical_lines_including_skipped_ones() {
     let parsed = parse_log(
@@ -321,9 +285,7 @@ fn blank_lines_are_skipped_without_being_reported() {
     assert_eq!(parsed.entries.len(), 1);
 }
 
-/// Anything that matches no known shape is surfaced by line number rather than
-/// dropped. Half this corpus was a class nobody had written down; the next
-/// unknown class should announce itself rather than quietly vanish.
+/// Unknown shapes are reported by line number, not dropped.
 #[test]
 fn an_unknown_shape_is_reported_by_line_number() {
     let parsed = parse_log(DAY, "21:05 <alice> fine\nnot a log line at all\n");
@@ -344,9 +306,7 @@ fn an_empty_file_yields_nothing_and_complains_about_nothing() {
     assert!(parsed.unparsed.is_empty());
 }
 
-/// A time that is not a time is not a message. `24:00` and `21:60` never occur
-/// in a real log, but accepting them would put a row in the archive that
-/// MariaDB then refuses as a DATETIME, mid-import.
+/// An impossible time would make MariaDB reject the row mid-import.
 #[test]
 fn an_impossible_clock_time_is_refused() {
     for line in ["24:00 <alice> hi", "21:60 <alice> hi", "99:99 <alice> hi"] {
@@ -356,10 +316,7 @@ fn an_impossible_clock_time_is_refused() {
     }
 }
 
-/// What the ingester binds to a MariaDB `DATETIME`. Seconds are zero because
-/// irssi's default `timestamp_format` is `%H:%M` and there is no more precision
-/// to be had — two messages in the same minute are ordered by insertion, which
-/// is the order the file already had.
+/// The MariaDB `DATETIME` literal; seconds are always zero.
 #[test]
 fn a_timestamp_renders_as_a_mariadb_datetime() {
     let e = only("09:05 <alice> hi");
@@ -368,23 +325,11 @@ fn a_timestamp_renders_as_a_mariadb_datetime() {
 
 // ------------------------------------------------- one line, two readers
 
-/// A line read on its own means exactly what it means read in its file.
-///
-/// ⚠ THIS IS THE CONTRACT BETWEEN THE TWO TIERS. `import_irclogs` parses
-/// whole files; `irc_tail` is handed one line at a time by the irssi plugin and
-/// parses it alone, then writes the row on the archive's dedupe key. If the two
-/// readings differed by so much as a nick, the live row and the row the next
-/// import would write would be different rows about the same line — and the
-/// dedupe key would keep whichever landed first, silently.
-///
-/// Everything but `line_no` must match: the single-line parse cannot know where
-/// in the file the line sat, which is why the plugin reports that separately and
-/// `irc_tail` overrides it.
+/// A line parsed alone reads as it does in its file, apart from `line_no`.
+/// `irc_tail` parses single lines and must write the row `import_irclogs` would.
 #[test]
 fn a_line_parsed_alone_matches_the_same_line_parsed_in_its_file() {
-    // The shapes that actually differ between readings if anything is wrong: the
-    // channel-mode space in `< nick>`, an op's `<@nick>`, an action, a server
-    // notice, and an event with no speaker.
+    // The shapes where the two readings could differ.
     let file = "--- Log opened Fri Aug 14 00:00:00 2026\n\
                 10:00 < alice> a plain line\n\
                 10:01 <@bob> an op speaks\n\
@@ -416,8 +361,7 @@ fn a_line_parsed_alone_matches_the_same_line_parsed_in_its_file() {
         assert_eq!(solo.kind, entry.kind, "kind differs for {raw:?}");
         assert_eq!(solo.nick, entry.nick, "nick differs for {raw:?}");
         assert_eq!(solo.text, entry.text, "text differs for {raw:?}");
-        // The one field a single line cannot know, and the reason the plugin
-        // reports it: alone, every line is line 1.
+        // Alone, every line is line 1; the plugin reports the real one.
         assert_eq!(solo.line_no, 1, "a line read alone is always line 1");
     }
 }

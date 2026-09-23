@@ -1,15 +1,12 @@
 ---
 name: build
 
-# signal-archiver (Rust) — gate on fmt + clippy + cargo test, then build + push
-# xinutec/signal-archiver:latest to Docker Hub. The k8s manifests + deploy live
-# in the home monorepo (xinutec/pippijn code/kubes/signal/k8s); the image tag is
-# the only contract between this repo and the deploy.
+# fmt + clippy + cargo test, then build and push
+# xinutec/signal-archiver:latest. Manifests live in pippijn/code
+# (kubes/dhall/apps/signal.dhall); the image tag is the only contract.
 #
-# tests/parse.rs and tests/irclog.rs are pure units, but tests/irc_stats.rs is
-# not: `irc_conversation_stats` is maintained by DATABASE TRIGGERS, so the only
-# thing that can test it is a database. Without the service below that test
-# skips itself silently and the triggers ship unverified.
+# The MariaDB service is for the tests that exercise SQL and triggers; with
+# `CI` set they fail rather than skip without it.
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

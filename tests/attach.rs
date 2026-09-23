@@ -1,9 +1,5 @@
-//! `attach::write_stream` — the chunks land in order, and a body that fails
-//! part-way leaves NO file behind.
-//!
-//! The property that motivated the function (bounded resident memory) is not
-//! one a test can observe; what a test can hold is that streaming did not cost
-//! correctness, which is the way this could have gone wrong quietly.
+//! `attach::write_stream`: chunks land in order, and a failed body leaves no
+//! file behind.
 
 use std::io::{Error, ErrorKind};
 use std::path::PathBuf;
@@ -37,8 +33,7 @@ async fn chunks_are_concatenated_in_order() {
 
 #[tokio::test]
 async fn an_empty_body_still_writes_an_empty_file() {
-    // A zero-byte attachment is a real answer from the bridge, and it must not
-    // be indistinguishable from a failed download.
+    // A zero-byte attachment is a real file, not a failure.
     let path = tmp("empty");
     let body = stream::iter(Vec::<Result<Vec<u8>, Error>>::new());
 
@@ -51,8 +46,6 @@ async fn an_empty_body_still_writes_an_empty_file() {
 
 #[tokio::test]
 async fn a_failure_part_way_leaves_no_file() {
-    // The caller does not record the row when this errors, so a short file
-    // would sit on the volume for ever looking like a whole one.
     let path = tmp("truncated");
     let body = stream::iter(vec![
         Ok(b"first half".to_vec()),

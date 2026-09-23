@@ -1,292 +1,151 @@
-# signal — Signal message archive
+# signal — message archive
 
-Archives Signal messages into MariaDB on the **isis** k3s cluster, the same way
-`home`/`health` archive their data. Two feeds into one schema:
-
-- **Ongoing** — [`signal-cli-rest-api`](https://github.com/bbernhard/signal-cli-rest-api)
-  links as a Signal **secondary device** and exposes received messages on a
-  websocket; a small Rust **ingester** parses each frame into MariaDB.
-- **History** (one-time, done) — an Android Signal **plaintext export**
-  (backup-v2 JSONL) imported into the same tables by `tools/import_jsonl.py`.
+Archives Signal, Telegram, IRC and Google Chat messages into one MariaDB on the
+**isis** k3s cluster (namespace `signal`). Each origin has its own tables.
 
 ```
-                  one-time, on Mac
- Android Signal ──plaintext export──▶ main.jsonl ──▶ import_jsonl.py ─┐
-   (history)        (backup-v2 JSONL)                                 │
-                                                                      ▼
- Android Signal ──link (QR)──▶ signal-cli-rest-api ──ws──▶ ingester ──▶ MariaDB
-   (ongoing)                   [json-rpc, PVC=keys]    (Rust)        [ns: signal]
+ Android Signal ──plaintext export──▶ import_jsonl.py ──────────────┐  (history, once)
+ Android Signal ──link (QR)──▶ signal-cli-rest-api ──ws──▶ ingester ─┤
+ Telegram ──MTProto──▶ telegram (history + live, one session) ───────┤
+ irssi autologs ──rsync──▶ import_irclogs; irssi plugin ──▶ irc_tail ┼──▶ MariaDB
+ gchat-archive capture ──▶ import_gchat.py ──────────────────────────┘
 ```
 
-Both feeds dedupe on `(sender_uuid, server_ts)` — a Signal timestamp is unique
-per sender — so history and live overlap safely.
-
-## Why signal-cli (not presage)
-We first tried presage (all-Rust, in-process). Its secondary-device **linking
-fails against current Signal servers with HTTP 409 / missing-capabilities**, even
-on its latest commit. `signal-cli` (≥0.14.x, via the bbernhard REST image)
-tracks Signal's required capabilities and links cleanly, so it owns the Signal
-protocol; our Rust binary is reduced to a dumb, dependency-light websocket→DB
-ingester (no libsignal/sqlcipher — fast, small build).
+signal-cli owns the Signal protocol (presage's linking fails against Signal's
+servers), so the ingester is a websocket-to-database client with no libsignal.
 
 ## Components
-- `src/parse.rs` — **pure** frame→action mapping (`parse_frame`), no I/O. Unit-tested.
-- `src/db.rs` — MariaDB schema (append-only `MIGRATIONS`, run on startup) + inserts.
-- `src/main.rs` — the binary: connects to `ws://…/v1/receive/<number>`, parses each
-  frame via `parse`, and executes the action against the DB; a heartbeat probes
-  idle sockets and reconnects on drop. Also downloads attachment bytes and
-  periodically refreshes group titles.
-- `src/lib.rs` — exposes `parse`/`db` as a library so the logic is testable.
-- `tools/import_jsonl.py` — the one-time history importer (plaintext JSONL
-  export → the same tables, deduped against the live feed). See *History backfill*.
-- `tools/reconcile_groups.py` — one-time fixer that rekeys master-key group
-  threads to the live group ids (for history imported before `--groups-json`).
-- `tools/import_gchat.py` — imports the Google Chat archive into SEPARATE
-  `gchat_*` tables in the same DB (see *Other origins* below).
+- `src/parse.rs` — pure Signal frame → action mapping.
+- `src/db.rs` — the schema (append-only `MIGRATIONS`, applied on startup) and
+  every write.
+- `src/main.rs` — the Signal ingester: holds `ws://…/v1/receive/<number>`,
+  executes parsed actions, stores attachment bytes, refreshes contact and group
+  names.
 - `src/telegram/` + `src/bin/telegram.rs` — the Telegram feed. `map.rs` is the
-  pure wire-type→row mapping (the `parse.rs` of that origin, unit-tested with no
-  account); `session.rs` keeps the MTProto session in MariaDB; the binary does
-  login, backfill and the live update stream. See *Other origins* below.
+  pure wire → row mapping; `session.rs` keeps the MTProto session in MariaDB.
+- `src/irclog.rs`, `src/bin/import_irclogs.rs`, `src/bin/irc_tail.rs` — irssi
+  autolog parsing, the periodic importer, and the live tail. Both write the same
+  rows on the same dedupe key.
+- `tools/import_jsonl.py` — the Signal history import.
+- `tools/reconcile_groups.py` — rekeys master-key group threads to live group ids.
+- `tools/import_gchat.py` — the Google Chat import.
+- `tools/check_known_truths.py` — checks the live database still answers the
+  facts in `tools/known_truths.tsv`.
+
+Manifests are in `kubes/dhall/apps/signal.dhall` in the `pippijn/code` repo.
 
 ## Tests
-`tests/parse.rs` unit-tests the bug-prone part — mapping signal-cli's JSON to
-archive actions (incoming/outgoing, groups, reactions, deletes, stickers,
-attachments, jsonrpc-wrapping, skips). No I/O, always runs.
+`tests/parse.rs`, `tests/telegram_map.rs`, `tests/irclog.rs`,
+`tests/telegram_session.rs` and `tests/attach.rs` need nothing.
 
-Two suites need a real MariaDB and **skip silently without one**, so a bare
-`cargo test` proves less than it looks like it does:
-- `tests/irc_stats.rs` — the `irc_conversation_stats` triggers (v11–v14): what
-  counts, that replay is free, and that DELETE and edits to
-  `conversation_id`/`kind`/`sent_at` are refused.
-- `tests/import_irclogs.rs` — the importer's incremental behaviour, the one
-  failure mode that produces no error and no row.
-
-`tests/telegram_store.rs` is a third, and what it pins is everything only the
-DATABASE can decide: that an edit keeps the text it replaces and a replayed edit
-appends nothing, that a peer-less deletion does not reach a channel sharing the
-number, that a withdrawn reaction stops being counted, that the backfill frontier
-never moves backwards, and that a session round-trips WITH its auth key. Two real
-defects were found by running it and by nothing else — a primary key over nullable
-columns, which MariaDB silently makes `NOT NULL` and which rejected every unicode
-reaction; and a gap-lock deadlock between the backfill and the live stream, which
-only appears when two writers are in flight. Both are written up where they were
-fixed (`db.rs` v17, and `store_telegram_message`).
-
-Telegram's mapping is unit-tested in `src/telegram/map/` and needs no account and
-no database: `tl::types::Message` is generated from Telegram's own schema, so a
-fixture is a struct literal the compiler checks against the real contract rather
-than a captured blob that can drift from it. The DM-attribution rule was ablated
-both ways (arms swapped, and the inference let out of DMs) and each fails exactly
-one test.
-
-All key off `SIGNAL_TEST_DATABASE_URL`. CI supplies a `mariadb:11.8` service;
-locally use `dev-lint#with-test-db`. Each test tags its rows uniquely per run as
-well as per test, so running the suite twice against one database is safe.
-- `Dockerfile` — pure-Rust build (no C toolchain).
-- `k8s/` — `00-namespace`, `01-pvc` (DB + signal-cli data), `02-db` (MariaDB),
-  `03-signal-cli` (the rest-api engine), `04-ingester` (the Rust binary),
-  `secret.sh` (DB creds; `SIGNAL_NUMBER` added after linking).
+`tests/contacts.rs`, `tests/telegram_store.rs`, `tests/irc_stats.rs` and
+`tests/import_irclogs.rs` need a MariaDB at `SIGNAL_TEST_DATABASE_URL` and skip
+without one; the first three fail instead when `CI` is set. CI supplies a
+`mariadb:11.8` service; locally use `dev-lint#with-test-db`. Each test's rows are
+unique per run, so the suite can run repeatedly against one database.
 
 ## Schema
-`contacts`, `conversations` (`dm:<uuid>` / `group:<id>`), `messages`
-(UNIQUE `(sender_uuid, server_ts)`), `attachments`, `reactions`. Identities are
-keyed on the Signal ACI UUID (E.164 number as fallback). Deletes and edits are
-non-destructive: a delete only flags `deleted`, and each edited version is a
-separate row linked to the original via `edit_of_ts` — content is never removed.
+Signal: `contacts` (+ `contact_names`, names over time), `conversations`
+(`dm:<uuid>` / `group:<id>`), `messages` (unique `(sender_uuid, server_ts)`),
+`attachments`, `reactions`, `signal_receipts`, `signal_call_events`, and
+`signal_frames`, every raw frame as it arrived. Identities are ACI UUIDs, E.164
+as fallback. Deletes flag the row and edits are separate rows linked by
+`edit_of_ts`; nothing is overwritten.
 
-Group threads are keyed by the signal-cli **group id** (base64 `groupInfo.groupId`,
-== the groups-API `internal_id`). The Android export instead carries each group's
-**master key** (a different value), so the importer maps master-key → group id by
-group name (`--groups-json`, below) to land history in the same thread as the live
-feed. DM threads (`dm:<uuid>`) need no mapping.
+Group threads are keyed by signal-cli's group id (base64 `groupInfo.groupId`).
+The Android export carries each group's master key instead, so the importer maps
+master key → group id by name (`--groups-json`).
 
-## Deploy (isis k3s, namespace `signal`)
-1. Push to `main` → CI builds `xinutec/signal-archiver:latest` (the ingester).
-2. `./k8s/secret.sh` (random DB creds; refuses to overwrite).
-3. `kubectl apply -f k8s/00-namespace.yaml -f k8s/01-pvc.yaml -f k8s/02-db.yaml -f k8s/03-signal-cli.yaml`
-4. **Link the device (your phone).** Fetch a QR PNG from the rest-api and scan it
-   in **Signal → Settings → Linked devices → Link new device**:
-   ```
-   kubectl -n signal exec deploy/signal-cli-rest-api -- \
-     curl -s 'http://localhost:8080/v1/qrcodelink?device_name=signal-archiver' -o /tmp/qr.png
-   kubectl -n signal cp signal-cli-rest-api-<pod>:/tmp/qr.png ./qr.png   # then open/scan
-   ```
-   (The QR is a fresh, short-TTL provisioning link — scan promptly. signal-cli
-   ≥0.14.x links without the 409.)
-5. Discover the linked number and add it to the secret, then deploy the ingester:
-   ```
-   kubectl -n signal exec deploy/signal-cli-rest-api -- curl -s localhost:8080/v1/accounts
-   kubectl -n signal patch secret signal-secret -p '{"stringData":{"SIGNAL_NUMBER":"+44..."}}'
-   kubectl apply -f k8s/04-ingester.yaml
-   ```
-6. Verify: `kubectl -n signal exec deploy/signal-db -- mariadb -usignal -p signal -e 'SELECT COUNT(*) FROM messages;'`
+Telegram: `telegram_*`, keyed by Telegram's own `(conversation_id, msg_id)`.
+IRC: `irc_*`. Google Chat: `gchat_*`, created by `tools/import_gchat.py` itself
+rather than by `MIGRATIONS`.
 
-## History backfill (one-time, done)
-Source is a Signal Android **plaintext export**, not the encrypted `.backup`:
-Signal Android (beta) → "export" → `Documents/signal-export-*/main.jsonl`, a
-stream of `account` / `recipient` / `chat` / `chatItem` / `stickerPack` frames.
-Fetch the groups list (so group history merges with the live feed — see *Schema*):
+## Linking Signal
+Fetch a QR code and scan it in Signal → Settings → Linked devices → Link new
+device. It expires quickly.
+```
+kubectl -n signal exec deploy/signal-cli-rest-api -- \
+  curl -s 'http://localhost:8080/v1/qrcodelink?device_name=signal-archiver' -o /tmp/qr.png
+kubectl -n signal cp signal-cli-rest-api-<pod>:/tmp/qr.png ./qr.png
+```
+Then put the linked number in `signal-secret`:
+```
+kubectl -n signal exec deploy/signal-cli-rest-api -- curl -s localhost:8080/v1/accounts
+kubectl -n signal patch secret signal-secret -p '{"stringData":{"SIGNAL_NUMBER":"+44..."}}'
+```
+
+## Signal history import
+Source is a Signal Android plaintext export (`main.jsonl`, backup-v2 JSONL), not
+the encrypted `.backup`. Fetch the groups list so group history lands in the live
+threads:
 ```
 NUM=$(curl -s localhost:8080/v1/accounts | sed 's/[][\"]//g')   # inside the rest-api pod
 curl -s localhost:8080/v1/groups/$NUM > groups.json
 ```
-Copy `main.jsonl` (and `groups.json`) off the device/cluster and run on the Mac:
+Then, with the database port-forwarded:
 ```
 DB_HOST=… DB_PORT=… DB_USER=… DB_PASSWORD=… DB_NAME=signal \
   SELF_UUID=<your ACI> SELF_PHONE=<your E.164 number> \
   ./tools/import_jsonl.py main.jsonl --groups-json=groups.json [--dry-run] [--limit=N]
 ```
-It resolves the export's internal recipient/chat ids and writes messages,
-contacts, conversations, reactions, attachment **metadata**, and edit history
-into the same tables, deduped on `(sender_uuid, server_ts)` via `INSERT IGNORE`
-— so it is safe to run alongside the live feed and to re-run. Attachment **bytes**
-are not imported (they live in the export's `files/` tree keyed by hash).
+It dedupes on `(sender_uuid, server_ts)`, so it is safe beside the live feed and
+to re-run. Attachment bytes are not imported, only metadata.
 
-If you imported without `--groups-json`, group history sits under master-key
-threads; `tools/reconcile_groups.py groups.json [--apply]` rekeys them to the live
-group ids (dry-run by default).
+A group whose name matches no live group keeps its master-key thread; the
+importer warns. `tools/reconcile_groups.py groups.json [--apply]` rekeys threads
+from an import run without `--groups-json`.
 
-## Scope / known follow-ups
-- Live feed archives **incoming** text + quotes + attachment metadata + **bytes**
-  + reactions, and **outgoing** messages (linked-device "Sent" sync); it resolves
-  contact names (DM thread names) and refreshes group titles.
-- The JSONL importer archives the same, **minus attachment bytes** (metadata only).
-- Group threads unify across feeds via the `--groups-json` name→groupId map
-  (`reconcile_groups.py` fixes any pre-mapping import). The only soft spot is the
-  name match — a renamed or duplicate group title can't be mapped and falls back
-  to the masterKey key (the importer warns); a future hardening is matching on the
-  member set instead of the name.
-
-## Other origins — Google Chat (separate tables)
-This DB is also the store for **other** message origins, each in its OWN tables
-(not merged into the Signal schema — the shapes differ too much to unify cleanly).
-
-**Google Chat** (`gchat_conversations`, `gchat_messages`, `gchat_reactions`):
-imported from the decoded archive produced by `~/Code/gchat-archive` (a CDP
-reverse-engineering capture, NOT a Takeout) by `tools/import_gchat.py`. Differences
-from Signal that justify separate tables: reactions are **aggregated** (`emoji` +
-`cnt`) not per-author events; messages carry Google **threading** (`thread_id`) and
-numeric `sender_id`; self is a `(you)` name suffix → stored as `is_self`. Messages
-dedupe on `(group_id, msg_id)`, names/reaction-counts upsert, so it is re-runnable.
+## Google Chat import
+From the decoded archive `~/Code/gchat-archive` produces (a browser capture, not
+Takeout). Reactions are counts per emoji, not per person; messages carry Google's
+threading. Dedupes on `(group_id, msg_id)`, so it is re-runnable.
 ```
-# port-forward the DB, then on the machine holding the archive:
 DB_HOST=… DB_PORT=… DB_USER=… DB_PASSWORD=… DB_NAME=signal \
   ./tools/import_gchat.py [conversations_dir] [--apply]   # dry-run by default
 ```
-The importer creates the `gchat_*` tables itself (`CREATE TABLE IF NOT EXISTS`);
-they are independent of the Rust ingester's `MIGRATIONS` (which owns only the
-Signal tables).
 
-## Other origins — Telegram (separate tables, one login)
-`telegram_conversations`, `telegram_messages`, `telegram_reactions`,
-`telegram_message_edits`, `telegram_backfill_state`, `telegram_session` — created by
-the Rust `MIGRATIONS` (v15–v20), unlike the `gchat_*` tables.
+## Telegram
+One user session pages back through history and holds the update stream; both
+write the same rows. A bot cannot read its owner's chats, so this is a user
+client, and `telegram_session` is a credential: re-logging in is rate-limited
+for hours. Secret chats are device-local and unreachable.
 
-**The only origin whose past and present come from one feed.** Telegram keeps
-history server-side, so a single authorised session pages backwards through
-everything AND holds the update stream. No export, no second import path, and the
-two halves cannot disagree because they write the same rows on the same key:
-`(conversation_id, msg_id)` is the message's own server-assigned identity, which is
-a stronger dedupe key than either of the other origins has.
-
+Log in once, interactively; a code arrives on the phone:
 ```
-# once per account lifetime, interactively (a code arrives on the phone):
 DB_HOST=… DB_PORT=… DB_USER=… DB_PASSWORD=… DB_NAME=signal \
   TELEGRAM_API_ID=… TELEGRAM_API_HASH=… \
-  cargo run --bin telegram -- login '+31…' 
-# then, as a Deployment: no arguments.
+  cargo run --bin telegram -- login '+31…'
 ```
+Not via `kubectl exec`: the Deployment refuses to start without a session, so
+there is nothing to exec into. Run it locally with `signal-db` port-forwarded,
+or in a throwaway pod with the same environment. `TELEGRAM_API_ID` and
+`TELEGRAM_API_HASH` come from <https://my.telegram.org> and live in
+`signal-secret`.
 
-⚠ **`telegram login` cannot be run with `kubectl exec` into the Deployment.** That
-pod refuses to start until a session exists — deliberately, because a feed which is
-quietly not logged in looks exactly like a quiet week — so there is no running
-container to exec into. In-cluster it is a throwaway pod with the same environment;
-`kubes/signal/k8s/secret.sh` prints the command. Locally it is the form above, with
-`signal-db` port-forwarded.
+`telegram_read_marks` is the one table that cannot be rebuilt: Telegram keeps
+only the current read high-water marks, so a mark not recorded when seen is lost.
+`observed_at` is when the archive saw it; Telegram's read updates carry no date.
+`outbox` is how far the other side has read mine, `inbox` how far I have read
+theirs.
 
-⚠ **`telegram_read_marks` IS THE ONE TABLE HERE THAT CANNOT BE REBUILT.** Every
-other fact in this archive can be recovered by reading Telegram again, because
-Telegram keeps the messages. It keeps **no log of reading** — a dialog carries only
-the current `read_inbox_max_id` / `read_outbox_max_id` — so a read not recorded as
-it happens is gone permanently. Capture started 2026-09-17 and there is nothing
-before that date, by nature rather than by omission.
+`telegram recapture` re-reads every stored message so columns added later get
+filled. Run it, like `telegram probe`, with the feed scaled to zero.
 
-It is append-only: each ADVANCE of a mark is its own row, so the table answers
-"when was this read?" and not just "how far". `observed_at` is **when we saw it,
-not when they read it** — Telegram's read updates carry no date — so a live update
-is seconds late and one first seen by the hourly sweep may be up to an hour late.
-`direction` uses Telegram's own words: `outbox` is the OUT-tray, meaning how far the
-other side has read MY messages; `inbox` is how far I have read theirs.
+Where Telegram differs from the other origins:
 
-Two capture points, deliberately overlapping. The live updates
-(`updateReadHistory{Inbox,Outbox}` and the `ReadChannel` pair) land within seconds
-but are **not guaranteed delivery** — only message updates are, and this feed has
-been seen dropping 71 queued updates on a restart. The hourly dialog sweep re-states
-every mark regardless and needs no extra API call, so a missed update costs
-lateness rather than the fact.
-
-⚠ **A forward was invisible here until 2026-09-17, and the column said otherwise.**
-`fwd_from_name` existed from the first Telegram migration and held **0 rows out of
-159,946**, because it was filled from the header's `from_name` — which Telegram sets
-only when the original sender has forward-privacy on. The ordinary case names a PEER
-in `from_id`, and that was never read, so a forwarded message was indistinguishable
-from something the sender wrote. `fwd_from_id` (v27) is that half; `post_author` now
-feeds the name for a forwarded channel post, whose `from_id` is the channel rather
-than the person who signed it.
-
-⚠ **The rows already walked are still NULL.** The backfill is marked complete and
-does not return on its own. Both forward columns are in `store_telegram_message`'s
-enrichment UPDATE, so a deliberate re-walk would fill them — 160k messages of API
-traffic, which is a decision to take with the cost in view rather than something to
-start by accident.
-
-`TELEGRAM_API_ID` / `TELEGRAM_API_HASH` come from <https://my.telegram.org>, are
-Pippijn's own, and live in `signal-secret`.
-
-⚠ **A BOT CANNOT DO THIS.** A Telegram bot is a separate account and cannot read
-the chats of the person who owns it, so this is a USER client speaking MTProto.
-That is also why `telegram_session` holds a credential rather than a cache: the row
-is a logged-in session, and re-logging-in is rate-limited by Telegram in hours.
-Losing it is not free.
-
-⚠ **`grammers` owns the protocol, for the reason `signal-cli` owns Signal's.** The
-DH handshake, AES-IGE, the message containers and the TL schema are the parts that
-rot silently when the other side bumps a layer. What is ours is the mapping and the
-rows. Unlike signal-cli it is a crate rather than a sidecar, so there is no REST
-hop and no third-party container holding the keys.
-
-⚠ **`Cargo.lock` pins `glass_pumpkin` to `2.0.0-rc0` and a `cargo update` undoes
-it**, breaking the build inside `grammers-crypto`. The note in `Cargo.toml` has the
-one-line fix.
-
-⚠ **Secret chats are not here and cannot be**: device-local by construction, so no
-login reaches them.
-
-What Telegram does that the others do not, and where each is handled:
-
-| | how Telegram does it | where |
+| | Telegram | handled in |
 | --- | --- | --- |
-| a DM names no sender | `from_id` omitted; `out` says which end | `map.rs`, inferred and tested both ways |
-| an edit date is not an edit to SHOW | `edit_hide` sits beside `edit_date`: "shown as not modified to the user, even if an edit date is present" | recorded in `edit_hidden`, honoured by the viewer — 606 hidden against 51 genuine when the archive re-read itself |
-| an edit MUTATES the message | same `msg_id`, new text, new `edit_date` | the prior text is filed in `telegram_message_edits` before the update, in one transaction — but only when the archive HELD the prior text, so backfilled edits have none and never will (558 such on the first ingest) |
-| a deletion names no peer | private chats and basic groups share ONE id sequence; channels have their own | `Db::mark_telegram_deleted` takes a SCOPE, and a peer-less deletion never reaches a channel |
-| a supergroup looks like a channel | same id space, told apart by a flag on the peer | the id gives `PeerSpace`, the peer gives `ConvKind`; the dialog sweep is what corrects it |
-| reactions are counts | aggregated per emoji, not per author | stored as given; a custom emoji keeps its document id |
+| a DM names no sender | `from_id` omitted; `out` says which end | `map::map_message` |
+| an edit date is not always an edit to show | `edit_hide` beside `edit_date` | `edit_hidden`, honoured by the viewer |
+| an edit mutates the message | same `msg_id`, new text | prior text filed in `telegram_message_edits` first; edits made before the archive held the text have none |
+| a deletion names no peer | private chats and basic groups share one id sequence | `Db::mark_telegram_deleted` never reaches a channel |
+| a supergroup shares the channel id space | told apart by a flag on the peer | `PeerSpace` from the id, `ConvKind` from the peer |
+| reactions | counts per emoji, plus a possibly truncated list of who | `telegram_reactions`, `telegram_reaction_authors` |
 
-Media is NOT downloaded: `media_kind` records that there was a photo. Attachment
-bytes are Signal-only in this archive.
-
-**First ingest, 2026-09-13** — 21 conversations, all of them DMs, so nothing here
-has yet exercised the group, supergroup or channel paths. Of 472 reaction rows,
-**none** were custom emoji, so that branch is unit-tested and unexercised by real
-data. The DM sender inference — the one rule in `map.rs` that guesses — produced
-**zero NULL senders across 5,523 DM messages**, which is the number worth having:
-it is the only thing that says the inference fires at all on real rows. It does
-NOT say the two arms are the right way round; the 2,646/2,879
-incoming/outgoing split would look just as plausible reversed, and only the
-ablated unit tests speak to that.
+Photos are downloaded eagerly to `TELEGRAM_MEDIA_DIR`; larger media when a reader
+asks (`telegram_media`).
 
 ## Security
-The signal-cli data PVC holds linked-device keys — secret-class; keep its odin
-backup encrypted. The DB holds private conversations (Signal + the imported Google
-Chat history, same private class); real content stays out of git.
+The signal-cli data PVC holds linked-device keys; keep its backup encrypted. The
+database holds private conversations and the Telegram session. Real content stays
+out of git.

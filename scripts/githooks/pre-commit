@@ -1,8 +1,4 @@
 #!/usr/bin/env bash
-# The runner is the hook. What to show on success, what exit 2 means, what a
-# signal death left unjudged — the gate says each itself, so this only starts
-# it on this repository's table. `?ref=HEAD`: a plain path would build the
-# neighbour's WORKING TREE, and a session mid-edit in dev-lint would fail this
-# gate for a reason no commit here explains.
+# `?ref=HEAD` builds dev-lint's committed state, not its working tree.
 set -euo pipefail
 exec nix run "git+file:../dev-lint?ref=HEAD#gate" -- . gate.json

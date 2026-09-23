@@ -1,43 +1,25 @@
-//! Telegram's wire types → archive rows. Pure: no client, no network, no
-//! clock.
+//! Telegram's wire types → archive rows. Pure: no client, no network, no clock,
+//! so all of it is testable without an account.
 //!
-//! This is `parse.rs`'s role for the other origin, and it exists for the same
-//! reason. Everything that can be got wrong about a Telegram message is got
-//! wrong HERE — which peer a message belongs to, who sent one that names no
-//! sender, whether a reaction is an emoji or a document id — and none of it
-//! needs an account to test. `grammers_client::types::Message` exposes its
-//! `raw: tl::enums::Message`, so the ingester hands that over and keeps the
-//! network on its own side of this boundary.
-//!
-//! What is NOT here is anything that needs the peer map: a sender's *name* is
-//! looked up from the peers a response carried, so this layer reports the
-//! sender's id and the caller names it.
+//! Anything needing the peer map stays with the caller: this reports a sender's
+//! id, and the caller names it.
 
 use grammers_tl_types as tl;
 
-/// Which of Telegram's three id spaces a peer came from.
-///
-/// ⚠ This is NOT what a conversation IS, and conflating the two would put
-/// every supergroup in the archive under "channel". Telegram models a supergroup
-/// and a broadcast channel with the same `channel` id space and tells them apart
-/// by a flag on the peer — so the space says where the number came from, and
-/// [`crate::telegram::ConvKind`] says what the thing is. `map` only ever needs
-/// the space, because the one inference it makes is about DMs.
+/// Which of Telegram's three id spaces a peer came from. Not the conversation's
+/// kind: supergroups and broadcast channels share the `channel` space; see
+/// [`crate::telegram::ConvKind`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerSpace {
     /// A user: a one-to-one conversation.
     User,
     /// A basic group (`chat`), the small kind that predates supergroups.
     Chat,
-    /// A channel id — a broadcast channel OR a supergroup.
+    /// A broadcast channel or a supergroup.
     Channel,
 }
 
 /// Whether a row is something somebody said or something that happened.
-///
-/// The same distinction `irc_messages.kind` draws between a line and a join, and
-/// it matters for the same reason: a reader that wants the conversation wants
-/// one of these and not the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MsgKind {
     Message,
@@ -54,10 +36,7 @@ impl MsgKind {
     }
 }
 
-/// What KIND of media a message carried. Not the media itself: this archive
-/// stores Telegram bytes nowhere yet (see the v16 migration), so a photo is
-/// recorded as having been a photo — with, since v21, its SIZE and mime beside it,
-/// which is what makes the decision about downloading a measured one.
+/// What kind of media a message carried.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaKind {
     Photo,
@@ -75,15 +54,12 @@ pub enum MediaKind {
     WebPage,
     Story,
     Giveaway,
-    /// A media variant this build does not name. Recorded rather than dropped:
-    /// "there was something here" is true and useful, and a reader that sees
-    /// this knows to come back rather than believing the message was bare text.
+    /// A media variant this build does not name.
     Other,
 }
 
 impl MediaKind {
-    /// The `telegram_messages.media_kind` value. Kept to 32 characters by the
-    /// column, which every variant here is comfortably inside.
+    /// The `telegram_messages.media_kind` value (at most 32 characters).
     pub fn as_str(self) -> &'static str {
         match self {
             MediaKind::Photo => "photo",
@@ -106,36 +82,27 @@ impl MediaKind {
     }
 }
 
-/// One reaction bucket on a message: how many chose it, and which it was.
-///
-/// Telegram reports reactions aggregated, so this is a count and not a list of
-/// people — the same limit `gchat_reactions` has and for the same reason.
+/// One reaction bucket on a message: which reaction, and how many chose it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reaction {
     /// A unicode emoticon, when the reaction was one.
     pub emoji: Option<String>,
-    /// A custom emoji's document id. Mutually exclusive with `emoji`: a custom
-    /// reaction has no characters to render, so the id is what there is.
+    /// A custom emoji's document id. Mutually exclusive with `emoji`.
     pub custom_emoji_id: Option<i64>,
     pub cnt: i32,
     /// Whether the logged-in account is one of the counted.
     pub chosen: bool,
 }
 
-/// WHO reacted, and when they did it.
-///
-/// ⚠ The list this comes from can be TRUNCATED, and [`Reactions::complete`] is
-/// how you know. Telegram returns `recent_reactions` as a sample when a message
-/// has many reactors, so a name missing from it is not a name that is gone. See
-/// migration v30.
+/// Who reacted, and when. The source list can be truncated; see
+/// [`Reactions::complete`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReactionAuthor {
     /// Normalised the way `conversation_id` and `sender_id` are.
     pub peer_id: i64,
     pub emoji: Option<String>,
     pub custom_emoji_id: Option<i64>,
-    /// Unix seconds, from Telegram. Genuinely when they reacted, not when we saw
-    /// it — contrast `telegram_read_marks.observed_at`.
+    /// Unix seconds: when they reacted, per Telegram.
     pub reacted_at: i64,
 }
 
@@ -145,19 +112,13 @@ pub struct Reactions {
     /// One bucket per distinct reaction, with its count. Authoritative.
     pub counts: Vec<Reaction>,
     pub authors: Vec<ReactionAuthor>,
-    /// Whether `authors` names EVERY reactor the counts add up to.
-    ///
-    /// ⚠ Only a complete list may retract anybody. False here means the store
-    /// must upsert what it has and date nothing, because the people it cannot see
-    /// are still reacting.
+    /// Whether `authors` names every reactor the counts add up to. Only a
+    /// complete list may retract anybody.
     pub complete: bool,
 }
 
-/// One formatted span: bold, a link, a mention, a spoiler.
-///
-/// ⚠ `offset` and `length` are UTF-16 CODE UNITS, so they cannot index a Rust
-/// string. See migration v31 — this is the field most likely to be used
-/// innocently and wrongly.
+/// One formatted span: bold, a link, a mention, a spoiler. Offsets and lengths
+/// are UTF-16 code units and cannot index a Rust string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entity {
     /// The TL constructor's name, less the `messageEntity` prefix: `bold`,
@@ -165,10 +126,9 @@ pub struct Entity {
     pub kind: &'static str,
     pub offset_utf16: i32,
     pub length_utf16: i32,
-    /// ⚠ The whole reason this table exists: a `textUrl` links somewhere the
-    /// visible text does not say.
+    /// A `textUrl`'s target, which the visible text does not contain.
     pub url: Option<String>,
-    /// Who a `mentionName` meant, which the text does not carry either.
+    /// Who a `mentionName` meant.
     pub user_id: Option<i64>,
     /// A `pre` block's syntax, when it declares one.
     pub language: Option<String>,
@@ -180,8 +140,7 @@ pub struct Entity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Call {
     pub call_id: i64,
-    /// ⚠ `None` is not a zero-length call: an unanswered one has no duration at
-    /// all, and that absence IS the record of it not being answered.
+    /// `None` for an unanswered call.
     pub duration_s: Option<i32>,
     /// `busy`, `hangup`, `missed` or `disconnect`.
     pub reason: Option<&'static str>,
@@ -192,122 +151,76 @@ pub struct Call {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
     pub conversation_id: i64,
-    /// Which id space `conversation_id` came from. Not the conversation's KIND —
-    /// see [`PeerSpace`].
+    /// Which id space `conversation_id` came from.
     pub peer_space: PeerSpace,
     pub msg_id: i32,
-    /// Unix seconds, UTC. Telegram's own unit, unconverted.
+    /// Unix seconds.
     pub sent_at: i64,
-    /// Normalised the same way `conversation_id` is, so a sender in a group and
-    /// the DM with that same person are one id.
+    /// Normalised like `conversation_id`, so a group sender and the DM with them
+    /// share an id.
     pub sender_id: Option<i64>,
     pub is_outgoing: bool,
     pub kind: MsgKind,
     pub text: Option<String>,
     pub media_kind: Option<MediaKind>,
-    /// What a download would cost, from the message rather than from a request.
+    /// Bytes, from the message itself.
     pub media_size: Option<i64>,
     pub media_mime: Option<String>,
-    /// Unix seconds of the most recent edit, or `None` for a message never
-    /// edited. This is Telegram's `edit_date` and is the only ordering there is
-    /// for an edit chain — there is no revision number.
+    /// Telegram's `edit_date`: unix seconds of the latest edit. The only ordering
+    /// of an edit chain.
     pub edited_at: Option<i64>,
-    /// ⚠ Telegram's `edit_hide`: "the message should be shown as NOT MODIFIED to
-    /// the user, even if an edit date is present".
-    ///
-    /// An `edit_date` alone does not mean a person edited anything — Telegram sets
-    /// one for its own reasons and then asks clients not to surface it, which is
-    /// why its own apps show no "edited" marker on such a message and why this
-    /// archive did. Reading `edit_date` without this flag is reading half the
-    /// contract. The edit is still RECORDED; what the flag governs is display.
+    /// Telegram's `edit_hide`: show the message as unmodified despite its
+    /// `edit_date`. Governs display only.
     pub edit_hidden: bool,
     pub reply_to_msg_id: Option<i32>,
-    /// Who a forward came from, as a peer — normalised the way `conversation_id`
-    /// and `sender_id` are, so a forwarder in a group and the DM with that same
-    /// person are one id.
-    ///
-    /// ⚠ This is the field a forward USUALLY has, and it was not read. The
-    /// header carries a peer for an ordinary forward and falls back to
-    /// [`Row::fwd_from_name`] only when the original sender has forward-privacy
-    /// on. Reading the name alone recorded a forward exactly when its sender had
-    /// asked not to be named, and dropped every other one — so a forwarded
-    /// message was indistinguishable from something the sender wrote. Zero rows
-    /// in 159,946 when that was noticed.
+    /// Who a forward came from, as a normalised peer. Set for ordinary forwards;
+    /// see [`Row::fwd_from_name`] for the rest.
     pub fwd_from_id: Option<i64>,
-    /// Who a forward came from, when the header names one in WORDS rather than by
-    /// peer: an account with forward-privacy on, or a channel post's author. A
-    /// forward whose sender is only a peer id has this NULL and
-    /// [`Row::fwd_from_id`] set.
+    /// Who a forward came from, in words: an account with forward privacy on, or
+    /// a channel post's author.
     pub fwd_from_name: Option<String>,
-    /// ⚠ When the ORIGINAL was written, in unix seconds. A forward stored with
-    /// only `sent_at` claims a thing was said today that was said years ago.
-    /// `messageFwdHeader` sends this outright — it is not behind a flag.
+    /// When the original was written, in unix seconds.
     pub fwd_date: Option<i64>,
     /// The original's id inside the channel it was posted to.
     pub fwd_channel_post: Option<i32>,
-    /// Which album this message belongs to, if it was sent as one. Without it a
-    /// set of photos sent together is N unrelated messages.
+    /// The album this message belongs to.
     pub grouped_id: Option<i64>,
     pub via_bot_id: Option<i64>,
-    /// The disappearing-message timer, and so the only account this archive can
-    /// give of why a conversation has holes.
+    /// The disappearing-message timer.
     pub ttl_period: Option<i32>,
-    /// The FRAGMENT a reply quoted, when it answered part rather than all.
+    /// The fragment a reply quoted, when it answered part of its target.
     pub reply_quote: Option<String>,
-    /// A reply reaching into another conversation, normalised like every peer
-    /// here. Without it the `reply_to_msg_id` looks dangling.
+    /// The conversation a reply's target is in, when it is another one.
     pub reply_to_peer_id: Option<i64>,
-    /// The TL constructor's name for a service message's action — the identity,
-    /// where `text` holds only our English rendering of it.
+    /// The TL constructor of a service message's action; `text` is our English
+    /// rendering.
     pub service_action: Option<&'static str>,
     pub call: Option<Call>,
     pub entities: Vec<Entity>,
     pub reactions: Reactions,
 }
 
-/// Fold one of Telegram's three peer spaces into the single signed space the
-/// archive keys conversations by.
-///
-/// ⚠ The raw `user_id`, `chat_id` and `channel_id` are each unique only WITHIN
-/// their own space, so a raw number is not a conversation. This is the
-/// normalisation every Telegram client uses (and the one the Bot API exposes),
-/// so an id from this archive is the id somebody else's tooling would print.
+/// Fold Telegram's three peer spaces into the one signed space the archive keys
+/// conversations by: the Bot API's normalisation.
 pub fn normalise_peer(peer: &tl::enums::Peer) -> (i64, PeerSpace) {
     match peer {
         tl::enums::Peer::User(u) => (u.user_id, PeerSpace::User),
         tl::enums::Peer::Chat(c) => (-c.chat_id, PeerSpace::Chat),
-        // -100 prepended to the channel id, which is what the constant is: a
-        // channel 1234 becomes -1001234, and no channel can collide with a basic
-        // group because a group's id is far below the offset.
         tl::enums::Peer::Channel(c) => (CHANNEL_ID_OFFSET - c.channel_id, PeerSpace::Channel),
     }
 }
 
-/// The offset that separates channel ids from basic-group ids in the folded
-/// space. Not a magic number: it is "-100" written in front of the id.
+/// "-100" written in front of a channel id: channel 1234 becomes -1001234.
 const CHANNEL_ID_OFFSET: i64 = -1_000_000_000_000;
 
-/// Map a wire message onto a row, or `None` for one that carries nothing to
-/// store.
+/// Map a wire message onto a row, or `None` for one with nothing to store.
 ///
-/// `self_id` is the logged-in account's own user id, and it is a parameter
-/// rather than a lookup because of the rule below — which is the single most
-/// wrong-able thing in this file.
-///
-/// ⚠ A message in a DM usually names no sender. `from_id` is omitted when
-/// Telegram considers it implied, which in a one-to-one chat it always is: the
-/// sender is either you or the person you are talking to, and `out` says which.
-/// Read literally, every incoming DM in this archive would have a NULL sender
-/// and every outgoing one too — which is how a conversation loses the only
-/// column that says who was speaking. In a group or channel `from_id` is
-/// present when there is an author at all, so no such inference is made or
-/// needed there: an anonymous channel post genuinely has no sender.
+/// A DM message omits `from_id`: the sender is `self_id` or the peer, and `out`
+/// says which. Elsewhere a missing `from_id` means no sender, as on an anonymous
+/// channel post.
 pub fn map_message(msg: &tl::enums::Message, self_id: i64) -> Option<Row> {
     match msg {
-        // `messageEmpty` is a hole: a message id Telegram will acknowledge and
-        // has no content for, which is what a deleted message looks like when it
-        // is fetched by id. Nothing to store, and storing a blank row would put
-        // an empty bubble in a conversation.
+        // A hole: what a deleted message looks like when fetched by id.
         tl::enums::Message::Empty(_) => None,
         tl::enums::Message::Message(m) => {
             let (conversation_id, peer_space) = normalise_peer(&m.peer_id);
@@ -326,9 +239,6 @@ pub fn map_message(msg: &tl::enums::Message, self_id: i64) -> Option<Row> {
                 ),
                 is_outgoing: m.out,
                 kind: MsgKind::Message,
-                // An empty body is stored as NULL rather than "": a message with
-                // only a photo said nothing, and the viewer already distinguishes
-                // "no body" from "a body that is blank" (its copied-log rule).
                 text: non_empty(&m.message),
                 media_kind: media.as_ref().map(|f| f.kind),
                 media_size: media.as_ref().and_then(|f| f.size),
@@ -367,26 +277,18 @@ pub fn map_message(msg: &tl::enums::Message, self_id: i64) -> Option<Row> {
                 ),
                 is_outgoing: m.out,
                 kind: MsgKind::Service,
-                // ⚠ DERIVED, not Telegram's words. A service message carries an
-                // action rather than a sentence — the words a Telegram client
-                // shows are that client's, in the reader's language. This label
-                // is ours, in English, and is marked `service` so nobody mistakes
-                // it for something a person typed.
+                // Our English label; Telegram sends an action, not words.
                 text: Some(describe_action(&m.action).to_owned()),
                 media_kind: None,
                 media_size: None,
                 media_mime: None,
                 edited_at: None,
-                // A service message carries neither field: `messageService` has no
-                // `edit_date` and no `edit_hide`.
                 edit_hidden: false,
                 reply_to_msg_id: m.reply_to.as_ref().and_then(reply_target),
-                // `messageService` carries no forward header at all.
                 fwd_from_id: None,
                 fwd_from_name: None,
                 fwd_date: None,
                 fwd_channel_post: None,
-                // Nor an album, a bot, entities or a quote.
                 grouped_id: None,
                 via_bot_id: None,
                 ttl_period: m.ttl_period,
@@ -401,7 +303,7 @@ pub fn map_message(msg: &tl::enums::Message, self_id: i64) -> Option<Row> {
     }
 }
 
-/// Who sent it — see the ⚠ on [`map_message`] for why a DM needs the inference.
+/// Who sent it; see [`map_message`].
 fn sender_of(
     from_id: Option<&tl::enums::Peer>,
     conversation_id: i64,
@@ -423,17 +325,11 @@ fn non_empty(s: &str) -> Option<String> {
 fn reply_target(header: &tl::enums::MessageReplyHeader) -> Option<i32> {
     match header {
         tl::enums::MessageReplyHeader::Header(h) => h.reply_to_msg_id,
-        // A reply to a story is a reply to something this archive does not hold,
-        // so there is no message id to point at.
         tl::enums::MessageReplyHeader::MessageReplyStoryHeader(_) => None,
     }
 }
 
-/// When the forwarded ORIGINAL was written.
-///
-/// ⚠ Not behind a flag: `messageFwdHeader` carries `date:int` outright, so a
-/// forward always knows how old it is and this archive threw that away for every
-/// one of them.
+/// When the forwarded original was written; always present.
 fn fwd_date(header: &tl::enums::MessageFwdHeader) -> i64 {
     match header {
         tl::enums::MessageFwdHeader::Header(h) => i64::from(h.date),
@@ -447,7 +343,6 @@ fn fwd_channel_post(header: &tl::enums::MessageFwdHeader) -> Option<i32> {
     }
 }
 
-/// The FRAGMENT a reply quoted, when it answered part rather than all.
 fn reply_quote(header: &tl::enums::MessageReplyHeader) -> Option<String> {
     match header {
         tl::enums::MessageReplyHeader::Header(h) => h.quote_text.as_deref().and_then(non_empty),
@@ -455,7 +350,7 @@ fn reply_quote(header: &tl::enums::MessageReplyHeader) -> Option<String> {
     }
 }
 
-/// The conversation a reply reached INTO, when it was not this one.
+/// The conversation a reply reached into, when it was not this one.
 fn reply_peer(header: &tl::enums::MessageReplyHeader) -> Option<i64> {
     match header {
         tl::enums::MessageReplyHeader::Header(h) => {
@@ -465,19 +360,12 @@ fn reply_peer(header: &tl::enums::MessageReplyHeader) -> Option<i64> {
     }
 }
 
-/// Every formatted span, with the payload the kinds that have one carry.
-///
-/// ⚠ `offset` and `length` are UTF-16 code units and are passed through
-/// unconverted — see [`Entity`]. Converting here would be the wrong place: the
-/// archive's job is to hold what Telegram said, and a reader that wants Rust
-/// indices has the text to convert against.
+/// Every formatted span, with its payload, offsets unconverted.
 fn entities(list: &[tl::enums::MessageEntity]) -> Vec<Entity> {
     use tl::enums::MessageEntity as E;
     list.iter()
         .map(|e| {
-            // Every arm names its own kind rather than deriving one, because the
-            // string is a STORED identity: a `Debug` spelling could change under
-            // us on a crate upgrade and silently repartition the table.
+            // Spelled out, not derived from `Debug`: the kind is a stored identity.
             let (kind, offset_utf16, length_utf16) = match e {
                 E::Unknown(x) => ("unknown", x.offset, x.length),
                 E::Mention(x) => ("mention", x.offset, x.length),
@@ -500,17 +388,13 @@ fn entities(list: &[tl::enums::MessageEntity]) -> Vec<Entity> {
                 E::CustomEmoji(x) => ("customEmoji", x.offset, x.length),
                 E::Blockquote(x) => ("blockquote", x.offset, x.length),
                 E::InputMessageEntityMentionName(x) => ("inputMentionName", x.offset, x.length),
-                // A span this archive has no name for is still a span, and its
-                // extent is the part worth keeping. `_` rather than an exhaustive
-                // list because the TL schema grows: a new entity kind must not
-                // stop the build of a feed whose job is to keep running.
+                // New TL entity kinds must not break the build.
                 _ => ("other", 0, 0),
             };
             Entity {
                 kind,
                 offset_utf16,
                 length_utf16,
-                // ⚠ The point of the whole table: this url is NOT in the text.
                 url: match e {
                     E::TextUrl(x) => non_empty(&x.url),
                     _ => None,
@@ -532,12 +416,8 @@ fn entities(list: &[tl::enums::MessageEntity]) -> Vec<Entity> {
         .collect()
 }
 
-/// The TL constructor's name for a service action.
-///
-/// ⚠ `describe_action` renders; this IDENTIFIES. The two exist together on
-/// purpose: the phrase is for a reader, the name is for the archive, and the
-/// phrase's `_ => "an event"` arm is exactly why storing only the phrase lost
-/// information that cannot be recovered from it.
+/// The TL constructor's name for a service action; [`describe_action`] renders
+/// it for a reader.
 fn action_name(action: &tl::enums::MessageAction) -> &'static str {
     use tl::enums::MessageAction as A;
     match action {
@@ -566,9 +446,6 @@ fn action_name(action: &tl::enums::MessageAction) -> &'static str {
         A::TopicCreate(_) => "topicCreate",
         A::TopicEdit(_) => "topicEdit",
         A::SetChatWallPaper(_) => "setChatWallPaper",
-        // Same reasoning as `entities`: an unrecognised action must not stop the
-        // feed. Unlike `describe_action`'s "an event", this arm is reached only
-        // for something genuinely new rather than for anything unlisted.
         _ => "other",
     }
 }
@@ -581,7 +458,6 @@ fn call_of(action: &tl::enums::MessageAction) -> Option<Call> {
     use tl::enums::PhoneCallDiscardReason as R;
     Some(Call {
         call_id: c.call_id,
-        // ⚠ `None` is the record of an unanswered call, not a zero.
         duration_s: c.duration,
         reason: c.reason.as_ref().map(|r| match r {
             R::Missed => "missed",
@@ -601,12 +477,8 @@ fn fwd_peer(header: &tl::enums::MessageFwdHeader) -> Option<i64> {
     }
 }
 
-/// A forward's origin in WORDS, for the two cases that have no usable peer.
-///
-/// `from_name` is Telegram's fallback for a sender with forward-privacy on —
-/// there is no peer to normalise, only the string they chose to be known by.
-/// `post_author` names the person who signed a CHANNEL post, which `from_id`
-/// cannot give: that peer is the channel, not the author.
+/// A forward's origin in words: `from_name` for a sender with forward privacy
+/// on, else `post_author`, who signed a channel post.
 fn fwd_name(header: &tl::enums::MessageFwdHeader) -> Option<String> {
     match header {
         tl::enums::MessageFwdHeader::Header(h) => h
@@ -650,18 +522,9 @@ fn reactions(r: &tl::enums::MessageReactions) -> Reactions {
         })
         .collect();
 
-    // ⚠ THE COMPARISON THAT DECIDES WHETHER ANYONE MAY BE RETRACTED. Telegram
-    // samples `recent_reactions` for a message with many reactors, and a sample
-    // that named three of twenty would otherwise read as seventeen people having
-    // taken their reaction back. The tally in `results` is the honest denominator,
-    // so the list is a complete statement exactly when it is no shorter than the
-    // tally — and `>=` rather than `==` because a reactor can appear under more
-    // than one emoji.
-    //
-    // ⚠ An ABSENT `recent_reactions` is not an empty one. It arrives as `None`,
-    // which flattens to no authors and — with any non-zero tally — to `complete:
-    // false`, so nothing is retracted on the strength of a field Telegram simply
-    // did not send.
+    // Complete when the list is no shorter than the tally. `>=` because a reactor
+    // can appear under several emoji. An absent list gives no authors, so it is
+    // never complete while anything is counted.
     let counted: i32 = counts.iter().map(|c| c.cnt).sum();
     let complete = i32::try_from(authors.len()).is_ok_and(|named| named >= counted);
 
@@ -673,9 +536,7 @@ fn reactions(r: &tl::enums::MessageReactions) -> Reactions {
 }
 
 /// Which reaction it was: a unicode emoticon, or a custom emoji's document id.
-///
-/// `reactionEmpty` and paid reactions have neither — for a count that is still a
-/// row worth keeping, and for an author it is still a person worth naming.
+/// `reactionEmpty` and paid reactions have neither.
 fn emoji_of(reaction: &tl::enums::Reaction) -> (Option<String>, Option<i64>) {
     match reaction {
         tl::enums::Reaction::Emoji(e) => (Some(e.emoticon.clone()), None),
@@ -684,23 +545,15 @@ fn emoji_of(reaction: &tl::enums::Reaction) -> (Option<String>, Option<i64>) {
     }
 }
 
-/// What a message's media IS, how big it is, and what type it holds.
+/// What a message's media is, its size and mime, all from the message itself.
 ///
-/// ⚠ Through `grammers_client::media::Media` rather than the raw enum, and that
-/// is what makes the finer answers possible. A sticker, a video, a voice note
-/// and a PDF are all `messageMediaDocument` on the wire; which one it is lives in
-/// the document's ATTRIBUTES. `Media::from_raw` reads them, and it needs no client
-/// — so this layer stays pure and gains `sticker` and a mime type it could not
-/// otherwise see.
-///
-/// ⚠ `size()` AND `mime` COST NO NETWORK REQUEST. They come out of the message
-/// itself, which is what lets the archive record what a download would cost before
-/// anything is downloaded.
+/// Through `grammers_client::media::Media`, which reads the document attributes
+/// that tell a sticker, video or PDF apart; all are `messageMediaDocument` on
+/// the wire.
 fn media_of(media: &tl::enums::MessageMedia) -> MediaFacts {
     use grammers_client::media::Media as M;
     let Some(m) = M::from_raw(media.clone()) else {
-        // `messageMediaEmpty` and media this build of grammers does not model. It
-        // was there, and that is all this can say.
+        // `messageMediaEmpty`, or media this grammers does not model.
         return MediaFacts {
             kind: MediaKind::Other,
             size: None,
@@ -709,17 +562,13 @@ fn media_of(media: &tl::enums::MessageMedia) -> MediaFacts {
     };
     let size = m.size().and_then(|s| i64::try_from(s).ok());
     let (kind, mime) = match &m {
-        // Telegram photos are compressed JPEG — that is what the variant MEANS, so
-        // the mime is knowable without asking.
+        // Telegram photos are always JPEG.
         M::Photo(_) => (MediaKind::Photo, Some("image/jpeg".to_owned())),
         M::Sticker(s) => (
             MediaKind::Sticker,
             s.document.mime_type().map(str::to_owned),
         ),
         M::Document(d) => (
-            // The mime is the honest finer label: a `video/mp4` and a
-            // `application/pdf` are both documents, and the column that separates
-            // them is the one that says so rather than a taxonomy of ours.
             match d.mime_type() {
                 Some(t) if t.starts_with("video/") => MediaKind::Video,
                 Some(t) if t.starts_with("audio/") => MediaKind::Audio,
@@ -732,29 +581,21 @@ fn media_of(media: &tl::enums::MessageMedia) -> MediaFacts {
         M::Geo(_) | M::GeoLive(_) | M::Venue(_) => (MediaKind::GeoPoint, None),
         M::Dice(_) => (MediaKind::Dice, None),
         M::WebPage(_) => (MediaKind::WebPage, None),
-        // `Media` is `#[non_exhaustive]`: a variant grammers adds later lands here
-        // rather than stopping the build, and is recorded as having been something.
+        // `Media` is `#[non_exhaustive]`.
         _ => (MediaKind::Other, None),
     };
     MediaFacts { kind, size, mime }
 }
 
-/// What [`media_of`] found. A struct because the three travel together and a
-/// tuple of two `Option`s at the call site is the shape nobody reads correctly.
+/// What [`media_of`] found.
 pub struct MediaFacts {
     pub kind: MediaKind,
-    /// Bytes a download would take, when Telegram said. `None` for media that is
-    /// not a file at all — a poll has no size.
+    /// Bytes; `None` for media that is not a file, such as a poll.
     pub size: Option<i64>,
     pub mime: Option<String>,
 }
 
-/// An English label for a service action.
-///
-/// Deliberately short and deliberately OURS: see the ⚠ in [`map_message`]. The
-/// list covers what a private archive actually contains; anything else is
-/// recorded as having happened rather than dropped, because a conversation with
-/// silent holes in it is worse than one with a vague line.
+/// An English label for a service action; unlisted ones read "an event".
 fn describe_action(action: &tl::enums::MessageAction) -> &'static str {
     use tl::enums::MessageAction as A;
     match action {

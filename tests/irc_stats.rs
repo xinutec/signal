@@ -1,23 +1,10 @@
-//! `irc_conversation_stats` is maintained by triggers, so the thing under test
-//! is the DATABASE, not a Rust function — nothing here would catch a mistake if
-//! it asserted against application code.
+//! `irc_conversation_stats` is maintained by triggers, so this tests the
+//! database.
 //!
-//! ⚠ NOTHING IS DROPPED AND NOTHING IS CLEANED UP. Every run invents its own
-//! network name, so its conversation is new, its stats row starts absent, and
-//! the absolute numbers below are exact no matter what else is in the database.
-//! That is the same isolation `tests/import_irclogs.rs` uses ("each test uses
-//! its own network tag"), and it is what lets this share one database with that
-//! suite while cargo runs both binaries in parallel.
-//!
-//! Two earlier attempts are worth not repeating: dropping the archive tables
-//! pulled them out from under a concurrent import test, and dropping
-//! `schema_version` to force a migration replay left the shared database
-//! permanently broken (the replayed `ALTER TABLE`s hit columns that were still
-//! there). Creating a second database instead is refused by the gate's
-//! least-privilege `signal` user, which is confined to one.
-//!
-//! Skips when `SIGNAL_TEST_DATABASE_URL` is unset, the same convention as the
-//! rest of the suite.
+//! Nothing is cleaned up: each run invents its own network, so its stats row
+//! starts absent and the numbers are exact beside a concurrent import test.
+//! Dropping tables or `schema_version` breaks the shared database, and the gate's
+//! `signal` user cannot create a second one.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -51,10 +38,7 @@ fn line(line_no: u32, sent_at: &str, kind: &'static str) -> IrcLine {
 #[tokio::test]
 async fn triggers_maintain_the_conversation_stats() {
     let Ok(url) = std::env::var("SIGNAL_TEST_DATABASE_URL") else {
-        // ⚠ Skipping locally is a convenience; skipping in CI would be a lie.
-        // A green run that tested nothing is exactly how the triggers would
-        // ship unverified — the failure mode is a PASS, so it has to be made
-        // impossible rather than watched for.
+        // A skip passes, so CI must not skip.
         assert!(
             std::env::var("CI").is_err(),
             "SIGNAL_TEST_DATABASE_URL is unset in CI: the trigger tests would \
@@ -64,10 +48,7 @@ async fn triggers_maintain_the_conversation_stats() {
         return;
     };
 
-    // `connect` applies whatever migrations are outstanding, which is what puts
-    // the table and its triggers there. It does NOT need a replay: if they are
-    // already applied the triggers already exist, and either way what follows
-    // exercises the live ones.
+    // `connect` applies outstanding migrations, triggers included.
     let db = Db::connect(&url).await.expect("migrations apply");
     let pool = MySqlPoolOptions::new()
         .max_connections(2)
@@ -115,10 +96,8 @@ async fn triggers_maintain_the_conversation_stats() {
          the 13:00 notice must not become the conversation's last message"
     );
 
-    // --- THE HINGE: replay must be free --------------------------------------
-    // `irc_tail` re-offers the plugin's whole ring after every restart and the
-    // importer re-reads any file whose mtime moved. If an ignored INSERT IGNORE
-    // fired the trigger, every restart would inflate every count.
+    // --- replay is free -----------------------------------------------------
+    // `irc_tail` and the importer both replay lines routinely.
     let wrote = db
         .insert_irc_lines(
             chan,
@@ -139,9 +118,6 @@ async fn triggers_maintain_the_conversation_stats() {
     );
 
     // --- lines do not arrive in timestamp order ------------------------------
-    // The importer walks files by path, so yesterday's log can land after
-    // today's. A plain assignment would move the conversation backwards in the
-    // list; GREATEST is what stops it.
     db.insert_irc_lines(
         chan,
         &network,
@@ -180,8 +156,7 @@ async fn triggers_maintain_the_conversation_stats() {
     );
 
     // --- the guards refuse what cannot be maintained -------------------------
-    // Scoped to this run's own conversation, so a failure here cannot damage
-    // anything else sharing the database.
+    // Scoped to this run's conversation.
     let deleted = sqlx::query("DELETE FROM irc_messages WHERE conversation_id = ?")
         .bind(chan)
         .execute(&pool)
@@ -205,9 +180,7 @@ async fn triggers_maintain_the_conversation_stats() {
     .await;
     assert!(moved.is_err(), "changing sent_at must be refused");
 
-    // --- but a repair that cannot drift the stats is ALLOWED -----------------
-    // `is_self` has needed correcting in production; refusing it would have made
-    // the guard worse than the drift it prevents.
+    // --- a repair that cannot drift the stats is allowed ---------------------
     sqlx::query("UPDATE irc_messages SET is_self = 1, text = 'fixed' WHERE conversation_id = ?")
         .bind(chan)
         .execute(&pool)

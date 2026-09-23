@@ -1,21 +1,9 @@
-//! The MTProto session, kept in MariaDB.
+//! The MTProto session, kept in MariaDB: auth keys per datacentre, the home
+//! datacentre, the peer cache, and the update state. It is a credential; see the
+//! v20 migration in `db.rs`.
 //!
-//! A Telegram session is four things: the authorisation key per datacentre, which
-//! datacentre is home, a cache of the peers seen so far, and how far through the
-//! update sequence the account has been read. `grammers` asks for them through
-//! the [`Session`] trait and does not care where they live.
-//!
-//! ⚠ This is a credential, not a cache. The row holds a logged-in session:
-//! reading it is reading the account. It lives in the archive's own database
-//! because it is exactly as sensitive as the messages it authorises, it is
-//! covered by their backup, and re-logging-in is rate-limited by Telegram in
-//! hours rather than seconds — so "just delete it and sign in again" is not a
-//! recovery plan. See the v20 migration in `db.rs`.
-//!
-//! ⚠ Why not the storage `grammers` ships. `grammers-session`'s default
-//! feature is a local SQLite file via `libsql`, which drags `bindgen`, `clang-sys`
-//! and a C toolchain into an image that has never needed one. The trait is nine
-//! methods; the dependency was the expensive way to get them.
+//! Not `grammers-session`'s SQLite storage, whose `libsql` dependency needs a C
+//! toolchain in the image.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,13 +17,8 @@ use grammers_session::{BoxFuture, Session, SessionData};
 use serde::{Deserialize, Serialize};
 use sqlx::mysql::MySqlPool;
 
-/// The session as one JSON document.
-///
-/// Deliberately NOT `SessionData` itself: that type does not derive `Serialize`
-/// (only its four components do), and its peer cache is a map keyed by a
-/// bit-packed id — which JSON cannot express as an object key. Storing the peers
-/// as a list instead is also exactly the shape `SessionData::import_to` wants, so
-/// loading is a replay of what was saved rather than a second representation.
+/// The session as one JSON document. Not `SessionData` itself, which does not
+/// derive `Serialize` and keys its peers by an id JSON cannot use as a key.
 #[derive(Serialize, Deserialize)]
 struct Persisted {
     home_dc: i32,
@@ -47,22 +30,14 @@ struct Persisted {
 /// A [`Session`] whose state is a row in `telegram_session`.
 pub struct DbSession {
     data: Mutex<SessionData>,
-    /// Set by every mutating method, cleared by [`DbSession::flush`].
-    ///
-    /// The trait's setters are called on the hot path — `auto_cache_peers` caches
-    /// every peer of every response, so a backfill touches this thousands of
-    /// times a minute — and a database write per call would make the session the
-    /// slowest part of ingesting. A flag plus a periodic flush costs one write
-    /// per interval in which anything changed, and nothing at all in one where
-    /// nothing did.
+    /// Set by every mutating method, cleared by [`DbSession::flush`]. The setters
+    /// run for every peer of every response, too often to write each time.
     dirty: AtomicBool,
 }
 
 #[derive(Debug)]
 pub enum SessionError {
-    /// The lock was poisoned, which means another thread panicked while holding
-    /// the session. Surfaced rather than papered over: the state it was mutating
-    /// is of unknown shape, and continuing would persist that.
+    /// Another thread panicked holding the session; its state is unknown.
     Poisoned,
 }
 
@@ -77,12 +52,7 @@ impl std::fmt::Display for SessionError {
 }
 
 impl DbSession {
-    /// A session with nothing in it: the state a first run starts from.
-    ///
-    /// Public because the tests live in `tests/` and exercise the public API — the
-    /// repository's rule, and it costs nothing here: this IS what [`Self::load`]
-    /// returns when the table holds no row, so a test built on it is testing the
-    /// real starting state rather than a fixture resembling it.
+    /// A session with nothing in it, as [`Self::load`] returns with no row.
     pub fn empty() -> Self {
         Self {
             data: Mutex::new(SessionData::default()),
@@ -95,24 +65,13 @@ impl DbSession {
         self.dirty.load(Ordering::SeqCst)
     }
 
-    /// Claim the change: report whether anything had changed, and mark it handled.
-    ///
-    /// This is the first half of [`Self::flush`] rather than a hook bolted on for
-    /// the tests — the order matters and is stated there. It is public because
-    /// whether this session thinks it has something to write is the one property of
-    /// the store with no observable consequence until much later: a session that
-    /// reports itself dirty forever writes a row every interval for the life of the
-    /// pod, and nothing else would ever say so.
+    /// Report whether anything had changed, and clear the flag. The first half of
+    /// [`Self::flush`].
     pub fn take_dirty(&self) -> bool {
         self.dirty.swap(false, Ordering::SeqCst)
     }
 
-    /// Read the session from the database, or start a fresh one if there is no
-    /// row yet.
-    ///
-    /// A fresh session is not an error and not a warning: it is what the first
-    /// run looks like, and `telegram login` is what turns it into an authorised
-    /// one.
+    /// Read the session from the database, or start empty if there is no row.
     pub async fn load(pool: &MySqlPool) -> Result<Self> {
         let stored: Option<String> =
             sqlx::query_scalar("SELECT data FROM telegram_session WHERE single_row = 1")
@@ -123,11 +82,7 @@ impl DbSession {
             None => SessionData::default(),
             Some(json) => {
                 let p: Persisted = serde_json::from_str(&json)
-                    // ⚠ Not recoverable by starting fresh. A session that fails
-                    // to parse still EXISTS at Telegram's end, and silently
-                    // replacing it with a default would log in again — spending a
-                    // flood wait and orphaning the update state, which is how an
-                    // archive develops a gap it cannot see.
+                    // Fatal: starting fresh would force a rate-limited re-login.
                     .context("telegram_session holds a document this build cannot read")?;
                 let mut data = SessionData {
                     home_dc: p.home_dc,
@@ -149,10 +104,8 @@ impl DbSession {
 
     /// Write the session back if anything has changed since the last flush.
     ///
-    /// Returns whether it wrote. The clear happens BEFORE the write rather than
-    /// after: a mutation that lands during the write then leaves the flag set and
-    /// is picked up by the next flush, where the other order would clear a change
-    /// it had not persisted.
+    /// Returns whether it wrote. The flag is cleared before the write, so a
+    /// mutation during the write is picked up by the next flush.
     pub async fn flush(&self, pool: &MySqlPool) -> Result<bool> {
         if !self.take_dirty() {
             return Ok(false);
@@ -178,11 +131,7 @@ impl DbSession {
         Ok(true)
     }
 
-    /// Whether this session has a logged-in user bound to it.
-    ///
-    /// Asked of the stored state rather than over the network, so a restart can
-    /// tell "never logged in" from "logged in, Telegram unreachable" without
-    /// dialling anybody.
+    /// Whether this session has a logged-in user, from stored state alone.
     pub fn is_authorized(&self) -> Result<bool> {
         Ok(self.self_id()?.is_some())
     }
@@ -207,9 +156,6 @@ impl DbSession {
 }
 
 /// The cached peer that is the logged-in account, if it has been seen.
-///
-/// A free function because both [`DbSession::self_id`] and `Session::peer` need
-/// it and they hold the lock differently.
 fn find_self(data: &SessionData) -> Option<&PeerInfo> {
     data.peer_infos.values().find(|p| {
         matches!(
@@ -222,19 +168,8 @@ fn find_self(data: &SessionData) -> Option<&PeerInfo> {
     })
 }
 
-/// The trait, delegating to the in-memory state and marking it dirty.
-///
-/// Mostly this is `grammers_session::storages::MemorySession` plus persistence,
-/// and staying close to it is deliberate: a divergence in how channel state is
-/// merged would be a bug with no symptom until an update stream skipped
-/// something.
-///
-/// ⚠ Two places diverge on purpose, and both are marked below. `peer` answers
-/// the self-user sentinel, which `MemorySession` does not; and `cache_peer`
-/// decides "changed" by comparing rather than by trusting `extend_info`'s return
-/// value. The first is required of a session that persists (`SqliteSession` does
-/// it too), the second only of one that flushes on a timer. Neither is a
-/// preference.
+/// `grammers_session::storages::MemorySession` plus persistence, differing only
+/// where marked in `peer` and `cache_peer`.
 impl Session for DbSession {
     type Error = SessionError;
 
@@ -266,20 +201,9 @@ impl Session for DbSession {
     fn peer(&self, peer: PeerId) -> BoxFuture<'_, Result<Option<PeerInfo>, SessionError>> {
         Box::pin(async move {
             let data = self.data()?;
-            // ⚠ `PeerId::self_user()` IS NOT A KEY IN THIS MAP, and answering
-            // it is not optional. It is a sentinel outside the id ranges, and
-            // `PeerInfo::id()` never produces it — so a storage that only looks
-            // the argument up returns `None` for "am I logged in?" no matter how
-            // logged in it is. `Client::stream_updates` asks exactly this to
-            // decide whether it needs to fetch a pristine update state, so
-            // getting it wrong makes a signed-in account behave like a fresh one
-            // every time the stream starts.
-            //
-            // The `grammers` storage this one is otherwise modelled on —
-            // `MemorySession` — does NOT handle it, which is what its own
-            // documentation means by "should only be used in very few select
-            // cases". `SqliteSession` does, by looking for the self flag, and
-            // that is what this mirrors.
+            // `PeerId::self_user()` is a sentinel no cached peer has as its id.
+            // `stream_updates` asks it to decide whether the account is logged
+            // in, so it is answered from the self flag, as `SqliteSession` does.
             Ok(if peer == PeerId::self_user() {
                 find_self(&data).cloned()
             } else {
@@ -294,14 +218,7 @@ impl Session for DbSession {
             let mut data = self.data()?;
             match data.peer_infos.get_mut(&peer.id()) {
                 Some(existing) => {
-                    // ⚠ `extend_info`'s bool is NOT "did anything change". It
-                    // reports whether the two infos matched in type and id, so it
-                    // is `true` for every restatement of a peer already known in
-                    // full — and `auto_cache_peers` restates every peer of every
-                    // response, thousands of times during a backfill. Reading it
-                    // as a change signal turns "flush when something changed"
-                    // into "flush on every tick", forever, and the symptom is a
-                    // write rate rather than a wrong answer. Compare instead.
+                    // `extend_info`'s bool reports a type/id match, not a change.
                     let before = existing.clone();
                     existing.extend_info(&peer);
                     if *existing != before {

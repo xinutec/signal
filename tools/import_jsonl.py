@@ -10,8 +10,8 @@ conversations, reactions and attachment metadata into the same tables the live
 ingester uses. Dedupe is on (sender_uuid, server_ts), so it is safe to run
 alongside the live feed and to re-run.
 
-Attachment BYTES are not imported (they live in the export's files/ tree keyed by
-hash); metadata only, matching the live v1 behaviour.
+Attachment bytes are not imported (they live in the export's files/ tree keyed
+by hash); metadata only.
 
 Group threads: the export keys groups by `masterKey`, the live feed by signal-cli's
 derived `groupId`. Pass `--groups-json=FILE` (the `GET /v1/groups/<number>` output)
@@ -65,19 +65,12 @@ def main():
     dry = "--dry-run" in opts
     limit = next((int(o.split("=")[1]) for o in opts if o.startswith("--limit=")), None)
     self_uuid = os.environ["SELF_UUID"]
-    # Own number: caller-supplied, never a literal here — this repo is public.
-    # Empty is not "absent": a blank self phone would silently NULL out the one
-    # recipient row that identifies Pippijn, so refuse it rather than degrade.
+    # Caller-supplied, since this repo is public. A blank one would erase the
+    # recipient row that identifies Pippijn, so it is refused.
     self_phone = norm_phone(os.environ["SELF_PHONE"].strip())
     if not self_phone:
         sys.exit("SELF_PHONE is empty; set it to your own number in E.164 form (+…)")
 
-    # The export keys a group by its `masterKey`, but the live ingester keys it by
-    # signal-cli's derived `groupId` (the groups-API `internal_id`) — different
-    # values. To land history in the SAME thread as the live feed, pass the groups
-    # list (--groups-json, the `GET /v1/groups/<number>` output) and we map each
-    # group to its groupId by NAME. Without it, groups fall back to the masterKey
-    # key and won't unify until tools/reconcile_groups.py is run.
     groups_json = next((o.split("=", 1)[1] for o in opts if o.startswith("--groups-json=")), None)
     name_to_gid = {}
     if groups_json:
@@ -148,18 +141,12 @@ def main():
     def upsert_contact(u):
         if dry or not u or not (u.get("uuid")):
             return
-        # ⚠ `display_name` is the column the archive reads; `profile_name` is its
-        # old name, still written while the viewer's deployed pod expects it (see
-        # the v41 migration). A historical import deliberately does NOT open a
-        # `contact_names` chapter: it carries no date for when the name began, and
-        # inventing "now" for a 2021 export would put today's timestamp on a name
-        # somebody wore five years ago.
+        # No `contact_names` row: the export does not say when a name began.
         cur.execute(
-            "INSERT INTO contacts (uuid, phone, profile_name, display_name) VALUES (%s,%s,%s,%s) "
+            "INSERT INTO contacts (uuid, phone, display_name) VALUES (%s,%s,%s) "
             "ON DUPLICATE KEY UPDATE phone=COALESCE(VALUES(phone),phone), "
-            "profile_name=COALESCE(VALUES(profile_name),profile_name), "
             "display_name=COALESCE(VALUES(display_name),display_name)",
-            (u["uuid"], u.get("phone"), u.get("name"), u.get("name")))
+            (u["uuid"], u.get("phone"), u.get("name")))
 
     # seed all contacts up front
     for r in recipients.values():
@@ -244,9 +231,9 @@ def main():
                     else:
                         stats["dups"] += 1
 
-                    # Edit history: the original (oldest revision) is the anchor
-                    # (edited=1); each later version links to it via edit_of_ts.
-                    # Runs regardless of dup so a re-import backfills edits.
+                    # The oldest revision is the anchor (edited=1); later ones
+                    # link to it via edit_of_ts. Runs for duplicates too, so a
+                    # re-import backfills edits.
                     revs = sorted(
                         (r for r in (item.get("revisions") or []) if r.get("standardMessage")),
                         key=lambda r: int(r.get("dateSent", 0)))

@@ -2,21 +2,14 @@
 #!nix-shell -i python3 -p "python3.withPackages(ps: [ps.pymysql])"
 """Import the Google Chat archive into its OWN tables in the signal MariaDB.
 
-Google Chat and Signal are different enough (aggregated emoji-count reactions vs
-Signal's per-author reaction events, Google message threading, numeric sender ids)
-that they get SEPARATE `gchat_*` tables rather than being forced into the Signal
-schema. They share the database only.
-
-Source is the decoded archive produced by ~/Code/gchat-archive (NOT a Takeout):
+Source is the decoded archive produced by ~/Code/gchat-archive (not Takeout):
 each `conversations/<group_id>.json` has {group_id, name, message_count, messages[]},
 and each message has {msg_id, thread_id, sender_id, sender_name, text, ts, ts_raw,
 reactions[{emoji, count, reactors[{id, name}]}]}. `sender_name` carries a trailing
 " (you)" for self.
 
-⚠ `reactors` is the ONLY record of who reacted — Google Chat's `list_topics`
-gives a reaction as `[emoji, count]` and never an author, so the names come from
-a second rpc sync.py replays and merges into this export. It is budget-capped per
-run, so a reaction with no `reactors` means "not resolved yet", never "nobody".
+`reactors` comes from a second rpc sync.py replays per reacted message; a
+reaction without it is unresolved, not unreacted.
 
 Idempotent: messages dedupe on (group_id, msg_id) via INSERT IGNORE; conversation
 names and reaction counts are upserted, so re-running picks up a fresh export.
@@ -64,14 +57,8 @@ DDL = [
         mime       VARCHAR(128) NULL,
         width      INT NULL,
         height     INT NULL,
-        -- ⚠ **NOT A UUID, AND 64 WAS TOO NARROW.** Google Chat synthesises this
-        -- id and it can be FILENAME-DERIVED: one attachment in the archive
-        -- carries 138 characters of Windows path ending in `.pdf972130`. At
-        -- VARCHAR(64) it was silently truncated on insert — the importer's
-        -- session had no strict mode, so no error — and the row could then no
-        -- longer be found by its own id. Worse, `UNIQUE (message_id, uuid)`
-        -- means two long ids on one message would collide at 64 characters and
-        -- the second INSERT would be dropped rather than refused.
+        -- Not a UUID: Google Chat can derive it from a file name, well over 64
+        -- characters, and the session has no strict mode to refuse truncation.
         uuid       VARCHAR(255) NULL,
         token      TEXT NULL,
         hash1      VARCHAR(128) NULL,
@@ -125,7 +112,7 @@ def main():
         for stmt in DDL:
             cur.execute(stmt)
 
-    # What the fetcher managed to pull, by the same key it wrote.
+    # What fetch_attachments.py pulled, by the key it wrote.
     stored = {}
     by_msg = os.path.join(os.path.dirname(conv_dir), "attachments", "by_message.json")
     if os.path.exists(by_msg):
@@ -165,11 +152,8 @@ def main():
                 continue
 
             cur.execute(
-                # ⚠ `reply_to_msg_id` is NOT `thread_id`. A topic id says which
-                # conversation a message belongs to; this says which MESSAGE it
-                # answers. Chat DMs have no topics and do have quote-replies, which
-                # is exactly why reading one as the other concluded — wrongly —
-                # that DMs carried no reply information at all.
+                # Not `thread_id`: that is the topic; this is the message
+                # answered. DMs have quote-replies but no topics.
                 "INSERT IGNORE INTO gchat_messages "
                 "(group_id, msg_id, thread_id, reply_to_msg_id, sender_id, sender_name, "
                 " is_self, ts_us, sent_at, text) "
@@ -187,20 +171,9 @@ def main():
                             (gid, msg_id))
                 message_id = cur.fetchone()[0]
 
-            # ⚠ THE PICTURES, WHICH THIS ARCHIVE HAD NEVER RECORDED AT ALL.
-            # A Google Chat message is a 39-element array and the capture read six
-            # indices; attachments are at 10. 326 of 7,042 messages carry one —
-            # and only 20 of those are wordless, so the other 306 rendered as
-            # ordinary text messages with a caption and no picture. Nothing said a
-            # picture had been there.
-            #
-            # ⚠ THE BYTES ARE NOT HERE AND THIS ROW CANNOT FETCH THEM. The
-            # client mints a `lh3.googleusercontent.com/chat_attachment/AP1Ws4…`
-            # URL at render time from `token`; that URL appears nowhere in the
-            # capture, and it answers 403 without Pippijn's session. So this table
-            # records that a picture EXISTED, who sent it, when, its name and its
-            # dimensions — and the two content hashes, which are the only way a
-            # byte stream obtained later could ever be matched back to it.
+            # Attachments. The bytes need Pippijn's session: the client mints the
+            # download URL from `token` at render time. The hashes match bytes
+            # fetched later back to their row.
             for a in m.get("attachments") or []:
                 stats["attachments"] += 1
                 cur.execute(
@@ -212,19 +185,10 @@ def main():
                     (message_id, a.get("name"), a.get("mime"), a.get("width"),
                      a.get("height"), a.get("uuid"), a.get("token"),
                      a.get("hash1"), a.get("hash2")))
-                # ⚠ The bytes, if `fetch_attachments.py` has them. Keyed on
-                # (group, message, uuid) — the attachment's identity in the
-                # archive — because a file that cannot name its message is a file
-                # the viewer can only guess about, and guessing hangs the wrong
-                # photo on the wrong message.
+                # The bytes, if fetched, keyed on (group, message, uuid).
                 held = stored.get(f"{gid}\t{msg_id}\t{a.get('uuid')}")
                 if held:
-                    # ⚠ `<=>`, NOT `=`. 58 of this archive's 326 attachments
-                    # have NO uuid, and `uuid = NULL` is never true — so a plain
-                    # `=` silently updated nothing for every one of them and the
-                    # pictures stayed unreachable while the import reported
-                    # success. `<=>` is the NULL-safe comparison and matches the
-                    # row the manifest is talking about.
+                    # `<=>`: some attachments have no uuid.
                     cur.execute(
                         "UPDATE gchat_attachments SET stored_path=%s "
                         "WHERE message_id=%s AND uuid <=> %s",
@@ -240,17 +204,8 @@ def main():
                     "ON DUPLICATE KEY UPDATE cnt=VALUES(cnt)",
                     (message_id, emoji, int(r.get("count") or 0)))
 
-                # ⚠ WHO reacted, which `list_topics` does NOT give. A reaction
-                # arrives as [emoji, count]; the names come from a second rpc that
-                # gchat-archive's sync.py replays per reacted message and merges
-                # into this same export as `reactors: [{id, name}]`.
-                #
-                # ⚠ AN ABSENT `reactors` IS NOT "NOBODY REACTED". That replay
-                # is budget-capped per run and carries an unfinished backlog on
-                # purpose, so most reaction groups have no names yet and running
-                # the sync again resolves more. Rows are therefore only ever
-                # ADDED here — never cleared to match a short list, which would
-                # discard on every import what the previous one had learned.
+                # Who reacted. Rows are only added: an absent or short
+                # `reactors` is unresolved, not a retraction.
                 for who in (r.get("reactors") or []):
                     rid = who.get("id") if isinstance(who, dict) else who
                     if not rid:

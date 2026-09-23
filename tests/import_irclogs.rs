@@ -1,23 +1,11 @@
-//! End-to-end tests for the importer's INCREMENTAL behaviour.
+//! End-to-end tests of the importer's incremental reads, driving the real
+//! binary against a real MariaDB. A file wrongly marked as read loses its new
+//! lines without any error, so the contract between reading, writing and
+//! recording is what is tested.
 //!
-//! These drive the real `import_irclogs` binary against a real MariaDB, because
-//! what is being tested is not a function — it is the contract between what the
-//! binary decides to read, what it writes, and what it records having read. A
-//! unit test of the comparison would pass while the thing that matters (a line
-//! arriving and never being imported) went wrong.
-//!
-//! ⚠ The failure mode this guards is SILENT DATA LOSS. Every other bug in
-//! this importer is loud: a parse failure is reported, a duplicate is refused by
-//! the unique key, a connection error stops the run. A file wrongly marked as
-//! already-read produces no error, no warning and no row — the message simply is
-//! not in the archive, and nothing ever looks at that file again.
-//!
-//! They run when `SIGNAL_TEST_DATABASE_URL` points at a *throwaway* database and
-//! are skipped otherwise. Each test uses a network tag of its own, unique to the
-//! test AND to the run (see [`tag`]), so the rows and the `irc_import_state` keys
-//! of one collide with neither another test's nor an earlier run's. They are safe
-//! to run in parallel and safe to run twice. NEVER point this at the real signal
-//! database.
+//! Runs when `SIGNAL_TEST_DATABASE_URL` names a throwaway database. Each test
+//! uses a network tag unique to it and to the run (see [`tag`]), so tests run
+//! in parallel and repeatedly. Never point this at the real signal database.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -25,9 +13,8 @@ use std::process::Command;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// `mysql://user:pass@host:port/name` split into the five variables the binary
-/// reads from the environment. None when the variable is unset, which is what
-/// makes these tests skip rather than fail on a machine with no database.
+/// `mysql://user:pass@host:port/name` split into the binary's five variables,
+/// or `None` to skip.
 fn db_env() -> Option<Vec<(&'static str, String)>> {
     let url = std::env::var("SIGNAL_TEST_DATABASE_URL").ok()?;
     let rest = url.strip_prefix("mysql://")?;
@@ -44,23 +31,9 @@ fn db_env() -> Option<Vec<(&'static str, String)>> {
     ])
 }
 
-/// A network tag unique to `base` *and* to this run.
-///
-/// ⚠ UNIQUE PER TEST IS NOT ENOUGH — IT HAS TO BE UNIQUE PER RUN. The tags
-/// used to be constants, which kept the five tests out of each other's way and
-/// did nothing about the run before. A second `cargo test` against the same
-/// database then failed four of five: the rows are still there, so the dedupe key
-/// refuses them, and `irc_import_state` still holds the `rel_path` — which embeds
-/// the tag — so the importer reports `0 log files read` where the test wants 2
-/// rows written. Green on a fresh database and red on a used one is worse than
-/// either, because it reads as a bug in whatever was being changed at the time.
-///
-/// Dropping the rows instead is not on offer: `trg_irc_stats_bd` refuses a DELETE
-/// on `irc_messages` by design, so nothing here can clean up after itself and
-/// every run has to land somewhere new.
-///
-/// One nonce for the whole process, so every row a single run wrote shares a
-/// suffix and can be read back as one batch by hand.
+/// A network tag unique to `base` and to this run. Rows cannot be cleaned up
+/// (`trg_irc_stats_bd` refuses DELETE), and `irc_import_state` keys on a path
+/// containing the tag, so a reused tag would fail the next run.
 fn tag(base: &str) -> String {
     static NONCE: OnceLock<String> = OnceLock::new();
     let nonce = NONCE.get_or_init(|| {
@@ -68,9 +41,7 @@ fn tag(base: &str) -> String {
             .duration_since(UNIX_EPOCH)
             .expect("clock before the epoch")
             .as_nanos();
-        // The pid alone repeats across boots and the clock alone can repeat under
-        // a coarse timer; together they are unique in practice. `network` is
-        // VARCHAR(64) and this is well under it.
+        // Pid and clock together; well within `network`'s VARCHAR(64).
         format!("{}-{nanos}", std::process::id())
     });
     format!("{base}-{nonce}")
@@ -114,7 +85,7 @@ fn import(root: &Path, extra: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-/// irssi's own format: `HH:MM < nick> text`, the padded form a channel writes.
+/// irssi's padded channel form, `HH:MM < nick> text`.
 const DAY_ONE: &str = "10:00 < alice> first\n10:01 < alice> second\n";
 
 #[test]
@@ -149,8 +120,7 @@ fn an_appended_line_is_imported_and_only_that_file_is_read() {
     let root = tree(tag, DAY_ONE);
     import(&root, &["--apply"]);
 
-    // A second day, so the tree holds a file that must NOT be re-read alongside
-    // the one that must.
+    // A second day, which must not be re-read.
     let other = root.join(tag).join("2020").join("01").join("02");
     fs::create_dir_all(&other).unwrap();
     fs::write(other.join("#chan.log"), DAY_ONE).unwrap();
@@ -158,8 +128,7 @@ fn an_appended_line_is_imported_and_only_that_file_is_read() {
     assert!(second.contains("1 log files read"), "{second}");
     assert!(second.contains("wrote 2 rows"), "{second}");
 
-    // Now append to the FIRST day, the case that actually happens: irssi adds a
-    // line to today's file, which the archive has already read once.
+    // Append to the first day, as irssi does to today's file.
     let mut text = DAY_ONE.to_string();
     text.push_str("10:02 < alice> third\n");
     fs::write(log_path(&root, tag), &text).unwrap();
@@ -199,12 +168,8 @@ fn all_re_reads_files_that_have_not_changed() {
 async fn stored_text(tag: &str) -> Vec<String> {
     let url = std::env::var("SIGNAL_TEST_DATABASE_URL").unwrap();
     let pool = sqlx::MySqlPool::connect(&url).await.unwrap();
-    // ⚠ The `query_as` TUPLE form, not `query_scalar`. `irc_messages.text` is
-    // NULLable (an event line — a join, a mode change — has no text), and
-    // dev-lint's DL-SQLX-ROW-TYPES peels one `Option` off a `query_scalar`
-    // target assuming it is the collection wrapper, so
-    // `query_scalar::<_, Option<String>>` reads to it as a bare `String` and no
-    // turbofish can satisfy it. The tuple form is judged correctly.
+    // The tuple form: dev-lint's DL-SQLX-ROW-TYPES misreads
+    // `query_scalar::<_, Option<String>>` over the NULLable `text`.
     let rows: Vec<(Option<String>,)> = sqlx::query_as(
         "SELECT m.text FROM irc_messages m
            JOIN irc_conversations c ON c.id = m.conversation_id
@@ -217,15 +182,8 @@ async fn stored_text(tag: &str) -> Vec<String> {
     rows.into_iter().map(|(t,)| t.unwrap_or_default()).collect()
 }
 
-/// ⚠ THE CORRUPTION THIS PREVENTS IS PERMANENT. `rsync` copies a log file
-/// whatever irssi is doing to it, so a snapshot can end halfway through a line.
-/// Imported, that fragment takes the `line_no` the finished line will have — and
-/// the dedupe key then refuses the real one forever. No error, no warning, and
-/// no run that could ever correct it; the archive would simply hold half a
-/// sentence.
-///
-/// It is also why the cadence matters: at 24 runs a day this is rare, and the
-/// whole point of #880 is to run it far more often.
+/// A snapshot can end mid-line. Imported, the fragment would take the finished
+/// line's `line_no`, and the dedupe key would refuse the real line forever.
 #[tokio::test]
 async fn a_half_written_last_line_is_left_until_it_is_finished() {
     if db_env().is_none() {
@@ -269,9 +227,7 @@ fn a_dry_run_records_nothing_so_the_next_real_run_still_reads_the_file() {
     assert!(dry.contains("1 log files read"), "{dry}");
     assert!(dry.contains("DRY RUN"), "{dry}");
 
-    // ⚠ THE DATA-LOSS CASE. If the dry run had recorded progress, this run would
-    // skip the file and its lines would never be imported by anything — the
-    // archive would be missing them with no error anywhere.
+    // Had the dry run recorded progress, this run would skip the file forever.
     let real = import(&root, &["--apply"]);
     assert!(real.contains("1 log files read"), "{real}");
     assert!(real.contains("wrote 2 rows"), "{real}");

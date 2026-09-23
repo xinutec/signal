@@ -1,14 +1,11 @@
 //! Pure parsing of signal-cli-rest-api receive frames into archive actions.
 //!
-//! This module has NO I/O — it turns a `serde_json::Value` frame into a
-//! `Parsed` describing what to write, so the mapping logic (the bug-prone part)
-//! is unit-testable without a database. `main.rs` executes the resulting action.
+//! No I/O: a `serde_json::Value` frame becomes a `Parsed` describing what to
+//! write, which `main.rs` executes.
 
 use serde_json::Value;
 
-/// Which kind of conversation a message belongs to. Replaces a stringly-typed
-/// `"dm"`/`"group"`: the DB `conversations.type` ENUM and every call site now
-/// share one type, so a typo'd kind is a compile error, not a runtime one.
+/// Which kind of conversation a message belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadKind {
     Dm,
@@ -26,10 +23,8 @@ impl ThreadKind {
 }
 
 /// A conversation identity. A DM carries the other party's id (ACI UUID or
-/// E.164); a group carries its group id. The `dm:`/`group:` storage prefix is
-/// defined ONLY here (`Display`), and the kind is *derived* from the variant —
-/// so a thread id and its kind can never disagree, and the prefix can't be
-/// typo'd at a call site.
+/// E.164); a group carries its group id. `Display` gives the stored
+/// `dm:`/`group:` form.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThreadId {
     Dm(String),
@@ -74,21 +69,15 @@ pub struct Attachment {
 pub struct Message {
     pub thread_id: ThreadId,
     pub sender: String,
-    /// ⚠ THE SENDER'S CLOCK. `envelope.timestamp` is minted by the sending
-    /// device and doubles as the message's identity, so a phone with a wrong
-    /// clock files its words under a wrong hour and nothing can correct it.
+    /// `envelope.timestamp`: the sending device's clock, and the message's
+    /// identity.
     pub server_ts: i64,
-    /// When SIGNAL received it — the only timestamp here no sender can set.
+    /// When Signal's server received it.
     pub server_received_ts: Option<i64>,
-    /// When Signal handed it to this device. The gap from `server_received_ts`
-    /// is how long it sat queued, which is what a reconnect after downtime looks
-    /// like from the inside.
+    /// When Signal's server delivered it to this device.
     pub server_delivered_ts: Option<i64>,
-    /// The disappearing-message timer in force when this was sent.
-    ///
-    /// ⚠ `None` AND `Some(0)` ARE DIFFERENT STATEMENTS. Absent means the
-    /// frame carried no timer at all; zero means the timer was explicitly turned
-    /// OFF, which is a thing somebody did. Collapsing them would lose the second.
+    /// The disappearing-message timer. `None` means the frame carried none;
+    /// `Some(0)` means it was turned off.
     pub expires_in_seconds: Option<i32>,
     pub body: Option<String>,
     pub quote_target_ts: Option<i64>,
@@ -125,13 +114,9 @@ pub enum Action {
         sender: String,
         target_ts: i64,
     },
-    /// ⚠ THE ONLY THING SIGNAL SAYS ONCE. A receipt is an EVENT with its own
-    /// clock — who, which messages, delivered/read/viewed, and when — not a
-    /// high-water mark like Telegram's `read_outbox_max_id`. Nothing restates it,
-    /// so a receipt that is not stored as it arrives is gone. See migration v37.
+    /// Delivery, read or viewed; see migration v40.
     Receipt(Receipt),
-    /// One WebRTC signalling frame of a call. Stored raw rather than folded into
-    /// a duration — see [`CallEvent`].
+    /// One WebRTC signalling frame of a call.
     Call(CallEvent),
     Skip,
 }
@@ -139,15 +124,12 @@ pub enum Action {
 /// Delivery, read or viewed, for one or more messages at once.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Receipt {
-    /// Who acknowledged. For `syncMessage.readMessages` this is US, reading on
-    /// another device, which is why the column is an author rather than a peer.
+    /// Who acknowledged; us, for `syncMessage.readMessages`.
     pub author: String,
     pub kind: ReceiptKind,
-    /// Signal's own `when`, in milliseconds — when the receipt was generated,
-    /// not when we saw it.
+    /// Signal's own `when`, in milliseconds.
     pub when_ts: i64,
-    /// ⚠ One receipt acknowledges MANY messages. Flattening to one row per
-    /// target is what makes the table answerable per message.
+    /// Every message this receipt acknowledges.
     pub targets: Vec<i64>,
 }
 
@@ -168,19 +150,7 @@ impl ReceiptKind {
     }
 }
 
-/// One frame of a call's signalling.
-///
-/// ⚠ RAW EVENTS, NOT A DURATION, AND THAT IS DELIBERATE. Telegram hands over
-/// a finished call as one service message with `duration` and `reason` already
-/// computed. Signal hands over WebRTC signalling: an offer, maybe an answer,
-/// maybe a busy, maybe a hangup, all sharing a `call_id`, each arriving as its
-/// own envelope with its own timestamp. A duration is offer→hangup — but only if
-/// both frames reached THIS device, and whether they do depends on where the
-/// call was answered.
-///
-/// So this stores what arrived. Computing a duration from events we have not yet
-/// seen in the wild would be inventing a state machine and then trusting it; the
-/// events are the unrecoverable part and can be interpreted later, against data.
+/// One frame of a call's signalling, uninterpreted; see migration v38.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallEvent {
     pub call_id: i64,
@@ -253,16 +223,7 @@ fn thread_of(msg: &Value, dm_peer: &str) -> ThreadId {
     }
 }
 
-/// The two times SIGNAL put on the envelope, which the payload cannot see.
-///
-/// ⚠ THESE ARE THE ONLY TIMESTAMPS NO SENDER CAN SET. `envelope.timestamp`
-/// is minted by the sending device and doubles as the message's identity, so a
-/// wrong clock files a message under a wrong hour and nothing downstream can
-/// correct it. These two are the server's own.
-///
-/// Passed as a pair rather than as two more positional parameters: they are one
-/// fact about one envelope, and a bare `Option<i64>, Option<i64>` at a call site
-/// is two chances to swap them silently.
+/// The Signal server's two timestamps from the envelope, which no sender can set.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ServerTimes {
     pub received: Option<i64>,
@@ -270,9 +231,7 @@ pub struct ServerTimes {
 }
 
 impl ServerTimes {
-    /// Read them off an `envelope`. Absent on frames that carry neither, which
-    /// is why both stay `Option` rather than defaulting to the sender's time —
-    /// a guess here would be indistinguishable from a measurement.
+    /// Read them off an `envelope`.
     fn of(env: &Value) -> Self {
         ServerTimes {
             received: env.get("serverReceivedTimestamp").and_then(Value::as_i64),
@@ -329,18 +288,7 @@ fn payload_action(
 
     let body = match msg.get("message").and_then(Value::as_str) {
         Some(t) => Some(t.to_string()),
-        // ⚠ THIS READ `sticker.emoji`, WHICH SIGNAL-CLI HAS NEVER SENT.
-        // `JsonSticker` is `(String packId, int stickerId)` — checked against the
-        // deployed tag, v0.14.5 — so the lookup always missed, `unwrap_or("")`
-        // turned the miss into a blank, and every sticker in the archive reads
-        // `[sticker]` with a space where the picture should be identified. Three
-        // rows, and nothing in the pipeline could have said so: a field that does
-        // not exist and a field that is empty are the same `None` here.
-        //
-        // The two fields that DO identify it are what Signal uses itself: a pack
-        // and an index within it. They are recorded rather than resolved — naming
-        // the sticker needs the pack manifest, which is a separate fetch, and the
-        // ids keep that possible instead of leaving the body to stand for it.
+        // signal-cli's `JsonSticker` is `(packId, stickerId)`; it has no emoji.
         None if msg.get("sticker").is_some() => {
             let sticker = msg.get("sticker");
             let pack = sticker
@@ -389,9 +337,6 @@ fn payload_action(
         server_ts: ts,
         server_received_ts: times.received,
         server_delivered_ts: times.delivered,
-        // ⚠ Read as i64 then narrowed, because `as_i32` does not exist on
-        // `serde_json::Value` — and a value too large for an INT is dropped
-        // rather than wrapped, since a negative timer is not a shorter one.
         expires_in_seconds: msg
             .get("expiresInSeconds")
             .and_then(Value::as_i64)
@@ -541,20 +486,13 @@ pub fn parse_frame(frame: &Value) -> Parsed {
         };
     }
 
-    // ⚠ BEFORE the syncMessage arm below, because a read receipt synced from
-    // another device arrives INSIDE `syncMessage` and the `sentMessage` arm would
-    // not match it — it would simply fall through to `Skip`, which is how every
-    // receipt since this feed started was lost.
+    // Our own reads, synced from another device, arrive inside `syncMessage`.
     if let Some(reads) = env
         .get("syncMessage")
         .and_then(|s| s.get("readMessages"))
         .and_then(Value::as_array)
         && !reads.is_empty()
     {
-        // ⚠ The AUTHOR here is us. `readMessages` is our own device telling the
-        // others what we have read, so the receipt is ours about somebody else's
-        // message — the mirror of an inbound `receiptMessage`, and the reason the
-        // column is `author_uuid` rather than a peer.
         let me = id_of(env.get("sourceUuid"), env.get("source"));
         let targets: Vec<i64> = reads
             .iter()
@@ -565,8 +503,7 @@ pub fn parse_frame(frame: &Value) -> Parsed {
                 action: Action::Receipt(Receipt {
                     author: me,
                     kind: ReceiptKind::Read,
-                    // No `when` on a sync read; the envelope's own clock is the
-                    // closest honest answer and is what we saw it at.
+                    // A sync read has no `when`; the envelope's clock is closest.
                     when_ts: env.get("timestamp").and_then(Value::as_i64).unwrap_or(0),
                     targets,
                 }),
@@ -582,10 +519,7 @@ pub fn parse_frame(frame: &Value) -> Parsed {
             .and_then(Value::as_array)
             .map(|a| a.iter().filter_map(Value::as_i64).collect())
             .unwrap_or_default();
-        // ⚠ The three flags are NOT exclusive — a single receipt can report both
-        // delivery and read — so this yields the STRONGEST one rather than
-        // matching. Storing only "delivery" for a frame that also said "read"
-        // would record the weaker fact and silently lose the stronger.
+        // The flags can co-occur; keep the strongest.
         let flag = |k: &str| receipt.get(k).and_then(Value::as_bool).unwrap_or(false);
         let kind = if flag("isViewed") {
             Some(ReceiptKind::Viewed)
@@ -620,9 +554,7 @@ pub fn parse_frame(frame: &Value) -> Parsed {
     if let Some(call) = env.get("callMessage") {
         let peer = id_of(env.get("sourceUuid"), env.get("source"));
         let event_ts = env.get("timestamp").and_then(Value::as_i64).unwrap_or(0);
-        // ⚠ `iceUpdateMessages` is deliberately absent: it is transport plumbing,
-        // many frames per call carrying only opaque blobs, and storing it would
-        // bury the four frames that say what happened.
+        // Not `iceUpdateMessages`: opaque transport, many per call.
         let found = [
             ("offerMessage", CallEventKind::Offer),
             ("answerMessage", CallEventKind::Answer),
@@ -667,9 +599,7 @@ pub fn parse_frame(frame: &Value) -> Parsed {
     Parsed::skip()
 }
 
-/// The display name Signal itself would show for a contact.
-///
-/// ⚠ THIS IS SIGNAL-CLI'S OWN PRECEDENCE, NOT A CHOICE MADE HERE. Copied from
+/// The display name Signal itself would show for a contact, by signal-cli's
 /// `ManagerImpl.getContactOrProfileName` at v0.14.7:
 ///
 /// ```text
@@ -679,15 +609,12 @@ pub fn parse_frame(frame: &Value) -> Parsed {
 /// return profile.getDisplayName();
 /// ```
 ///
-/// — and `getDisplayNickname` / `getName` are each `given + " " + family`, falling
-/// back to whichever half is non-empty.
+/// `getDisplayNickname` and `getName` are each `given + " " + family`, or
+/// whichever half is non-empty.
 ///
-/// ⚠ THE DEPLOYED 0.14.5 HAS NO NICKNAME BRANCH, WHICH IS WHY THIS EXISTS. Its
-/// `getContactOrProfileName` goes straight from the system contact name to the
-/// profile name, and that function is what fills `envelope.sourceName` — so a
-/// contact renamed in Signal's own UI arrived here under whatever they call
-/// themselves. `/v1/contacts` serves the nickname at 0.14.5 regardless, so the
-/// fix is to read it rather than to wait for an image.
+/// The deployed 0.14.5 lacks the nickname branch when filling
+/// `envelope.sourceName`, but `/v1/contacts` serves the nickname, so this
+/// applies the newer precedence to it.
 pub fn display_name_of(c: &Value) -> Option<String> {
     let joined = |obj: Option<&Value>, given: &str, family: &str| -> Option<String> {
         let obj = obj?;
@@ -712,9 +639,7 @@ pub fn display_name_of(c: &Value) -> Option<String> {
             .map(str::to_string)
     };
     let nick = c.get("nickname");
-    // `nickname.name` is the single-field form; the UI writes first/last, so the
-    // split is the usual case and the flat one is checked first only because
-    // signal-cli's own `getDisplayNickname` does the same.
+    // The single-field form first, as `getDisplayNickname` does.
     nick.and_then(|n| {
         n.get("name")
             .and_then(Value::as_str)

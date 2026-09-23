@@ -13,7 +13,7 @@ where one already exists. The global UNIQUE keys (messages on (sender_uuid,
 server_ts), reactions on (author_uuid, target_ts, reaction_ts)) are thread-id
 independent, so rekeying can never collide — each logical row exists exactly once.
 
-Get the groups JSON the same way the README's deploy step does:
+Get the groups JSON as in the README's history import:
     NUM=$(curl -s localhost:8080/v1/accounts | sed 's/[][\"]//g')
     curl -s localhost:8080/v1/groups/$NUM > groups.json
 

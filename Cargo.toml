@@ -10,70 +10,35 @@ futures = "0.3"
 # Plaintext ws:// to the in-cluster signal-cli-rest-api — no TLS feature needed.
 tokio-tungstenite = "0.29"
 serde_json = "1"
-# `derive` only: the one typed thing this crate decodes is the irssi plugin's
-# tail reply, where a struct is what makes a missing or renamed field a compile
-# error rather than a silently absent line.
+# `derive`, for the irssi plugin's typed tail reply.
 serde = { version = "1", features = ["derive"] }
-# Plaintext HTTP to signal-cli-rest-api (attachment bytes + group names); no TLS.
-# `stream` is for `bytes_stream()`: attachment blobs are written chunk by chunk,
-# so the pod's peak memory is one chunk rather than the largest file anyone
-# sends it — which is what lets the container carry a memory limit at all.
+# Plaintext HTTP to signal-cli-rest-api; no TLS. `stream` writes attachments
+# chunk by chunk, bounding peak memory.
 reqwest = { version = "0.13", default-features = false, features = ["stream"] }
 # Runtime SQL only; in-cluster MariaDB is plaintext, so no TLS backend feature.
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "mysql"] }
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# Telegram, as a user client rather than a bot: a bot cannot read the chats of
-# the account it belongs to, so an archive of Pippijn's own conversations has to
-# speak MTProto with his own api_id. `grammers` owns that protocol — the DH
-# handshake, AES-IGE, the message containers and the TL schema — for the same
-# reason `signal-cli` owns Signal's: it is the part that rots silently when the
-# other side bumps a layer, and the part whose bugs are unobservable from here.
-# What is OURS is the binary that turns its types into archive rows.
+# Telegram's MTProto, as a user client.
 grammers-client = "0.10.0"
-# Held, not used directly: grammers-crypto 0.10 asks for `^2.0.0-rc0`, which
-# admits rc1, and rc1 moved to num-bigint 0.5 and made `safe_prime::check`
-# return a Result — grammers-crypto 0.10.0 does not compile against it. A
-# direct `=` pin is the one thing cargo unifies a transitive range with, so
-# `cargo update` stays on rc0 until grammers releases against rc1.
+# Not used directly. grammers-crypto 0.10 asks for `^2.0.0-rc0`, which admits
+# rc1, and grammers-crypto does not compile against rc1. This `=` pin holds
+# `cargo update` on rc0.
 glass_pumpkin = "=2.0.0-rc0"
-# ⚠ `default-features = false` is load-bearing, and the default is what this
-# repository is built to avoid. `grammers-session`'s default feature is
-# `sqlite-storage`, which is `libsql` → `libsql-ffi` → `bindgen` → `clang-sys`:
-# a C toolchain and libclang in the build image, for a local SQLite file this
-# archive does not want. The session lives in MariaDB beside the messages it
-# authorises (`telegram_session`, src/telegram/session.rs), so the storage that
-# dependency would provide has nothing to store.
-#
-# `serde` is what replaces it: the four pieces of session state each derive
-# Serialize under that feature, so our own `Session` impl can persist them.
+# The default `sqlite-storage` feature needs a C toolchain and libclang; the
+# session lives in MariaDB instead (src/telegram/session.rs), persisted via
+# `serde`.
 grammers-session = { version = "0.10.0", default-features = false, features = [
   "serde",
 ] }
-# ⚠ **`Cargo.lock` PINS `glass_pumpkin` TO 2.0.0-rc0, AND A `cargo update` WILL
-# BREAK THE BUILD BY UNDOING IT.** `grammers-crypto` asks for `2.0.0-rc0`, and
-# cargo reads a pre-release requirement as "this rc or a later one", so it
-# resolves 2.0.0-rc1 — which changed `safe_prime::check` to return a `Result` and
-# does not compile against grammers 0.10.0. The failure is loud and names
-# `grammers-crypto/src/two_factor_auth.rs`, so this note is here to save the
-# diagnosis rather than the build:
-#     cargo update -p glass_pumpkin --precise 2.0.0-rc0
-# Not pinnable from this file without taking a direct dependency on a crate this
-# code never calls, which would be a worse lie than a lockfile entry.
-#
-# The sender pool: the thing that actually holds the connections. It is a
-# separate crate from the client because the client is a handle to it, and the
-# binary needs both — one to spawn the runner, one to make calls.
+# The sender pool that holds the connections; the client is a handle to it.
 grammers-mtsender = "0.10.0"
-# The raw TL types. `map.rs` maps `tl::enums::Message` — a plain data enum with
-# no client attached — which is what lets the whole mapping be unit-tested with
-# no network and no login, exactly as `parse.rs` is for Signal.
+# The raw TL types `map.rs` maps.
 grammers-tl-types = "0.10.0"
 sha2 = "0.11"
 
-# The fleet's `[lints]` baseline (dev-lint docs/standards.md §7), so clippy is
-# no weaker here than anywhere else. Extensions are argued here, per crate.
+# The fleet's `[lints]` baseline (dev-lint docs/standards.md §7).
 [lints.rust]
 unsafe_code = "forbid"
 

@@ -52,10 +52,7 @@ fn outgoing_sync_dm_keys_thread_by_destination() {
             thread_id: ThreadId::Dm("u2".into()),
             sender: "me".into(),
             server_ts: 2000,
-            // ⚠ This fixture's envelope carries no server times, so they stay
-            // `None` — asserted rather than elided, because the alternative
-            // (falling back to the sender's clock) would look identical in a
-            // struct literal that simply omitted them.
+            // This envelope carries no server times.
             server_received_ts: None,
             server_delivered_ts: None,
             expires_in_seconds: None,
@@ -154,15 +151,8 @@ fn outgoing_remote_delete_marks_self_sender() {
     );
 }
 
-/// ⚠ THIS TEST INVENTED THE FIELD IT WAS TESTING, AND SO PASSED FOR THREE
-/// MONTHS WHILE THE ARCHIVE LOST EVERY STICKER'S IDENTITY. The fixture said
-/// `{"emoji": "🎉"}`; signal-cli's `JsonSticker` is `(String packId, int
-/// stickerId)` and has never carried an emoji. A mock cannot contradict the thing
-/// it stands for — so the only check on the shape was this file agreeing with
-/// itself, and the live rows read `[sticker]` with a blank where the emoji went.
-///
-/// The fixture is now the record signal-cli actually sends, copied from the
-/// deployed tag (v0.14.5) rather than from memory.
+/// The fixture is the record signal-cli sends: `JsonSticker` is
+/// `(String packId, int stickerId)`, with no emoji.
 #[test]
 fn sticker_only_message_names_the_pack_and_the_index() {
     let f = json!({"envelope": {
@@ -178,10 +168,6 @@ fn sticker_only_message_names_the_pack_and_the_index() {
     }
 }
 
-/// ⚠ AND A STICKER WITH NEITHER FIELD STILL HAS TO SAY A STICKER WAS SENT.
-/// The old code reached that wording by accident, through a missing field and an
-/// `unwrap_or("")`; it is a deliberate branch now, so the marker cannot quietly
-/// become the thing it means for an unrecognised shape.
 #[test]
 fn a_sticker_with_no_ids_is_still_marked() {
     let f = json!({"envelope": {
@@ -230,15 +216,7 @@ fn jsonrpc_params_wrapped_envelope_is_accepted() {
     }
 }
 
-/// ⚠ THIS TEST USED TO SAY RECEIPTS WERE SKIPPED, AND THAT WAS NOT A
-/// DECISION. The arm had simply never been written, and the name made the
-/// omission read as intent — it went on passing after receipts started being
-/// stored, because its receipt carried no `timestamps` and so skipped for an
-/// entirely different reason. A green test asserting the wrong rule is worse
-/// than a missing one.
-///
-/// What is actually skipped: typing, which is not a fact about a conversation,
-/// and a frame this parser does not recognise. Receipts have their own tests.
+/// Typing is skipped, and so is a frame the parser does not recognise.
 #[test]
 fn typing_and_unknown_frames_are_skipped() {
     let typing = json!({"envelope": {"sourceUuid": "u1", "typingMessage": {"action": "STARTED"}}});
@@ -265,7 +243,7 @@ fn incoming_edit_maps_to_edit_action() {
             is_outgoing: false,
         })
     );
-    // an incoming edit still refreshes the contact + DM name
+    // An incoming edit still refreshes the contact and DM name.
     assert_eq!(
         p.contact,
         Some(Contact {
@@ -328,8 +306,7 @@ fn timestamp_falls_back_to_data_message_timestamp() {
 
 #[test]
 fn message_with_no_timestamp_anywhere_is_skipped() {
-    // No env timestamp and none on the dataMessage: we can't anchor it in time,
-    // so it's skipped rather than stored at ts=0.
+    // No timestamp anywhere: skipped rather than stored at ts=0.
     let f = json!({"envelope": {"sourceUuid": "u1", "dataMessage": {"message": "no ts"}}});
     assert_eq!(parse_frame(&f).action, Action::Skip);
 }
@@ -353,12 +330,7 @@ fn edit_with_no_target_timestamp_is_skipped() {
     assert_eq!(parse_frame(&f).action, Action::Skip);
 }
 
-/// ⚠ THE THREE RECEIPT FLAGS ARE NOT EXCLUSIVE.
-///
-/// A single `receiptMessage` can report delivery AND read at once, so matching
-/// on them in the wrong order stores the weaker fact and loses the stronger —
-/// silently, because a `delivery` row looks perfectly correct on its own. This
-/// asserts the precedence rather than the arms, which is the part that can drift.
+/// One `receiptMessage` can report delivery and read at once; the stronger wins.
 #[test]
 fn a_receipt_reports_the_strongest_thing_it_says() {
     let both = json!({"envelope": {
@@ -387,9 +359,7 @@ fn a_receipt_reports_the_strongest_thing_it_says() {
     };
     assert_eq!(r.kind, ReceiptKind::Delivery);
 
-    // ⚠ A receipt naming nothing is not a receipt about nothing — it is a frame
-    // we cannot attach to any message, and storing it would make a row that no
-    // query can ever reach.
+    // A receipt naming no message cannot be attached to one.
     let empty = json!({"envelope": {
         "sourceUuid": "u1", "timestamp": 5000,
         "receiptMessage": {"when": 4000, "isDelivery": true, "timestamps": []}
@@ -397,11 +367,8 @@ fn a_receipt_reports_the_strongest_thing_it_says() {
     assert_eq!(parse_frame(&empty).action, Action::Skip);
 }
 
-/// ⚠ A read receipt from ANOTHER OF OUR DEVICES arrives inside `syncMessage`,
-/// where the `sentMessage` arm does not match it — so before this existed it
-/// fell through to `Skip` like every other receipt.
-///
-/// The author is US: it is our own device saying what we have read.
+/// Our own read, synced from another device inside `syncMessage`; the author
+/// is us.
 #[test]
 fn reading_on_the_phone_is_a_receipt_from_ourselves() {
     let f = json!({"envelope": {
@@ -422,8 +389,7 @@ fn reading_on_the_phone_is_a_receipt_from_ourselves() {
     );
 }
 
-/// A call is signalling frames sharing an id, not a finished call with a
-/// duration — see `CallEvent`. Each frame is its own row.
+/// Each call signalling frame is its own row.
 #[test]
 fn a_call_arrives_as_the_frames_it_is_made_of() {
     let offer = json!({"envelope": {
@@ -454,9 +420,6 @@ fn a_call_arrives_as_the_frames_it_is_made_of() {
         (42, CallEventKind::Hangup, Some(2))
     );
 
-    // ⚠ Ice updates are transport plumbing and are deliberately NOT stored: many
-    // frames per call carrying opaque blobs, which would bury the four that say
-    // what happened.
     let ice = json!({"envelope": {
         "sourceUuid": "u1", "timestamp": 7100,
         "callMessage": {"iceUpdateMessages": [{"id": 42, "opaque": "y"}]}
@@ -466,19 +429,12 @@ fn a_call_arrives_as_the_frames_it_is_made_of() {
 
 // ---- what Signal would call somebody ---------------------------------------
 
-/// ⚠ THE FIXTURES ARE REAL RECORDS FROM `/v1/contacts`, shapes observed on the
-/// deployed signal-cli on 2026-09-21 — not invented. The last test in this file
-/// to invent a field (`sticker.emoji`) passed for three months while the archive
-/// lost every sticker's identity, because a mock cannot contradict the thing it
-/// stands for.
-///
-/// The ORDER under test is signal-cli's own, from `getContactOrProfileName` at
-/// v0.14.7: nickname, else system contact name, else profile name. The deployed
-/// 0.14.5 lacks the nickname branch, which is exactly why this function exists
-/// rather than the archive just reading `envelope.sourceName`.
+/// The fixtures are real `/v1/contacts` records. The order under test is
+/// signal-cli 0.14.7's `getContactOrProfileName`: nickname, else system contact
+/// name, else profile name.
 #[test]
 fn a_nickname_outranks_the_profile_name_the_person_chose() {
-    // Her real record: she calls herself Tata, Pippijn typed Tania Boiko.
+    // She calls herself Tata; Pippijn typed Tania Boiko.
     let c = json!({
         "uuid": "fb07a20e", "name": "", "given_name": "",
         "profile": {"given_name": "Tata", "lastname": ""},
@@ -487,8 +443,7 @@ fn a_nickname_outranks_the_profile_name_the_person_chose() {
     assert_eq!(display_name_of(&c).as_deref(), Some("Tania Boiko"));
 }
 
-/// The commonest shape here: 38 of 52 recipients have an address-book name and
-/// no nickname, and for 13 of those a profile name sits underneath it.
+/// The common shape: an address-book name, no nickname, a profile name beneath.
 #[test]
 fn the_address_book_outranks_the_profile_name() {
     let c = json!({
@@ -499,10 +454,8 @@ fn the_address_book_outranks_the_profile_name() {
     assert_eq!(display_name_of(&c).as_deref(), Some("Alice Andersson"));
 }
 
-/// ⚠ AN EMPTY NICKNAME IS NOT A NICKNAME. signal-cli sends the object with
-/// blank strings rather than omitting it, so a presence check would make every
-/// contact nameless — the failure would be total and instant, which is the only
-/// reason it is not the likelier bug.
+/// signal-cli sends the nickname object with blank strings rather than
+/// omitting it.
 #[test]
 fn blank_name_fields_fall_through_rather_than_winning() {
     let c = json!({
@@ -513,7 +466,7 @@ fn blank_name_fields_fall_through_rather_than_winning() {
     assert_eq!(display_name_of(&c).as_deref(), Some("Carol Danvers"));
 }
 
-/// Half a name is still a name — `getDisplayNickname` joins what it has.
+/// Half a name is still a name; `getDisplayNickname` joins what it has.
 #[test]
 fn one_half_of_a_name_is_used_without_a_stray_space() {
     let given = json!({"uuid": "u3", "nickname": {"given_name": "Mononym"}});
@@ -522,9 +475,7 @@ fn one_half_of_a_name_is_used_without_a_stray_space() {
     assert_eq!(display_name_of(&family).as_deref(), Some("Surname"));
 }
 
-/// ⚠ `None`, NOT AN EMPTY STRING. 3 of 45 contacts resolve to no name at all.
-/// `upsert_contact` reads `None` as "learned nothing" and keeps what it has; an
-/// empty string would pass the non-empty filter nowhere and blank somebody.
+/// `None`, not an empty string, which `upsert_contact` would store.
 #[test]
 fn a_contact_with_no_name_anywhere_resolves_to_nothing() {
     let c = json!({"uuid": "u5", "name": "", "given_name": "",
@@ -536,12 +487,7 @@ fn a_contact_with_no_name_anywhere_resolves_to_nothing() {
 
 // ---- the times Signal puts on, and the timer it was sent under --------------
 
-/// ⚠ THE FIXTURE IS A REAL FRAME, TRIMMED — taken from `signal_frames` on
-/// 2026-09-21, not written from the record definition. Every field asserted here
-/// was observed on the wire: `serverReceivedTimestamp` on 31 of 31 frames and
-/// `expiresInSeconds` on 7 of 7 data messages. Quotes, mentions, text styles and
-/// previews appeared on ZERO, which is why they have no columns yet and no
-/// fixtures here — inventing one is how `sticker.emoji` passed for three months.
+/// The fixture is a real frame from `signal_frames`, trimmed.
 #[test]
 fn a_message_carries_signals_own_times_and_its_timer() {
     let f = json!({"envelope": {
@@ -553,9 +499,7 @@ fn a_message_carries_signals_own_times_and_its_timer() {
     }});
     match parse_frame(&f).action {
         Action::Message(m) => {
-            // ⚠ The sender's own clock, and NOT the same number as the server's.
-            // The fixture keeps them distinct on purpose: equal values would let
-            // a reader that returned the wrong one pass.
+            // Distinct from the server times, so returning the wrong one fails.
             assert_eq!(m.server_ts, 1790001402745);
             assert_eq!(m.server_received_ts, Some(1790001399818));
             assert_eq!(m.server_delivered_ts, Some(1790001400170));
@@ -565,10 +509,7 @@ fn a_message_carries_signals_own_times_and_its_timer() {
     }
 }
 
-/// ⚠ ABSENT IS NOT ZERO. A frame with no timer says nothing about one; a
-/// timer of 0 says somebody turned it OFF. Collapsing them loses the second, and
-/// the archive would report every old message as "never expiring" with the same
-/// confidence as one where that was actually chosen.
+/// No timer and a timer of 0 are different statements.
 #[test]
 fn no_timer_and_a_timer_of_zero_are_different_answers() {
     let absent = json!({"envelope": {
@@ -586,9 +527,8 @@ fn no_timer_and_a_timer_of_zero_are_different_answers() {
     assert_eq!(timer(&off), Some(0), "the timer was switched off");
 }
 
-/// A frame that carries neither server time — older signal-cli, or a shape that
-/// simply omits them — must leave both `None` rather than borrowing the sender's
-/// clock. A fabricated server time is indistinguishable from a measured one.
+/// A frame without server times leaves both `None` rather than borrowing the
+/// sender's clock.
 #[test]
 fn missing_server_times_are_not_invented_from_the_senders_clock() {
     let f = json!({"envelope": {

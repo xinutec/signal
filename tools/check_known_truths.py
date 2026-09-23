@@ -2,30 +2,15 @@
 #!nix-shell -i python3 -p "python3.withPackages(ps: [ps.pymysql])"
 """Check the archive still answers the things Pippijn knows to be true.
 
-⚠ **THIS IS A POSITIVE CONTROL, WHICH IS THE ONLY KIND OF CHECK THAT EARNS A
-NULL.** On 2026-09-18 four absences were reported that the checking method had
-manufactured — Google Chat "had no replies" while 126 sat unread at index 36,
-the capture was "clean" while it took no attachments at all, Signal "had no read
-state" after fifteen months of discarding receipts. Every one of those checks
-came back clean because it could not have come back otherwise.
-
-A row in `known_truths.tsv` is something known INDEPENDENTLY of this archive. If
-a query stops returning it, the pipeline has lost something and says so. That is
-the difference between a test and an audit: an audit finds what you thought to
-look for, a test tells you when what you already found goes away.
-
-⚠ **`expect` IS A FLOOR, NOT AN EQUALITY.** These counts grow — more messages,
-more reactions, more calls. Asserting equality would turn every ordinary day
-into a failure and the check would be muted within a week; asserting a floor
-fails only when something has been LOST, which is the event worth waking up for.
+Each row of `known_truths.tsv` is known independently of the archive, so a
+query that stops returning it means the pipeline lost something. `expect` is a
+floor, since the counts only grow.
 
 Usage (env: DB_HOST DB_PORT DB_USER DB_PASSWORD DB_NAME):
 
     ./check_known_truths.py [--sql]
 
-⚠ `--sql` prints the queries for a database this machine cannot reach — the
-archive lives in the cluster and the fleet is not routable from here. Same rows,
-same file, so the two cannot disagree.
+`--sql` prints the queries instead, for running where the database is reachable.
 """
 import os
 import sys
@@ -49,8 +34,7 @@ def rows():
 def main():
     if "--sql" in sys.argv:
         for name, expect, sql in rows():
-            # The name is echoed as a literal so the output is readable beside
-            # the number, wherever it is piped.
+            # The name as a literal, so the output labels each number.
             print(f"SELECT {expect} AS expect, ({sql}) AS actual, "
                   f"{expect} <= ({sql}) AS ok, '{name.replace(chr(39), '')}' AS what;")
         return

@@ -1,28 +1,10 @@
-# Things the archive MUST be able to answer, checked against the live database.
+# Things the archive must be able to answer, checked against the live database.
 #
-# ⚠ **THESE ARE POSITIVE CONTROLS, NOT COVERAGE.** On 2026-09-18 four separate
-# absences were reported that the checking method had manufactured: Google Chat
-# "had no replies" (126 existed), the capture was "clean" (it took no
-# attachments at all), Signal "had no read state" (receipts had been discarded
-# for fifteen months), formatting affected "28,000 messages" (1,145). Each null
-# came from a check that could not have produced a positive, and each was
-# written as a fact about the service rather than about the measurement.
-#
-# A row here is an instance Pippijn KNOWS is true, independent of this archive.
-# If the query stops returning it, the pipeline has lost something — and unlike
-# an audit, that failure announces itself. Silence from a check that has never
-# been shown to detect anything is worth nothing.
-#
-# ⚠ **A ROW MUST BE TRUE NOW, NOT EXPECTED TO BECOME TRUE.** The first version of
-# this file asserted that some message carried both a delivery AND a read
-# receipt — plausible, and false: receipt capture had started hours earlier and
-# no message had both yet. It reported LOST on a pipeline that had lost nothing.
-# A control that fails for a reason other than loss teaches the reader to ignore
-# it, which is how a check dies.
-#
-# ⚠ **DO NOT GENERATE ROWS FROM THE DATABASE.** A row derived from the archive
-# tests that the archive agrees with itself, which is the exact failure above.
-# Every row must come from somewhere else: his memory, his phone, the Chat UI.
+# Each row is something Pippijn knows independently of the archive (his memory,
+# his phone, the Chat UI), so a query that stops returning it means the pipeline
+# lost something. Never derive a row from the database: that only tests that the
+# archive agrees with itself. A row must be true now, not expected to become
+# true, or it fails without any loss.
 #
 # Run:  tools/check_known_truths.py
 # Format: name <TAB> expected <TAB> sql

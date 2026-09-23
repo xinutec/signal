@@ -1,52 +1,32 @@
 //! Pure parsing of irssi autolog files into archive entries.
 //!
-//! No I/O, like [`crate::parse`]: a log file's path and its text go in,
-//! classified entries come out, so the fiddly part — which of five shapes a
-//! line is, and which day it belongs to — is unit-testable without a
-//! filesystem or a database.
+//! No I/O: a log file's path and text go in, classified entries come out.
 //!
-//! The layout is fixed by irssi's own setting rather than by convention:
+//! The layout is irssi's own setting:
 //!
 //! ```text
 //! autolog_path = "~/irclogs/$tag/%Y/%m/%d/$0.log"
 //! ```
 //!
-//! So the network (`$tag`) and the target (`$0` — a channel or a nick)
-//! are recoverable only from the path, and so is the date: a logged line
-//! carries irssi's default `timestamp_format` of `%H:%M` and nothing more.
+//! The network (`$tag`), target (`$0`, a channel or nick) and date come only
+//! from the path; a line carries just `%H:%M`.
 //!
-//! ⚠ The line classes were measured, not assumed — one network's whole
-//! tree, 966,039 lines, 2026-08-14:
+//! | class | form |
+//! |---|---|
+//! | message | `HH:MM <nick> text` |
+//! | notice, server | `HH:MM !server [* ]text` |
+//! | notice, user | `HH:MM -nick(user@host)- text` |
+//! | event | `HH:MM -!- text` |
+//! | event, OTR | `HH:MM OTR: text` |
+//! | action | `HH:MM  * nick text` |
+//! | *log opened/closed* | `--- Log opened <date>` |
+//! | *day changed* | `--- Day changed <date>` |
 //!
-//! | class | form | count |
-//! |---|---|---|
-//! | message | `HH:MM <nick> text` | 425,748 |
-//! | notice, server | `HH:MM !server [* ]text` | 385,012 |
-//! | *log opened* | `--- Log opened <date>` | 52,894 |
-//! | *log closed* | `--- Log closed <date>` | 52,812 |
-//! | event | `HH:MM -!- text` | 45,600 |
-//! | action | `HH:MM  * nick text` | 3,495 |
-//! | event, OTR | `HH:MM OTR: text` | 288 |
-//! | *day changed* | `--- Day changed <date>` | 162 |
-//! | notice, user | `HH:MM -nick(user@host)- text` | 25 |
-//! | unrecognised | — | 3 |
-//!
-//! Server notices very nearly outnumber conversation, and three of the classes
-//! were not in the format as anybody had written it down: the bare notice with
-//! no `*`, the notice from a person, and the OTR plugin's status lines. Each
-//! was found by counting the corpus rather than by reading about it.
-//!
-//! Which is why nothing here drops a line silently. Anything unrecognised
-//! comes back in [`Parsed::unparsed`] by line number for the caller to report,
-//! and the classes are matched narrowly on purpose — a rule general enough to
-//! absorb the next surprise would also hide it.
+//! Classes are matched narrowly, and anything unrecognised is returned in
+//! [`Parsed::unparsed`] for the caller to report.
 
-/// A calendar date, as components.
-///
-/// Not a `chrono::NaiveDate` because nothing here does date *arithmetic* — the
-/// path supplies one date and a `--- Day changed` marker supplies the next,
-/// both absolute. Taking on a date dependency to buy a `format!` we can write
-/// ourselves would be the larger change.
+/// A calendar date, as components. No arithmetic is needed: every date here is
+/// read, never computed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Date {
     pub year: i32,
@@ -63,9 +43,7 @@ pub struct Timestamp {
 }
 
 impl std::fmt::Display for Timestamp {
-    /// A MariaDB `DATETIME` literal. Seconds are zero because `%H:%M` is all the
-    /// precision there is; two messages in one minute are ordered by insertion,
-    /// which is the order the file already had.
+    /// A MariaDB `DATETIME` literal, seconds always zero.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -75,9 +53,7 @@ impl std::fmt::Display for Timestamp {
     }
 }
 
-/// What a logged line *is*. The archive keeps all four and lets the reader
-/// decide what to show — a notice is not conversation, but it is the record of
-/// why a conversation stopped.
+/// What a logged line is. All four are kept; the reader decides what to show.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Message,
@@ -100,16 +76,14 @@ impl Kind {
 
 /// One recognised line.
 ///
-/// `line_no` counts *physical* lines from 1, skipped ones included, because it
-/// is half the dedupe key: irssi's autolog only ever appends, so a line's
-/// number within its file never moves and re-importing writes nothing twice.
+/// `line_no` counts physical lines from 1, skipped ones included. It is part of
+/// the dedupe key, stable because irssi only appends.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     pub line_no: u32,
     pub at: Timestamp,
     pub kind: Kind,
-    /// Who said it: a nick, or for a [`Kind::Notice`] the server that sent it.
-    /// `None` for an event, which is about somebody rather than by them.
+    /// A nick, or for a server [`Kind::Notice`] the server. `None` for an event.
     pub nick: Option<String>,
     pub text: String,
 }
@@ -131,8 +105,7 @@ pub struct LogPath {
 }
 
 impl LogPath {
-    /// Channels start with `#`; anything else is a private conversation. This
-    /// is IRC's own rule, not a heuristic — a nick may not begin with `#`.
+    /// Channels start with `#`; a nick cannot.
     pub fn is_channel(&self) -> bool {
         self.target.starts_with('#')
     }
@@ -140,12 +113,9 @@ impl LogPath {
 
 /// Split a path relative to the irclogs root into network, target and date.
 ///
-/// ⚠ Exactly five components, and that is load-bearing. 57 of 89,474 files
-/// sit at `<YYYY>/<MM>/<DD>/<target>.log` with no network at all — they predate
-/// the `$tag` in `autolog_path`. Matching on the *last* five components instead
-/// would read `irclogs/2014/03/09/x.log` as the network `irclogs`, filing
-/// somebody's conversation under a server that does not exist. Four components
-/// is a legacy file; the caller counts them and leaves them alone.
+/// Exactly five components. Some old files have four, with no network; matching
+/// the last five would read `irclogs/2014/03/09/x.log` as network `irclogs`.
+/// The caller counts those and leaves them alone.
 pub fn parse_path(rel: &str) -> Option<LogPath> {
     let parts: Vec<&str> = rel
         .split('/')
@@ -178,14 +148,10 @@ pub fn parse_log(start: Date, text: &str) -> Parsed {
         }
 
         if let Some(marker) = line.strip_prefix("--- ") {
-            // `Log opened` / `Log closed` bracket every session and say nothing
-            // the entries do not; a day change moves the clock and must not be
-            // missed.
+            // Opened/closed markers carry nothing; a day change moves the date.
             if let Some(rest) = marker.strip_prefix("Day changed ") {
                 match parse_day_changed(rest) {
                     Some(d) => date = d,
-                    // Not skipped: leaving the date as it was would file a whole
-                    // day of conversation under yesterday, silently.
                     None => out.unparsed.push(line_no),
                 }
             } else if !marker.starts_with("Log opened") && !marker.starts_with("Log closed") {
@@ -242,36 +208,27 @@ fn parse_entry(date: Date, line_no: u32, line: &str) -> Option<Entry> {
         })
     };
 
-    // `<nick> text`. Split on the FIRST `>` so a message *about* IRC syntax is
-    // not re-parsed as one.
+    // `<nick> text`, split on the first `>`.
     if let Some(rest) = rest.strip_prefix('<') {
         let (nick, text) = rest.split_once('>')?;
-        // ⚠ The space belongs in this set: irssi writes the channel mode in a
-        // fixed column, so an ordinary speaker is `< nick>` and an op is
-        // `<@nick>`. 323,570 of the measured messages are the padded form
-        // against 102,178 unpadded — reading the space as part of the name
-        // splits every unopped participant into a second person.
+        // irssi pads the mode column: `< nick>` for a plain speaker, `<@nick>`
+        // for an op.
         return entry(
             Kind::Message,
             Some(nick.trim_start_matches([' ', '@', '+', '%', '&', '~'])),
             text.strip_prefix(' ').unwrap_or(text),
         );
     }
-    // ` * nick text` — one space already consumed after the clock, so the
-    // action's own second space is what is left. This is the only thing that
-    // distinguishes it.
+    // ` * nick text`: the clock's space is already consumed.
     if let Some(rest) = rest.strip_prefix(" * ") {
         let (nick, text) = rest.split_once(' ').unwrap_or((rest, ""));
         return entry(Kind::Action, Some(nick), text);
     }
-    // `-!- somebody has joined` — kept whole. Splitting join from part here
-    // would invent structure nothing consumes.
+    // `-!- somebody has joined`, kept whole.
     if let Some(rest) = rest.strip_prefix("-!- ") {
         return entry(Kind::Event, None, rest);
     }
-    // `!server text`, where the text of a status notice conventionally opens
-    // with `*`. 32,712 measured carry it and 79 do not, so it is decoration
-    // and stripping it is what keeps those 79 from being reported as a mystery.
+    // `!server text`; the leading `*** ` is usual but optional.
     if let Some(rest) = rest.strip_prefix('!') {
         let (server, text) = rest.split_once(' ')?;
         return entry(
@@ -280,26 +237,20 @@ fn parse_entry(date: Date, line_no: u32, line: &str) -> Option<Entry> {
             text.strip_prefix("*** ").unwrap_or(text),
         );
     }
-    // `-nick(user@host)- text` — a notice from a person. The hostmask names a
-    // connection rather than a correspondent, and the archive keys people by
-    // nick, so it is dropped. Checked after `-!- `, which shares the leading
-    // dash.
+    // `-nick(user@host)- text`, a notice from a person; the hostmask is dropped.
+    // After `-!- `, which shares the dash.
     if let Some(rest) = rest.strip_prefix('-') {
         let (who, text) = rest.split_once("- ")?;
         let nick = who.split_once('(').map_or(who, |(nick, _host)| nick);
         return entry(Kind::Notice, Some(nick), text);
     }
-    // `[notice(nick)] text` — the same thing an older irssi theme wrote before
-    // the dashed form. 3 measured, all from 2013.
+    // `[notice(nick)] text`, an older irssi theme's form.
     if let Some(rest) = rest.strip_prefix("[notice(") {
         let (nick, text) = rest.split_once(")] ")?;
         return entry(Kind::Notice, Some(nick), text);
     }
-    // The OTR plugin logs its status into the conversation it protects (288
-    // measured, all private). ⚠ Matched literally rather than as `word:`: a
-    // general rule would swallow the next plugin's output as a known class
-    // instead of reporting it, which is how this one stayed invisible until the
-    // corpus was counted.
+    // The OTR plugin's status lines. Literal, not `word:`, so the next plugin's
+    // output is reported rather than absorbed.
     if rest.starts_with("OTR: ") {
         return entry(Kind::Event, None, rest);
     }
@@ -308,9 +259,7 @@ fn parse_entry(date: Date, line_no: u32, line: &str) -> Option<Entry> {
 
 /// `HH:MM ` at the head of a line, validated as a real clock time.
 ///
-/// `24:00` and `21:60` do not occur in a real log, but accepting one would put
-/// a row in the archive that MariaDB then rejects as a `DATETIME` — halfway
-/// through an import, with everything before it already written.
+/// An invalid time would make MariaDB reject the row mid-import.
 fn split_time(line: &str) -> Option<(u32, u32, &str)> {
     let (clock, rest) = line.split_at_checked(6)?;
     let (hour, minute) = clock.strip_suffix(' ')?.split_once(':')?;

@@ -1,8 +1,6 @@
-//! signal-archiver library: the pure parsing logic (`parse` for the Signal
-//! receive websocket, `irclog` for irssi's autologs, `telegram::map` for
-//! Telegram's wire types) and the MariaDB store (`db`). The binaries wire these
-//! to their feeds. Split into a lib so the parsing is unit-testable (see
-//! `tests/`).
+//! signal-archiver library: pure parsing (`parse` for Signal frames, `irclog`
+//! for irssi autologs, `telegram::map` for Telegram) and the MariaDB store
+//! (`db`). The binaries connect these to their feeds.
 
 pub mod attach;
 pub mod db;

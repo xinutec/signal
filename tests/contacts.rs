@@ -1,22 +1,6 @@
 //! What somebody is called, and what they were called before — against a real
 //! MariaDB, because everything that could be wrong here is the SQL.
-//!
-//! ⚠ THESE EXIST BECAUSE A RENAME IS COMING IN BULK. signal-cli resolves
-//! `envelope.sourceName` with Signal's own precedence, and 0.14.7 adds a branch
-//! above the other two — the first/last name you type in the app. Upgrading past
-//! it renames every contact who has one, on the first message after the pod
-//! restarts. `contacts` held one name per person, so that event would have
-//! silently destroyed what people were called before it.
-//!
-//! ⚠ THEY ALSO EXIST BECAUSE A WRONG DIAGNOSIS GOT THIS FAR. The claim was
-//! that `COALESCE(VALUES(x), x)` made the name write-once; it does the opposite,
-//! and the archive had been tracking signal-cli correctly all along. The first
-//! run of `the_old_name_is_kept_and_dated` said so within a minute, which is the
-//! only reason the wrong story stopped there.
-//!
-//! ⚠ NOTHING IS DROPPED AND NOTHING IS CLEANED UP — each test invents its own
-//! uuid, so its rows start absent and the counts are exact whatever else is in the
-//! database. Same isolation as `tests/telegram_store.rs`.
+//! Nothing is cleaned up: each test uses its own uuid, so its rows start absent.
 //!
 //! Skips when `SIGNAL_TEST_DATABASE_URL` is unset, and refuses to skip in CI.
 
@@ -27,9 +11,7 @@ use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
 
 async fn connect() -> Option<(Db, MySqlPool)> {
     let Ok(url) = std::env::var("SIGNAL_TEST_DATABASE_URL") else {
-        // ⚠ Skipping locally is a convenience; skipping in CI would be a lie. The
-        // failure mode of every test in this file is a PASS, so it has to be made
-        // impossible rather than watched for.
+        // A skip passes, so CI must not skip.
         assert!(
             std::env::var("CI").is_err(),
             "SIGNAL_TEST_DATABASE_URL is unset in CI: the contact writes would \
@@ -77,9 +59,7 @@ async fn history(pool: &MySqlPool, uuid: &str) -> Vec<(String, bool)> {
     .collect()
 }
 
-/// Signal's display name is whatever `getContactOrProfileName` resolves to, and
-/// it changes the moment the branch above the current one starts matching — which
-/// is what a signal-cli upgrade does to everybody at once. The archive follows it.
+/// The display name follows whatever `getContactOrProfileName` resolves to.
 #[tokio::test]
 async fn a_renamed_contact_is_renamed_here_too() {
     let Some((db, pool)) = connect().await else {
@@ -90,7 +70,7 @@ async fn a_renamed_contact_is_renamed_here_too() {
     db.upsert_contact(&id, None, Some("Tata")).await.unwrap();
     assert_eq!(display_name(&pool, &id).await.as_deref(), Some("Tata"));
 
-    // The same name again, which is what arrives with every one of her messages.
+    // The same name arrives with every message.
     db.upsert_contact(&id, None, Some("Tata")).await.unwrap();
     assert_eq!(
         history(&pool, &id).await,
@@ -109,9 +89,7 @@ async fn a_renamed_contact_is_renamed_here_too() {
     );
 }
 
-/// ⚠ A RENAME MUST NOT ERASE WHAT SHE WAS CALLED WHEN SHE SAID SOMETHING. An
-/// archive that only overwrites answers "what is she called" and loses "what was
-/// she called then", and the second is the one a reader of an old thread has.
+/// A rename keeps what she was called before, for old threads.
 #[tokio::test]
 async fn the_old_name_is_kept_and_dated() {
     let Some((db, pool)) = connect().await else {
@@ -133,8 +111,7 @@ async fn the_old_name_is_kept_and_dated() {
         "both names, oldest first, and exactly one of them current"
     );
 
-    // ⚠ The end is DATED, not merely flagged. A boolean would say a name stopped
-    // being used and never when, which is the fact a thread from that week needs.
+    // Dated, not just flagged.
     let ended: Option<i64> = sqlx::query_scalar(
         "SELECT UNIX_TIMESTAMP(seen_until) FROM contact_names WHERE uuid = ? AND name = 'Tata'",
     )
@@ -145,11 +122,8 @@ async fn the_old_name_is_kept_and_dated() {
     assert!(ended.is_some_and(|t| t > 0), "the old name carries its end");
 }
 
-/// ⚠ LEARNING NOTHING IS NOT LEARNING THAT SHE HAS NO NAME. A sighting with no
-/// name at all — a receipt, a typing frame, a group member we have no profile for
-/// — must not blank a name we hold, and must not open a chapter in the history
-/// either. Splitting the write into two statements is what put this case at risk,
-/// so it is pinned here.
+/// A sighting with no name (a receipt, a typing frame, an unknown group
+/// member) neither blanks the name nor opens a new one.
 #[tokio::test]
 async fn a_nameless_sighting_does_not_wipe_a_name() {
     let Some((db, pool)) = connect().await else {
@@ -181,8 +155,7 @@ async fn a_nameless_sighting_does_not_wipe_a_name() {
     assert_eq!(phone.as_deref(), Some("+447700900000"));
 }
 
-/// Asserts the end state rather than the sequence, because that is what a fresh
-/// database gets once every migration has run.
+/// Asserts the end state a fresh database reaches.
 #[tokio::test]
 async fn the_superseded_column_is_gone() {
     let Some((db, pool)) = connect().await else {
@@ -203,14 +176,8 @@ async fn the_superseded_column_is_gone() {
             .unwrap();
     assert_eq!(name.as_deref(), Some("Tania Boiko"));
 
-    // ⚠ Asked of the SCHEMA, not by selecting the column — a query naming a
-    // dropped column is an error, which a test could mistake for any other
-    // failure. This asks what columns exist and expects one to be absent.
-    // `information_schema` is the SERVER's catalogue, not this repo's schema, so
-    // no migration creates it and none should — asking it is the point.
-    // ⚠ The marker is the LAST comment line deliberately: it must sit within two
-    // lines of the FLAGGED line, which is the SQL string rather than the call,
-    // and prose after it pushes it out of range.
+    // Asks the server's catalogue: selecting a dropped column would error like
+    // any other failure.
     // dev-lint: allow-sqlx — the server's own catalogue, by design.
     let still_there: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM information_schema.columns
@@ -225,19 +192,12 @@ async fn the_superseded_column_is_gone() {
 
 // ---- the frame itself -------------------------------------------------------
 
-/// ⚠ SIGNAL SAYS EVERYTHING EXACTLY ONCE. There is no server-side history to
-/// re-walk — Telegram has one, which is why a gap there costs an afternoon and a
-/// gap here costs the message. `JsonDataMessage` carries 23 fields at the
-/// deployed 0.14.5 and `parse_frame` reads four, so keeping the bytes is what
-/// makes the other nineteen recoverable at all: a column can be added and
-/// backfilled later, a field never captured cannot.
 #[tokio::test]
 async fn the_frame_is_kept_whole_and_a_replay_is_free() {
     let Some((db, pool)) = connect().await else {
         return;
     };
-    // A ts nothing else uses, and a field this archive has NO column for — which
-    // is the whole point: it has to survive anyway.
+    // A timestamp nothing else uses, and a field with no column.
     let ts = 1_600_000_000_000i64 + std::process::id() as i64;
     let frame = serde_json::json!({"envelope": {
         "sourceUuid": "frame-test", "timestamp": ts,
@@ -255,8 +215,7 @@ async fn the_frame_is_kept_whole_and_a_replay_is_free() {
         db.record_signal_frame(&frame).await.unwrap(),
         "first sighting"
     );
-    // ⚠ signal-cli re-delivers on reconnect, and this archive reconnects on every
-    // deploy. A replay must cost nothing and must not double the row.
+    // signal-cli re-delivers on every reconnect.
     assert!(
         !db.record_signal_frame(&frame).await.unwrap(),
         "a replayed frame is recognised, not stored twice"
@@ -269,17 +228,12 @@ async fn the_frame_is_kept_whole_and_a_replay_is_free() {
         .unwrap();
     assert_eq!(rows, 1);
 
-    // ⚠ The assertion that matters: a field with no column survives, and is
-    // QUERYABLE. If this ever fails, the table has become a write-only hole and
-    // the backfill it exists to enable is not possible.
-    // ⚠ `JSON_VALUE`, NOT `->>`. The `->>` operator is MySQL's; MariaDB
-    // rejects it outright (error 1064). Pinned here rather than discovered
-    // halfway through a backfill over the whole table.
+    // A field with no column must be queryable. `JSON_VALUE`, because MariaDB
+    // rejects `->>` (error 1064).
     let at = |path: &'static str| {
         let pool = pool.clone();
         async move {
-            // `path` is a `&'static str` written at each call site below; nothing
-            // from the database or the frame reaches this string. Safe to assert.
+            // `path` is a literal at each call site.
             sqlx::query_scalar::<_, Option<String>>(AssertSqlSafe(format!(
                 "SELECT JSON_VALUE(frame, '{path}') FROM signal_frames WHERE envelope_ts = ?"
             )))
@@ -290,12 +244,8 @@ async fn the_frame_is_kept_whole_and_a_replay_is_free() {
         }
     };
 
-    // Every one of these is a field the archive has no column for, read back out
-    // of the frame. This is the backfill this table exists to make possible.
-    //
-    // ⚠ `1`, NOT `"true"`. MariaDB's JSON_VALUE renders a JSON boolean as
-    // 1/0. Pinned because a backfill comparing against 'true' would silently
-    // classify every view-once message as ordinary — a wrong answer, not an error.
+    // Fields with no column, read back out of the frame. JSON_VALUE renders a
+    // JSON boolean as 1/0, not 'true'.
     assert_eq!(
         at("$.envelope.dataMessage.viewOnce").await.as_deref(),
         Some("1"),
@@ -329,10 +279,8 @@ async fn the_frame_is_kept_whole_and_a_replay_is_free() {
     );
 }
 
-/// ⚠ TWO FRAMES CAN SHARE A TIMESTAMP AND BE DIFFERENT THINGS — a message and
-/// the receipt that acknowledges it, a sync and the original. The key is the
-/// frame's own bytes for that reason: keying on (timestamp, source) would file
-/// the second as a replay of the first and lose it.
+/// Two frames can share a timestamp and be different things, such as a message
+/// and its receipt.
 #[tokio::test]
 async fn two_frames_sharing_a_timestamp_both_survive() {
     let Some((db, pool)) = connect().await else {
@@ -360,14 +308,7 @@ async fn two_frames_sharing_a_timestamp_both_survive() {
 
 // ---- the backfill the frames exist for --------------------------------------
 
-/// ⚠ THIS IS WHAT `signal_frames` WAS FOR, EXERCISED. The columns did not
-/// exist when these envelopes arrived; the values come out anyway because the
-/// frame was stored whole before anything read it. Without that table, v47 could
-/// only ever have been an `ALTER` and a shrug.
-///
-/// The test writes a message the OLD way — no server times, no timer, exactly
-/// what a row from before v47 looks like — then runs the backfill statement and
-/// asserts the row learned from its frame.
+/// A row written without the v47 columns learns them from its frame.
 #[tokio::test]
 async fn a_message_learns_its_server_times_from_its_kept_frame() {
     let Some((db, pool)) = connect().await else {
@@ -376,8 +317,7 @@ async fn a_message_learns_its_server_times_from_its_kept_frame() {
     let ts = 1_620_000_000_000i64 + std::process::id() as i64;
     let thread = format!("dm:backfill-{}", std::process::id());
 
-    // The frame, as it arrived. Distinct numbers throughout so a reader that
-    // returns the wrong one cannot pass.
+    // Distinct numbers throughout, so returning the wrong one fails.
     let frame = serde_json::json!({"envelope": {
         "sourceUuid": "backfill-test", "timestamp": ts,
         "serverReceivedTimestamp": ts - 3,
@@ -386,7 +326,6 @@ async fn a_message_learns_its_server_times_from_its_kept_frame() {
     }});
     assert!(db.record_signal_frame(&frame).await.unwrap());
 
-    // The row as it would have been written before v47 existed.
     sqlx::query(
         "INSERT INTO messages (thread_id, sender_uuid, server_ts, body, is_outgoing)
          VALUES (?, 'backfill-test', ?, 'hello', 0)",
@@ -397,9 +336,7 @@ async fn a_message_learns_its_server_times_from_its_kept_frame() {
     .await
     .unwrap();
 
-    // ⚠ The v48 statement verbatim. Copied rather than invoked because a
-    // migration only ever runs once per database — re-running it here is the only
-    // way to exercise it against a row created after it had already passed.
+    // The v48 statement verbatim: a migration runs once per database.
     // dev-lint: allow-sqlx — the v48 migration's own statement, under test.
     sqlx::query(
         "UPDATE messages m
@@ -438,12 +375,7 @@ async fn a_message_learns_its_server_times_from_its_kept_frame() {
     );
 }
 
-/// ⚠ A MESSAGE WITH NO FRAME LEARNS NOTHING, AND THAT IS THE EXPECTED SHAPE OF
-/// THIS BACKFILL. Frame capture began 2026-09-21; everything before it has no
-/// envelope and never will, because Signal keeps no server-side history. So the
-/// backfill touching almost nothing is correct rather than broken — and the
-/// columns must stay NULL rather than acquiring the sender's clock, which would
-/// make an unmeasured value indistinguishable from a measured one.
+/// A message with no frame keeps NULLs rather than the sender's clock.
 #[tokio::test]
 async fn a_message_with_no_frame_keeps_null_rather_than_guessing() {
     let Some((_db, pool)) = connect().await else {
