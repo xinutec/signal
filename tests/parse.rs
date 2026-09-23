@@ -2,8 +2,8 @@
 
 use serde_json::json;
 use signal_archiver::parse::{
-    Action, Attachment, CallEvent, CallEventKind, Contact, Edit, Message, Reaction, Receipt,
-    ReceiptKind, ThreadId, ThreadKind, display_name_of, parse_frame,
+    Action, Attachment, CallEvent, CallEventKind, Contact, Edit, LinkPreview, Message, Reaction,
+    Receipt, ReceiptKind, TextStyle, ThreadId, ThreadKind, display_name_of, parse_frame,
 };
 
 #[test]
@@ -24,8 +24,12 @@ fn incoming_text_dm() {
             expires_in_seconds: None,
             body: Some("hi there".into()),
             quote_target_ts: None,
+            quote_author: None,
+            quote_text: None,
             is_outgoing: false,
             attachments: vec![],
+            styles: vec![],
+            previews: vec![],
         })
     );
     assert_eq!(
@@ -58,8 +62,12 @@ fn outgoing_sync_dm_keys_thread_by_destination() {
             expires_in_seconds: None,
             body: Some("yo".into()),
             quote_target_ts: None,
+            quote_author: None,
+            quote_text: None,
             is_outgoing: true,
             attachments: vec![],
+            styles: vec![],
+            previews: vec![],
         })
     );
     assert_eq!(p.contact, None, "outgoing sync should not upsert a contact");
@@ -241,6 +249,7 @@ fn incoming_edit_maps_to_edit_action() {
             target_ts: 1000,
             body: Some("fixed typo".into()),
             is_outgoing: false,
+            styles: vec![],
         })
     );
     // An incoming edit still refreshes the contact and DM name.
@@ -273,6 +282,7 @@ fn outgoing_sync_edit_maps_to_edit_action() {
             target_ts: 1500,
             body: Some("edited (sync)".into()),
             is_outgoing: true,
+            styles: vec![],
         })
     );
 }
@@ -542,4 +552,160 @@ fn missing_server_times_are_not_invented_from_the_senders_clock() {
         }
         other => panic!("expected Message, got {other:?}"),
     }
+}
+
+/// A real outgoing message with every style Signal's picker offers, ids replaced.
+/// Positions are UTF-16 code units; the last span carries two styles.
+#[test]
+fn text_styles_are_kept_as_signal_sends_them() {
+    let f = json!({"account": "+440000000000", "envelope": {
+        "serverDeliveredTimestamp": 1790178383840_i64, "serverReceivedTimestamp": 1790178383827_i64,
+        "source": "+440000000000", "sourceDevice": 1, "sourceName": "Me",
+        "sourceNumber": "+440000000000", "sourceUuid": "me",
+        "syncMessage": {"sentMessage": {
+            "destination": "+440000000000", "destinationNumber": "+440000000000",
+            "destinationUuid": "me", "expiresInSeconds": 0, "isExpirationUpdate": false,
+            "message": "Hello bold italic strike-through mono-space, spoiler, mono strike",
+            "textStyles": [
+                {"length": 4, "start": 6, "style": "BOLD"},
+                {"length": 6, "start": 11, "style": "ITALIC"},
+                {"length": 14, "start": 18, "style": "STRIKETHROUGH"},
+                {"length": 10, "start": 33, "style": "MONOSPACE"},
+                {"length": 7, "start": 45, "style": "SPOILER"},
+                {"length": 11, "start": 54, "style": "MONOSPACE"},
+                {"length": 11, "start": 54, "style": "STRIKETHROUGH"}
+            ],
+            "timestamp": 1790178384508_i64, "viewOnce": false}},
+        "timestamp": 1790178384508_i64}});
+    let Action::Message(m) = parse_frame(&f).action else {
+        panic!("not a message");
+    };
+    let style = |s: &str, start: i32, length: i32| TextStyle {
+        style: s.into(),
+        start_utf16: start,
+        length_utf16: length,
+    };
+    assert_eq!(
+        m.styles,
+        vec![
+            style("BOLD", 6, 4),
+            style("ITALIC", 11, 6),
+            style("STRIKETHROUGH", 18, 14),
+            style("MONOSPACE", 33, 10),
+            style("SPOILER", 45, 7),
+            style("MONOSPACE", 54, 11),
+            style("STRIKETHROUGH", 54, 11),
+        ]
+    );
+}
+
+/// An edit carries the styles of its new text.
+#[test]
+fn an_edit_carries_its_text_styles() {
+    let f = json!({"envelope": {
+        "sourceUuid": "u1", "timestamp": 2000,
+        "editMessage": {"targetSentTimestamp": 1000, "dataMessage": {
+            "message": "now bold",
+            "textStyles": [{"start": 4, "length": 4, "style": "BOLD"}]}}
+    }});
+    let Action::Edit(e) = parse_frame(&f).action else {
+        panic!("not an edit");
+    };
+    assert_eq!(
+        e.styles,
+        vec![TextStyle {
+            style: "BOLD".into(),
+            start_utf16: 4,
+            length_utf16: 4
+        }]
+    );
+}
+
+/// A run missing a field, or with a negative position, is dropped rather than
+/// guessed at.
+#[test]
+fn a_malformed_style_run_is_dropped() {
+    let f = json!({"envelope": {
+        "sourceUuid": "u1", "timestamp": 2000,
+        "dataMessage": {"message": "hi there", "textStyles": [
+            {"start": 0, "length": 2, "style": "BOLD"},
+            {"start": 3, "style": "ITALIC"},
+            {"start": -1, "length": 2, "style": "BOLD"},
+            {"start": 3, "length": 5}
+        ]}
+    }});
+    let Action::Message(m) = parse_frame(&f).action else {
+        panic!("not a message");
+    };
+    assert_eq!(
+        m.styles,
+        vec![TextStyle {
+            style: "BOLD".into(),
+            start_utf16: 0,
+            length_utf16: 2
+        }]
+    );
+}
+
+/// A real link preview, ids replaced. `image` is null for this page.
+#[test]
+fn a_link_preview_is_kept() {
+    let f = json!({"envelope": {
+        "sourceUuid": "me", "timestamp": 1790178522951_i64,
+        "syncMessage": {"sentMessage": {
+            "destinationUuid": "me", "expiresInSeconds": 0, "isExpirationUpdate": false,
+            "message": "https://xinutec.org",
+            "previews": [{"description": "", "image": null, "title": "Welcome to nginx!",
+                          "url": "https://xinutec.org"}],
+            "timestamp": 1790178522951_i64, "viewOnce": false}}}});
+    let Action::Message(m) = parse_frame(&f).action else {
+        panic!("not a message");
+    };
+    assert_eq!(
+        m.previews,
+        vec![LinkPreview {
+            url: "https://xinutec.org".into(),
+            title: Some("Welcome to nginx!".into()),
+            // Empty is absent.
+            description: None,
+        }]
+    );
+}
+
+/// A preview without a url is not a preview.
+#[test]
+fn a_preview_without_a_url_is_dropped() {
+    let f = json!({"envelope": {
+        "sourceUuid": "u1", "timestamp": 2000,
+        "dataMessage": {"message": "hi", "previews": [{"title": "t"}]}
+    }});
+    let Action::Message(m) = parse_frame(&f).action else {
+        panic!("not a message");
+    };
+    assert!(m.previews.is_empty());
+}
+
+/// A real reply, ids replaced: the quote names its target, author and text.
+#[test]
+fn a_reply_keeps_who_and_what_it_quoted() {
+    let f = json!({"envelope": {
+        "sourceUuid": "me", "timestamp": 1790178613827_i64,
+        "syncMessage": {"sentMessage": {
+            "destinationUuid": "me", "expiresInSeconds": 0, "isExpirationUpdate": false,
+            "message": "This is many styles.",
+            "quote": {"attachments": [], "author": "+440000000000",
+                      "authorNumber": "+440000000000", "authorUuid": "me",
+                      "id": 1790178384508_i64,
+                      "text": "Hello bold italic strike-through mono-space, spoiler, mono strike",
+                      "textStyles": [{"length": 4, "start": 6, "style": "BOLD"}]},
+            "timestamp": 1790178613827_i64, "viewOnce": false}}}});
+    let Action::Message(m) = parse_frame(&f).action else {
+        panic!("not a message");
+    };
+    assert_eq!(m.quote_target_ts, Some(1790178384508));
+    assert_eq!(m.quote_author.as_deref(), Some("me"));
+    assert_eq!(
+        m.quote_text.as_deref(),
+        Some("Hello bold italic strike-through mono-space, spoiler, mono strike")
+    );
 }

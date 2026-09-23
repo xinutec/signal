@@ -201,7 +201,8 @@ async fn dispatch(ctx: &Ctx, frame: &Value) -> Result<()> {
         Action::Edit(e) => {
             ctx.db.upsert_conversation(&e.thread_id).await?;
             let n = ctx.db.mark_edited(&e.sender, e.target_ts).await?;
-            ctx.db
+            if let Some(row) = ctx
+                .db
                 .insert_edit(
                     &e.thread_id,
                     &e.sender,
@@ -210,7 +211,10 @@ async fn dispatch(ctx: &Ctx, frame: &Value) -> Result<()> {
                     e.target_ts,
                     e.is_outgoing,
                 )
-                .await?;
+                .await?
+            {
+                ctx.db.insert_text_styles(row, &e.styles).await?;
+            }
             tracing::info!(
                 "edit flagged {n} original(s) + stored new version (sender={}, target={})",
                 e.sender,
@@ -234,6 +238,8 @@ async fn dispatch(ctx: &Ctx, frame: &Value) -> Result<()> {
             ctx.db.upsert_conversation(&m.thread_id).await?;
             // `None` = a duplicate INSERT IGNORE dropped; skip its children.
             if let Some(msg_id) = ctx.db.insert_message(&m).await? {
+                ctx.db.insert_text_styles(msg_id, &m.styles).await?;
+                ctx.db.insert_link_previews(msg_id, &m.previews).await?;
                 for att in &m.attachments {
                     let stored = match &att.id {
                         Some(id) => download_attachment(ctx, id).await,

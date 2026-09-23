@@ -22,6 +22,52 @@ pub fn url_from_env() -> Result<String> {
     Ok(format!("mysql://{user}:{pass}@{host}:{port}/{name}"))
 }
 
+/// Migration v52; public so tests run the statement the migration runs.
+pub const BACKFILL_QUOTES: &str = r"UPDATE messages m
+        JOIN signal_frames f ON f.envelope_ts = m.server_ts AND f.source_uuid = m.sender_uuid
+         SET m.quote_author_uuid = COALESCE(
+                 m.quote_author_uuid,
+                 JSON_VALUE(f.frame, '$.envelope.dataMessage.quote.authorUuid'),
+                 JSON_VALUE(f.frame, '$.envelope.syncMessage.sentMessage.quote.authorUuid')),
+             m.quote_text = COALESCE(
+                 m.quote_text,
+                 NULLIF(JSON_VALUE(f.frame, '$.envelope.dataMessage.quote.text'), ''),
+                 NULLIF(JSON_VALUE(f.frame, '$.envelope.syncMessage.sentMessage.quote.text'), ''))";
+
+/// Migration v53; public so tests run the statement the migration runs.
+pub const BACKFILL_TEXT_STYLES: &str = r"INSERT IGNORE INTO signal_text_styles (message_id, style, start_utf16, length_utf16)
+        SELECT m.id, s.style, s.start_utf16, s.length_utf16
+          FROM messages m
+          JOIN signal_frames f ON f.envelope_ts = m.server_ts AND f.source_uuid = m.sender_uuid
+          JOIN JSON_TABLE(
+                   COALESCE(
+                       JSON_EXTRACT(f.frame, '$.envelope.dataMessage.textStyles'),
+                       JSON_EXTRACT(f.frame, '$.envelope.syncMessage.sentMessage.textStyles'),
+                       JSON_EXTRACT(f.frame, '$.envelope.editMessage.dataMessage.textStyles'),
+                       JSON_EXTRACT(f.frame, '$.envelope.syncMessage.editMessage.dataMessage.textStyles'),
+                       JSON_EXTRACT(f.frame, '$.envelope.syncMessage.sentMessage.editMessage.dataMessage.textStyles')),
+                   '$[*]' COLUMNS (
+                       style VARCHAR(16) PATH '$.style',
+                       start_utf16 INT PATH '$.start',
+                       length_utf16 INT PATH '$.length')) s
+         WHERE s.style IS NOT NULL AND s.start_utf16 >= 0 AND s.length_utf16 >= 0";
+
+/// Migration v54; public so tests run the statement the migration runs.
+pub const BACKFILL_LINK_PREVIEWS: &str = r"INSERT IGNORE INTO signal_link_previews (message_id, position, url, title, description)
+        SELECT m.id, p.position - 1, p.url, NULLIF(p.title, ''), NULLIF(p.description, '')
+          FROM messages m
+          JOIN signal_frames f ON f.envelope_ts = m.server_ts AND f.source_uuid = m.sender_uuid
+          JOIN JSON_TABLE(
+                   COALESCE(
+                       JSON_EXTRACT(f.frame, '$.envelope.dataMessage.previews'),
+                       JSON_EXTRACT(f.frame, '$.envelope.syncMessage.sentMessage.previews')),
+                   '$[*]' COLUMNS (
+                       position FOR ORDINALITY,
+                       url TEXT PATH '$.url',
+                       title TEXT PATH '$.title',
+                       description TEXT PATH '$.description')) p
+         WHERE p.url IS NOT NULL AND p.url <> ''";
+
 const MIGRATIONS: &[&str] = &[
     // v0: people, keyed by ACI UUID (E.164 when there is none).
     r"CREATE TABLE IF NOT EXISTS contacts (
@@ -541,6 +587,35 @@ const MIGRATIONS: &[&str] = &[
                  m.expires_in_seconds,
                  JSON_VALUE(f.frame, '$.envelope.dataMessage.expiresInSeconds'),
                  JSON_VALUE(f.frame, '$.envelope.syncMessage.sentMessage.expiresInSeconds'))",
+    // v49: what a quote says about its target, for a target the archive does
+    // not hold.
+    r"ALTER TABLE messages
+        ADD COLUMN quote_author_uuid VARCHAR(64) NULL,
+        ADD COLUMN quote_text TEXT NULL",
+    // v50: styled runs of a message body, in Signal's own names. Positions are
+    // UTF-16 code units; runs may overlap.
+    r"CREATE TABLE IF NOT EXISTS signal_text_styles (
+        id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        message_id BIGINT NOT NULL,
+        style VARCHAR(16) NOT NULL,
+        start_utf16 INT NOT NULL,
+        length_utf16 INT NOT NULL,
+        UNIQUE KEY uniq_signal_text_style (message_id, style, start_utf16, length_utf16)
+    ) DEFAULT CHARSET=utf8mb4",
+    // v51: link previews the sender's app attached, in the order it sent them.
+    r"CREATE TABLE IF NOT EXISTS signal_link_previews (
+        id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        message_id BIGINT NOT NULL,
+        position INT NOT NULL,
+        url TEXT NOT NULL,
+        title TEXT NULL,
+        description TEXT NULL,
+        UNIQUE KEY uniq_signal_link_preview (message_id, position)
+    ) DEFAULT CHARSET=utf8mb4",
+    // v52–v54: backfill v49–v51 from `signal_frames`, as v48 does.
+    BACKFILL_QUOTES,
+    BACKFILL_TEXT_STYLES,
+    BACKFILL_LINK_PREVIEWS,
 ];
 
 #[derive(Clone)]
@@ -732,8 +807,9 @@ impl Db {
         let res = sqlx::query(
             "INSERT IGNORE INTO messages
                 (thread_id, sender_uuid, server_ts, body, quote_target_ts, is_outgoing,
-                 server_received_ts, server_delivered_ts, expires_in_seconds)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 server_received_ts, server_delivered_ts, expires_in_seconds,
+                 quote_author_uuid, quote_text)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(m.thread_id.to_string())
         .bind(&m.sender)
@@ -744,6 +820,8 @@ impl Db {
         .bind(m.server_received_ts)
         .bind(m.server_delivered_ts)
         .bind(m.expires_in_seconds)
+        .bind(m.quote_author.as_deref())
+        .bind(m.quote_text.as_deref())
         .execute(&self.pool)
         .await?;
         Ok((res.rows_affected() != 0).then(|| res.last_insert_id()))
@@ -786,8 +864,8 @@ impl Db {
         body: Option<&str>,
         edit_of_ts: i64,
         is_outgoing: bool,
-    ) -> Result<()> {
-        sqlx::query(
+    ) -> Result<Option<u64>> {
+        let res = sqlx::query(
             "INSERT IGNORE INTO messages \
                 (thread_id, sender_uuid, server_ts, body, is_outgoing, edit_of_ts) \
              VALUES (?, ?, ?, ?, ?, ?)",
@@ -800,6 +878,51 @@ impl Db {
         .bind(edit_of_ts)
         .execute(&self.pool)
         .await?;
+        Ok((res.rows_affected() != 0).then(|| res.last_insert_id()))
+    }
+
+    /// Record a message row's styled runs.
+    pub async fn insert_text_styles(
+        &self,
+        message_id: u64,
+        styles: &[crate::parse::TextStyle],
+    ) -> Result<()> {
+        for st in styles {
+            sqlx::query(
+                "INSERT IGNORE INTO signal_text_styles
+                    (message_id, style, start_utf16, length_utf16)
+                 VALUES (?, ?, ?, ?)",
+            )
+            .bind(message_id)
+            .bind(&st.style)
+            .bind(st.start_utf16)
+            .bind(st.length_utf16)
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Record a message row's link previews, in the order sent.
+    pub async fn insert_link_previews(
+        &self,
+        message_id: u64,
+        previews: &[crate::parse::LinkPreview],
+    ) -> Result<()> {
+        for (position, p) in previews.iter().enumerate() {
+            sqlx::query(
+                "INSERT IGNORE INTO signal_link_previews
+                    (message_id, position, url, title, description)
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(message_id)
+            .bind(position as i32)
+            .bind(&p.url)
+            .bind(p.title.as_deref())
+            .bind(p.description.as_deref())
+            .execute(&self.pool)
+            .await?;
+        }
         Ok(())
     }
 

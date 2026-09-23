@@ -81,8 +81,81 @@ pub struct Message {
     pub expires_in_seconds: Option<i32>,
     pub body: Option<String>,
     pub quote_target_ts: Option<i64>,
+    /// Who the quoted message was from, as the quote names them.
+    pub quote_author: Option<String>,
+    /// The quoted message's text as the quote carries it, for a target the
+    /// archive does not hold.
+    pub quote_text: Option<String>,
     pub is_outgoing: bool,
     pub attachments: Vec<Attachment>,
+    pub styles: Vec<TextStyle>,
+    pub previews: Vec<LinkPreview>,
+}
+
+/// A link preview the sender's app attached. Empty strings are absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkPreview {
+    pub url: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+}
+
+fn link_previews(msg: &Value) -> Vec<LinkPreview> {
+    let text = |p: &Value, k: &str| {
+        p.get(k)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    msg.get("previews")
+        .and_then(Value::as_array)
+        .map(|ps| {
+            ps.iter()
+                .filter_map(|p| {
+                    Some(LinkPreview {
+                        url: text(p, "url")?,
+                        title: text(p, "title"),
+                        description: text(p, "description"),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One styled run of a message body, as Signal sends it: `style` is Signal's
+/// own name (`BOLD`, `ITALIC`, `STRIKETHROUGH`, `MONOSPACE`, `SPOILER`), and the
+/// positions are UTF-16 code units. Runs may overlap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextStyle {
+    pub style: String,
+    pub start_utf16: i32,
+    pub length_utf16: i32,
+}
+
+/// A payload's `textStyles`, dropping any run that lacks a field or has a
+/// negative position.
+fn text_styles(msg: &Value) -> Vec<TextStyle> {
+    let int = |r: &Value, k: &str| {
+        r.get(k)
+            .and_then(Value::as_i64)
+            .and_then(|n| i32::try_from(n).ok())
+            .filter(|n| *n >= 0)
+    };
+    msg.get("textStyles")
+        .and_then(Value::as_array)
+        .map(|runs| {
+            runs.iter()
+                .filter_map(|r| {
+                    Some(TextStyle {
+                        style: r.get("style")?.as_str()?.to_string(),
+                        start_utf16: int(r, "start")?,
+                        length_utf16: int(r, "length")?,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +176,7 @@ pub struct Edit {
     pub target_ts: i64, // server_ts of the original message being edited
     pub body: Option<String>,
     pub is_outgoing: bool,
+    pub styles: Vec<TextStyle>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -306,10 +380,16 @@ fn payload_action(
         }
         None => None,
     };
-    let quote = msg
-        .get("quote")
-        .and_then(|q| q.get("id"))
-        .and_then(Value::as_i64);
+    let quote_obj = msg.get("quote");
+    let quote = quote_obj.and_then(|q| q.get("id")).and_then(Value::as_i64);
+    let quote_author = quote_obj
+        .filter(|q| q.get("authorUuid").is_some() || q.get("author").is_some())
+        .map(|q| id_of(q.get("authorUuid"), q.get("author")));
+    let quote_text = quote_obj
+        .and_then(|q| q.get("text"))
+        .and_then(Value::as_str)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string);
     let attachments = msg
         .get("attachments")
         .and_then(Value::as_array)
@@ -343,8 +423,12 @@ fn payload_action(
             .and_then(|n| i32::try_from(n).ok()),
         body,
         quote_target_ts: quote,
+        quote_author,
+        quote_text,
         is_outgoing,
         attachments,
+        styles: text_styles(msg),
+        previews: link_previews(msg),
     })
 }
 
@@ -369,6 +453,7 @@ fn edit_action(
             .and_then(Value::as_str)
             .map(str::to_string),
         is_outgoing,
+        styles: text_styles(inner),
     })
 }
 
