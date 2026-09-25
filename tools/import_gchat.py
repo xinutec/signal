@@ -66,6 +66,9 @@ DDL = [
         UNIQUE KEY uniq_gchat_attachment (message_id, uuid),
         INDEX idx_gchat_attachment_msg (message_id)
     ) DEFAULT CHARSET=utf8mb4""",
+    # NULL until gchat-archive's fetch_attachments.py holds the bytes.
+    """ALTER TABLE gchat_attachments
+        ADD COLUMN IF NOT EXISTS stored_path VARCHAR(255) NULL""",
     """CREATE TABLE IF NOT EXISTS gchat_reaction_authors (
         id         BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
         message_id BIGINT NOT NULL,
