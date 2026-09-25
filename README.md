@@ -1,5 +1,9 @@
 # signal — message archive
 
+**Moved.** This code now lives in `archiver/` of
+[xinutec/messages](https://github.com/xinutec/messages), history included. This
+repository is archived.
+
 Archives Signal, Telegram, IRC and Google Chat messages into one MariaDB on the
 **isis** k3s cluster (namespace `signal`). Each origin has its own tables.
 
